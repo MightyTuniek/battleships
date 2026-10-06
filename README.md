@@ -334,4 +334,4 @@ Please keep the single-file, zero-dependency constraint.
 
 ## License
 
-No license file is included yet. If you plan to publish this publicly, add one (e.g. MIT) as `LICENSE` and state it here.
+MIT - see [LICENSE](LICENSE)

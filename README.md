@@ -37,12 +37,11 @@ python3 --version
 Clone and run — no install step:
 
 ```bash
-git clone https://github.com/<you>/battleships-terminal.git
+git clone https://github.com/MightyTuniek/battleships
 cd battleships-terminal
 python3 battleshipsamazing.py
 ```
 
-Replace `<you>` with the actual repo owner/name after you push this to GitHub.
 
 If colors look wrong:
 

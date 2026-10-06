@@ -156,14 +156,14 @@ Green `+` = valid, red = invalid. `Enter` = start, `R` = reroll on random-layout
 ### Shooting (interactive)
 
 ```text
-Arrows / WASD    move cursor
-Enter / Space    fire
-A–Z              jump to column
-1–9, 0           jump to row (0 = row 10)
-?                toggle hint
-/                toggle density map
-W                save game
-Q / Esc          abandon / surrender
+Arrows / WASD                       move cursor
+Enter / Space                       fire
+A–N (max, depends on board size)    jump to column
+1–9, 0                              jump to row (0 = row 10)
+?                                   toggle hint
+/                                   toggle density map
+W                                   save game
+Q / Esc                             abandon / surrender
 ```
 
 You can also type `B7` + `Enter` anytime.
@@ -196,7 +196,7 @@ LAN typed adds: `say <msg>`, `chat`, `surrender`.
 
 `Main Menu → Visual Settings`:
 
-`animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell`
+`animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
 
 Disable color:
 

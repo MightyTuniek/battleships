@@ -306,8 +306,7 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 
 ```text
 .
-├── battleships.py          # entire game, stdlib only (~7000 lines)
-├── battleshipsamazing.py   # compatibility alias retained for older launchers
+├── battleships.py   # the game itself
 ├── README.md               # this file
 └── save.json               # created by you when saving (not committed)
 ```

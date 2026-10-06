@@ -38,7 +38,7 @@ Clone and run — no install step:
 
 ```bash
 git clone https://github.com/MightyTuniek/battleships
-cd battleships-terminal
+cd battleships
 python3 battleshipsamazing.py
 ```
 

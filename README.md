@@ -4,7 +4,7 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-green)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)
 
-A complete Battleships game for the terminal in a single Python file. Play against 5 AI difficulties, run a campaign, play 2-player hotseat, or play over LAN with chat and anti-cheat. No dependencies, stdlib only.
+A complete Battleships game for the terminal in a single Python file. Play against 5 AI difficulties, run a campaign, play 2-player hotseat, or play over LAN with chat and anti-cheat. No dependencies, no install.
 
 ## Features
 
@@ -39,20 +39,19 @@ Clone and run — no install step:
 ```bash
 git clone https://github.com/MightyTuniek/battleships
 cd battleships
-python3 battleshipsamazing.py
+python3 battleships.py
 ```
-
 
 If colors look wrong:
 
 ```bash
-python3 battleshipsamazing.py --no-color
+python3 battleships.py --no-color
 ```
 
 ## Quickstart
 
 ```bash
-python3 battleshipsamazing.py
+python3 battleships.py
 ```
 
 Main menu:
@@ -87,7 +86,7 @@ Plays `Easy → Medium → Hard → Expert → Nightmare` in sequence, reusing y
 Start directly:
 
 ```bash
-python3 battleshipsamazing.py --campaign
+python3 battleships.py --campaign
 ```
 
 ### Hotseat
@@ -111,8 +110,8 @@ In-menu `GAME SETUP`, or via `--board` / `--fleet`:
 Custom:
 
 ```bash
-python3 battleshipsamazing.py --board 8 --fleet small
-python3 battleshipsamazing.py --board 12 --fleet armada
+python3 battleships.py --board 8 --fleet small
+python3 battleships.py --board 12 --fleet armada
 ```
 
 - Board size is clamped to 6–14.
@@ -197,13 +196,13 @@ LAN typed adds: `say <msg>`, `chat`, `surrender`.
 
 `Main Menu → Visual Settings`:
 
-`animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
+`animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell`
 
 Disable color:
 
 ```bash
-python3 battleshipsamazing.py --no-color
-NO_COLOR=1 python3 battleshipsamazing.py
+python3 battleships.py --no-color
+NO_COLOR=1 python3 battleships.py
 ```
 
 ## Save / load
@@ -213,13 +212,13 @@ Games save as portable JSON (boards, turn, stats, RNG state for exact resume).
 In game: `W` or `save <file>`. Resume:
 
 ```bash
-python3 battleshipsamazing.py --load save.json
+python3 battleships.py --load save.json
 ```
 
 ## CLI reference
 
 ```bash
-python3 battleshipsamazing.py --help
+python3 battleships.py --help
 ```
 
 | Flag | Description |
@@ -239,15 +238,15 @@ python3 battleshipsamazing.py --help
 Examples:
 
 ```bash
-python3 battleshipsamazing.py --board 8 --fleet small
-python3 battleshipsamazing.py --campaign --contrarian
-python3 battleshipsamazing.py --load mygame.json
-python3 battleshipsamazing.py --bench 20 --seed 42
-python3 battleshipsamazing.py --bench 5 --include-nightmare
-python3 battleshipsamazing.py --lan-port 48785 --lan-password secret123
+python3 battleships.py --board 8 --fleet small
+python3 battleships.py --campaign --contrarian
+python3 battleships.py --load mygame.json
+python3 battleships.py --bench 20 --seed 42
+python3 battleships.py --bench 5 --include-nightmare
+python3 battleships.py --lan-port 48785 --lan-password secret123
 ```
 
-> Note: the source docstring mentions `battleships.py`. The file in this repo is `battleshipsamazing.py` — use that name.
+The primary entry point is `battleships.py`.
 
 ## LAN multiplayer
 
@@ -307,7 +306,8 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 
 ```text
 .
-├── battleshipsamazing.py  # entire game, stdlib only (~7000 lines)
+├── battleships.py          # entire game, stdlib only (~7000 lines)
+├── battleshipsamazing.py   # compatibility alias retained for older launchers
 ├── README.md               # this file
 └── save.json               # created by you when saving (not committed)
 ```
@@ -326,8 +326,8 @@ Issues and PRs welcome:
 
 1. Fork the repo
 2. Create a branch: `git checkout -b feature/my-change`
-3. Run a syntax check: `python3 -m py_compile battleshipsamazing.py`
-4. Optional AI check: `python3 battleshipsamazing.py --bench 5 --seed 0`
+3. Run a syntax check: `python3 -m py_compile battleships.py`
+4. Optional AI check: `python3 battleships.py --bench 5 --seed 0`
 5. Open a pull request
 
 Please keep the single-file, zero-dependency constraint.
@@ -335,3 +335,4 @@ Please keep the single-file, zero-dependency constraint.
 ## License
 
 MIT - see [LICENSE](LICENSE)
+

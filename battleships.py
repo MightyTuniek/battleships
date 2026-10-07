@@ -405,9 +405,22 @@ VISUAL_DEFAULTS = {
     "color_density": True,
     "screen_flash": False,
     "terminal_bell": False,
+    "screen_shake": True,
+    "hit_stop": True,
+    "kill_cam": True,
+    "damage_fire": True,
+    "sonar_sweep": True,
+    "captain_taunts": True,
+    "streaks": True,
+    "epic_mode": False,
 }
 VISUAL = dict(VISUAL_DEFAULTS)
 _VISUAL_SETTINGS = VisualSettings(flags=VISUAL)  # single owner; VISUAL is compat view
+
+EPIC_TIMINGS = {
+    False: {"hit_stop": 0.12, "sunk_stop": 0.25, "shake_frames": 3},
+    True: {"hit_stop": 0.30, "sunk_stop": 0.80, "shake_frames": 6},
+}
 
 
 def vis(name: str) -> bool:
@@ -544,6 +557,14 @@ def visual_settings_menu():
         ("Colorized density map", "color_density"),
         ("Screen flash", "screen_flash"),
         ("Terminal bell", "terminal_bell"),
+        ("Screen shake on hits", "screen_shake"),
+        ("Hit-stop pause", "hit_stop"),
+        ("Sunk kill-cam", "kill_cam"),
+        ("Burning damaged ships", "damage_fire"),
+        ("Sonar sweep on enemy turn", "sonar_sweep"),
+        ("Captain taunts", "captain_taunts"),
+        ("Streak callouts", "streaks"),
+        ("EPIC MODE (all Hollywood, slower)", "epic_mode"),
     ]
 
     sel = 0

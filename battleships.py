@@ -771,7 +771,7 @@ class Spinner:
             burst_banner("ENEMY TURN", ("red", "bold"), 0.28)
 
         try:
-            if vis("sonar_sweep") and supports_cursor_ui():
+            if vis("sonar_sweep") and can_animate():
                 for f in ["((.))", "((o))", "(((o)))"]:
                     self.stream.write("\r  sonar " + f)
                     self.stream.flush()
@@ -858,7 +858,7 @@ def burst_shot(pos, hit, ship, sunk, opp=False, level="Easy"):
     _bell("sunk" if sunk else ("hit" if hit else "miss"))
 
     try:
-        if sunk and (vis("terminal_bell") or vis("epic_mode")) and sys.stdout.isatty():
+        if sunk and can_animate() and (vis("terminal_bell") or vis("epic_mode")) and sys.stdout.isatty():
             time.sleep(0.15 if vis("epic_mode") else 0.08)
             _bell("hit")
     except Exception:
@@ -888,18 +888,22 @@ def burst_shot(pos, hit, ship, sunk, opp=False, level="Easy"):
     if not opp:
         try:
             _BURST_STREAK["n"] = _BURST_STREAK["n"] + 1 if hit else 0
-            if vis("streaks") and _BURST_STREAK["n"] == 2:
-                _burst_print("DOUBLE HIT!", ("yellow", "bold"), hold=0.6)
-            elif vis("streaks") and _BURST_STREAK["n"] >= 3:
-                _burst_print("ON FIRE! x%d" % _BURST_STREAK["n"], ("red", "bold"), hold=0.6)
-            if vis("captain_taunts") and random.random() < 0.35:
-                pool = TAUNTS.get(level, TAUNTS["Easy"]).get(
-                    "sunk" if sunk else ("hit" if hit else "miss"), [])
-                if pool:
-                    _burst_print("ENEMY CAPTAIN: %s" % random.choice(pool),
-                                 ("white",), hold=0.5)
         except Exception:
             pass
+        if can_animate():
+            try:
+                if vis("streaks") and _BURST_STREAK["n"] == 2:
+                    _burst_print("DOUBLE HIT!", ("yellow", "bold"), hold=0.6)
+                elif vis("streaks") and _BURST_STREAK["n"] >= 3:
+                    _burst_print("ON FIRE! x%d" % _BURST_STREAK["n"], ("red", "bold"), hold=0.6)
+                if vis("captain_taunts") and random.random() < 0.35:
+                    pool = TAUNTS.get(level, TAUNTS["Easy"]).get(
+                        "sunk" if sunk else ("hit" if hit else "miss"), [])
+                    if pool:
+                        _burst_print("ENEMY CAPTAIN: %s" % random.choice(pool),
+                                     ("white",), hold=0.5)
+            except Exception:
+                pass
 
 
 def burst_shot_lan(pos, hit, sunk_len, opp=False, level="Easy"):
@@ -1765,6 +1769,14 @@ TAUNTS = {
 _BURST_STREAK = {"n": 0}
 
 
+def _reset_burst_state() -> None:
+    """Reset per-seat display streak. Call at game start and hotseat handoff."""
+    try:
+        _BURST_STREAK["n"] = 0
+    except Exception:
+        pass
+
+
 def war_sparkline(history) -> str:
     seq = [("H" if e.get("hit") else ".") for e in history[-20:]]
     return "".join(seq) or "-"
@@ -2191,7 +2203,7 @@ def own_char(board, r, c, last=None):
     shot = (r, c) in board.shots
 
     if ship and shot:
-        if vis("damage_fire"):
+        if vis("damage_fire") and can_animate() and not board.is_sunk(ship):
             frame = int(time.time() * 4) % 2
             ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
             if last == (r, c):
@@ -2219,7 +2231,7 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
     elif (r, c) in enemy.shots:
         if not ship:
             ch = paint("o", "white")
-        elif not enemy.is_sunk(ship) and vis("damage_fire"):
+        elif not enemy.is_sunk(ship) and vis("damage_fire") and can_animate():
             frame = int(time.time() * 4) % 2
             ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
             if last == (r, c):
@@ -2908,6 +2920,7 @@ class Game:
 
     def _record_shot_history(self, pos, hit, ship, sunk, top3, coach_opt):
         self._stats_obj.streak = self._stats_obj.streak + 1 if hit else 0
+        self.stats["streak"] = self._stats_obj.streak
         self.shot_history.append({
             "pos": pos,
             "hit": hit,
@@ -2959,6 +2972,7 @@ class Game:
     def run(self) -> str:
         self.last_player = None
         self.last_ai = None
+        _reset_burst_state()
 
         if self.player.order and len(self.player.order) == len(FLEET):
             notes = ["Resumed. Your move."]
@@ -3252,6 +3266,7 @@ class HotseatGame:
         return out
 
     def handoff(self, seat):
+        _reset_burst_state()
         clear()
         print()
         for line in big_banner("PLAYER %d" % (seat + 1), "cyan"):

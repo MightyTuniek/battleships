@@ -768,6 +768,17 @@ class Spinner:
         if "enemy" in low or "opponent" in low or "aiming" in low:
             burst_banner("ENEMY TURN", ("red", "bold"), 0.28)
 
+        try:
+            if vis("sonar_sweep") and supports_cursor_ui():
+                for f in ["((.))", "((o))", "(((o)))"]:
+                    self.stream.write("\r  sonar " + f)
+                    self.stream.flush()
+                    time.sleep(0.07)
+                self.stream.write("\r" + " " * 20 + "\r")
+                self.stream.flush()
+        except Exception:
+            pass
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
@@ -843,6 +854,13 @@ def burst_shot(pos, hit, ship, sunk, opp=False):
         _screen_flash()
 
     _bell("sunk" if sunk else ("hit" if hit else "miss"))
+
+    try:
+        if sunk and (vis("terminal_bell") or vis("epic_mode")) and sys.stdout.isatty():
+            time.sleep(0.15 if vis("epic_mode") else 0.08)
+            _bell("hit")
+    except Exception:
+        pass
 
     if opp:
         if sunk:
@@ -2109,6 +2127,12 @@ def own_char(board, r, c, last=None):
     shot = (r, c) in board.shots
 
     if ship and shot:
+        if vis("damage_fire"):
+            frame = int(time.time() * 4) % 2
+            ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
+            if last == (r, c):
+                ch = _highlight(ch)
+            return ch
         ch = paint("X", "red", "bold")
     elif ship:
         ch = paint("S", "cyan", "bold")
@@ -2131,6 +2155,12 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
     elif (r, c) in enemy.shots:
         if not ship:
             ch = paint("o", "white")
+        elif not enemy.is_sunk(ship) and vis("damage_fire"):
+            frame = int(time.time() * 4) % 2
+            ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
+            if last == (r, c):
+                ch = _highlight(ch)
+            return ch
         else:
             ch = paint("#", "green", "bold") if enemy.is_sunk(ship) else paint("X", "yellow", "bold")
     elif reveal and ship:

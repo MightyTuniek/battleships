@@ -150,6 +150,7 @@ class GameStats:
     ai_hits: int = 0
     coach_opt: int = 0
     coach_total: int = 0
+    streak: int = 0
 
     @property
     def accuracy(self) -> str:
@@ -158,13 +159,14 @@ class GameStats:
     def as_dict(self) -> Dict[str, int]:
         return {"shots": self.shots, "hits": self.hits, "hints": self.hints,
                 "ai_shots": self.ai_shots, "ai_hits": self.ai_hits,
-                "coach_opt": self.coach_opt, "coach_total": self.coach_total}
+                "coach_opt": self.coach_opt, "coach_total": self.coach_total,
+                "streak": self.streak}
 
     @classmethod
     def from_dict(cls, d: Dict[str, int]) -> "GameStats":
         return cls(**{k: int(d.get(k, 0)) for k in
                        ("shots", "hits", "hints", "ai_shots", "ai_hits",
-                        "coach_opt", "coach_total")})
+                        "coach_opt", "coach_total", "streak")})
 
 
 class PlacementCache:
@@ -828,7 +830,7 @@ def _burst_print(text, styles, hold):
         pass
 
 
-def burst_shot(pos, hit, ship, sunk, opp=False):
+def burst_shot(pos, hit, ship, sunk, opp=False, level="Easy"):
     cell = cell_name(pos)
 
     _hit_stop(bool(sunk))
@@ -883,8 +885,24 @@ def burst_shot(pos, hit, ship, sunk, opp=False):
             text = "·  splash at %s" % cell
             _burst_print(text, ("blue",), hold=0.5)
 
+    if not opp:
+        try:
+            _BURST_STREAK["n"] = _BURST_STREAK["n"] + 1 if hit else 0
+            if vis("streaks") and _BURST_STREAK["n"] == 2:
+                _burst_print("DOUBLE HIT!", ("yellow", "bold"), hold=0.6)
+            elif vis("streaks") and _BURST_STREAK["n"] >= 3:
+                _burst_print("ON FIRE! x%d" % _BURST_STREAK["n"], ("red", "bold"), hold=0.6)
+            if vis("captain_taunts") and random.random() < 0.35:
+                pool = TAUNTS.get(level, TAUNTS["Easy"]).get(
+                    "sunk" if sunk else ("hit" if hit else "miss"), [])
+                if pool:
+                    _burst_print("ENEMY CAPTAIN: %s" % random.choice(pool),
+                                 ("white",), hold=0.5)
+        except Exception:
+            pass
 
-def burst_shot_lan(pos, hit, sunk_len, opp=False):
+
+def burst_shot_lan(pos, hit, sunk_len, opp=False, level="Easy"):
     cell = cell_name(pos)
 
     _hit_stop(bool(sunk_len))
@@ -1715,6 +1733,52 @@ def expert_par(ship_cells, rng=random):
 
 def par_line(shots, par):
     return "You won in %d shots. Expert par: %d." % (shots, par)
+
+
+# 10 lines per level: 3 hit + 3 miss + 2 sunk + 2 losing. Short, naval,
+# no profanity, no position leaks. The "losing" pool is data for now;
+# only hit/miss/sunk are triggered in V1 (burst_shot has no board context
+# to detect "losing" — follow-up wiring).
+TAUNTS = {
+    "Easy": {"hit": ["Ha! Lucky shot, admiral.", "Oops — nice one!", "Hey, that tickled."],
+             "miss": ["Missed me!", "Splash! Try again.", "Is that fog or aim?"],
+             "sunk": ["Hey! That was my favorite ship!", "No fair, I liked that one."],
+             "losing": ["Uh oh...", "This is fine. Everything is fine."]},
+    "Medium": {"hit": ["Good shooting.", "Noted.", "Copy that hit."],
+               "miss": ["Wide.", "No damage.", "Splash out."],
+               "sunk": ["You got one. Respect.", "Ship lost. My bad."],
+               "losing": ["Tide is turning...", "Holding the line."]},
+    "Hard": {"hit": ["Efficient.", "Copy that.", "Plotting return fire."],
+             "miss": ["Wasted shell.", "Negative splash.", "Range off."],
+             "sunk": ["Ship lost. Adjusting.", "Casualties logged."],
+             "losing": ["Requesting reinforcements.", "Damage control parties out."]},
+    "Expert": {"hit": ["Probability updated.", "Interesting line.", "Recalibrating."],
+               "miss": ["Suboptimal.", "Expected.", "Within tolerance."],
+               "sunk": ["Acceptable loss.", "Model updated."],
+               "losing": ["Recalculating...", "Win probability falling."]},
+    "Nightmare": {"hit": ["Logged.", "Noted.", "."],
+                  "miss": ["No.", "Miss.", "Nothing."],
+                  "sunk": ["...", "Irrelevant."],
+                  "losing": ["...", "Still coming."]},
+}
+
+_BURST_STREAK = {"n": 0}
+
+
+def war_sparkline(history) -> str:
+    seq = [("H" if e.get("hit") else ".") for e in history[-20:]]
+    return "".join(seq) or "-"
+
+
+def mvp_line(game) -> str:
+    best = None
+    for e in getattr(game, "shot_history", []):
+        if e.get("sunk"):
+            best = e
+            break
+    if best is None:
+        return "MVP: none yet"
+    return "MVP: %s (sunk %s)" % (cell_name(best["pos"]), best.get("ship") or "ship")
 
 
 def bench_solo(ai_cls, games, seed):
@@ -2843,6 +2907,7 @@ class Game:
     # -- Shot-history helper --------------------------------------------------
 
     def _record_shot_history(self, pos, hit, ship, sunk, top3, coach_opt):
+        self._stats_obj.streak = self._stats_obj.streak + 1 if hit else 0
         self.shot_history.append({
             "pos": pos,
             "hit": hit,
@@ -2925,7 +2990,7 @@ class Game:
                 results = apply_salvo(self.enemy, self.pk, turn_shots)
 
                 for pos, (hit, ship, sunk), top, opt in zip(turn_shots, results, top3_list, opts):
-                    burst_shot(pos, hit, ship, sunk, opp=False); show_sunk_reveal(self.player, self.enemy, ship, pos) if sunk else None
+                    burst_shot(pos, hit, ship, sunk, opp=False, level=self.level); show_sunk_reveal(self.player, self.enemy, ship, pos) if sunk else None
                     self._record_shot_history(pos, hit, ship, sunk,
                                               [p for (p, _, _) in top], opt)
 
@@ -2946,7 +3011,7 @@ class Game:
                     ai_moves = self._enemy_salvo_response()
 
                 for apos, ahit, aship, asunk in ai_moves:
-                    burst_shot(apos, ahit, aship, asunk, opp=True)
+                    burst_shot(apos, ahit, aship, asunk, opp=True, level=self.level)
                     notes.append(shot_msg_ai(apos, ahit, aship, asunk))
 
                 if self.player.all_sunk():
@@ -2965,7 +3030,7 @@ class Game:
             coach_opt = pos in top3
 
             hit, ship, sunk = self.enemy.fire(pos)
-            burst_shot(pos, hit, ship, sunk, opp=False)
+            burst_shot(pos, hit, ship, sunk, opp=False, level=self.level)
 
             self.stats["coach_opt"] += coach_opt; show_sunk_reveal(self.player, self.enemy, ship, pos) if sunk else None
             self.stats["coach_total"] += 1
@@ -2987,7 +3052,7 @@ class Game:
             with Spinner("Enemy is calculating"):
                 apos, ahit, aship, asunk = self._enemy_single_response()
 
-            burst_shot(apos, ahit, aship, asunk, opp=True)
+            burst_shot(apos, ahit, aship, asunk, opp=True, level=self.level)
             notes.append(shot_msg_ai(apos, ahit, aship, asunk))
 
             if self.player.all_sunk():
@@ -3038,6 +3103,8 @@ class Game:
             "Ships afloat: %d/%d" % (len(self.player.afloat()), len(FLEET)),
             "Hints used:   %d" % s["hints"],
             coach_line(s["coach_opt"], s["coach_total"]),
+            "War: %s" % war_sparkline(self.shot_history),
+            mvp_line(self),
         ]
         print()
         for line in boxed_panel(paint("SUMMARY", "bold"), summary):

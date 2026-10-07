@@ -419,6 +419,40 @@ VISUAL_DEFAULTS = {
 VISUAL = dict(VISUAL_DEFAULTS)
 _VISUAL_SETTINGS = VisualSettings(flags=VISUAL)  # single owner; VISUAL is compat view
 
+VISUAL_CATEGORIES = [
+    ("Master", [
+        ("Master animations", "animations"),
+        ("EPIC MODE (all Hollywood, slower)", "epic_mode"),
+    ]),
+    ("Battle Effects", [
+        ("Explosion / splash frames", "explosions"),
+        ("Shot trails", "shot_trails"),
+        ("Screen shake on hits", "screen_shake"),
+        ("Hit-stop pause", "hit_stop"),
+        ("Sunk ship reveal", "sunk_reveal"),
+        ("Sunk kill-cam", "kill_cam"),
+        ("Burning damaged ships", "damage_fire"),
+        ("Victory/defeat cinematics", "victory_cinematics"),
+    ]),
+    ("Board Readability", [
+        ("Animated water", "animated_water"),
+        ("Strong last-shot highlight", "last_shot_highlight"),
+        ("Fleet status labels", "fleet_status"),
+        ("Colorized density map", "color_density"),
+    ]),
+    ("Turn Flow & Feedback", [
+        ("Turn banners", "turn_banners"),
+        ("Radar spinner", "radar_spinner"),
+        ("Sonar sweep on enemy turn", "sonar_sweep"),
+        ("Streak callouts", "streaks"),
+        ("Captain taunts", "captain_taunts"),
+    ]),
+    ("Accessibility Alerts", [
+        ("Screen flash", "screen_flash"),
+        ("Terminal bell", "terminal_bell"),
+    ]),
+]
+
 EPIC_TIMINGS = {
     False: {"hit_stop": 0.12, "sunk_stop": 0.25, "shake_frames": 3},
     True: {"hit_stop": 0.30, "sunk_stop": 0.80, "shake_frames": 6},
@@ -585,52 +619,45 @@ def finish_cinematic(won):
 
 
 def visual_settings_menu():
-    items = [
-        ("Master animations", "animations"),
-        ("Explosion / splash frames", "explosions"),
-        ("Shot trails", "shot_trails"),
-        ("Sunk ship reveal", "sunk_reveal"),
-        ("Animated water", "animated_water"),
-        ("Strong last-shot highlight", "last_shot_highlight"),
-        ("Fleet status labels", "fleet_status"),
-        ("Turn banners", "turn_banners"),
-        ("Radar spinner", "radar_spinner"),
-        ("Victory/defeat cinematics", "victory_cinematics"),
-        ("Colorized density map", "color_density"),
-        ("Screen flash", "screen_flash"),
-        ("Terminal bell", "terminal_bell"),
-        ("Screen shake on hits", "screen_shake"),
-        ("Hit-stop pause", "hit_stop"),
-        ("Sunk kill-cam", "kill_cam"),
-        ("Burning damaged ships", "damage_fire"),
-        ("Sonar sweep on enemy turn", "sonar_sweep"),
-        ("Captain taunts", "captain_taunts"),
-        ("Streak callouts", "streaks"),
-        ("EPIC MODE (all Hollywood, slower)", "epic_mode"),
-    ]
-
-    sel = 0
+    top_sel = 0
+    sub_sel: Dict[str, int] = {}
     while True:
         options = []
-        for label, key in items:
-            state = paint("ON ", "green", "bold") if VISUAL.get(key) else paint("OFF", "red")
-            options.append("%-32s %s" % (label, state))
+        for title, entries in VISUAL_CATEGORIES:
+            on = sum(1 for _, key in entries if VISUAL.get(key))
+            options.append("%-24s %d/%d ON" % (title, on, len(entries)))
 
         options.append("Reset to defaults")
         options.append("Back")
 
-        idx = select_menu(paint("VISUAL SETTINGS", "bold"), options, start_idx=sel)
-        sel = idx
+        idx = select_menu(paint("VISUAL SETTINGS", "bold"), options, start_idx=top_sel)
+        top_sel = idx
 
-        if idx == len(items) + 1:
+        if idx == len(VISUAL_CATEGORIES) + 1:
             return
 
-        if idx == len(items):
+        if idx == len(VISUAL_CATEGORIES):
             _VISUAL_SETTINGS.reset()
             continue
 
-        _, key = items[idx]
-        _VISUAL_SETTINGS.toggle(key)
+        title, entries = VISUAL_CATEGORIES[idx]
+        pos = sub_sel.get(title, 0)
+        while True:
+            sub_options = []
+            for label, key in entries:
+                state = paint("ON ", "green", "bold") if VISUAL.get(key) else paint("OFF", "red")
+                sub_options.append("%-32s %s" % (label, state))
+            sub_options.append("Back")
+
+            sub_idx = select_menu(paint("VISUAL — %s" % title, "bold"),
+                                  sub_options, start_idx=pos)
+            pos = sub_idx
+            sub_sel[title] = pos
+
+            if sub_idx == len(entries):
+                break
+            _, key = entries[sub_idx]
+            _VISUAL_SETTINGS.toggle(key)
 
 
 # ----------------------------------------------------------------------------
@@ -766,21 +793,9 @@ class Spinner:
         if not supports_cursor_ui():
             return self
 
-        low = self.message.lower()
-        if "enemy" in low or "opponent" in low or "aiming" in low:
-            burst_banner("ENEMY TURN", ("red", "bold"), 0.28)
-
-        try:
-            if vis("sonar_sweep") and can_animate():
-                for f in ["((.))", "((o))", "(((o)))"]:
-                    self.stream.write("\r  sonar " + f)
-                    self.stream.flush()
-                    time.sleep(0.07)
-                self.stream.write("\r" + " " * 20 + "\r")
-                self.stream.flush()
-        except Exception:
-            pass
-
+        # Deferred: show nothing until the operation proves slow (>0.25s).
+        # Fast AIs finish inside the grace period with zero output, so no
+        # sonar/spinner flash after every attack.
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self
@@ -790,13 +805,46 @@ class Spinner:
             return
         self._stop.set()
         self._thread.join(timeout=0.5)
+        if not self._width:
+            return
         try:
             self.stream.write("\r" + " " * (self._width + 2) + "\r")
             self.stream.flush()
         except Exception:
             pass
 
+    def _sonar_clear(self):
+        try:
+            self.stream.write("\r" + " " * 20 + "\r")
+            self.stream.flush()
+        except Exception:
+            pass
+
     def _run(self):
+        if self._stop.wait(0.25):
+            return
+
+        low = self.message.lower()
+        if "enemy" in low or "opponent" in low or "aiming" in low:
+            if self._stop.is_set():
+                return
+            burst_banner("ENEMY TURN", ("red", "bold"), 0.28)
+
+        try:
+            if vis("sonar_sweep") and can_animate():
+                for f in ["((.))", "((o))", "(((o)))"]:
+                    if self._stop.is_set():
+                        self._sonar_clear()
+                        return
+                    self.stream.write("\r  sonar " + f)
+                    self.stream.flush()
+                    if self._stop.wait(0.07):
+                        self._sonar_clear()
+                        return
+                self._sonar_clear()
+        except Exception:
+            pass
+
         if vis("radar_spinner"):
             chars = "|/-" + chr(92)
         else:

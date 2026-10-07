@@ -475,6 +475,32 @@ def _burst_frames(frames, styles, hold=0.35):
         pass
 
 
+def _hit_stop(sunk: bool) -> None:
+    try:
+        if not (vis("hit_stop") and can_animate()):
+            return
+        t = EPIC_TIMINGS[bool(vis("epic_mode"))]
+        time.sleep(t["sunk_stop"] if sunk else t["hit_stop"])
+    except Exception:
+        pass
+
+
+def _screen_shake(intensity: int = 1) -> None:
+    try:
+        if not (vis("screen_shake") and can_animate()):
+            return
+        n = EPIC_TIMINGS[bool(vis("epic_mode"))]["shake_frames"] if intensity > 1 else 3
+        for _ in range(n):
+            pad = " " * (random.randint(0, intensity * 2))
+            sys.stdout.write("\r" + pad + "  * *" + pad)
+            sys.stdout.flush()
+            time.sleep(0.03)
+        sys.stdout.write("\r" + " " * 20 + "\r")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _shot_trail(pos, opp=False):
     if not (vis("shot_trails") and can_animate()):
         return
@@ -524,6 +550,20 @@ def show_sunk_reveal(player, enemy, ship_name, last_player=None):
         print(render_boards(player, enemy, reveal=False,
                             last_player=last_player, reveal_cells=set(cells)))
         print()
+        if vis("kill_cam"):
+            step = ""
+            for ch in "S U N K".split():
+                step = (step + " " + ch).strip()
+                try:
+                    if can_animate():
+                        sys.stdout.write("\r  " + paint(step, "green", "bold"))
+                        sys.stdout.flush()
+                        time.sleep(0.15 if vis("epic_mode") else 0.06)
+                except Exception:
+                    pass
+            print()
+            print("  " + paint("enemy %s destroyed — %d shots to kill" % (ship_name, len(cells)), "green"))
+            print()
         for line in big_banner("S H I P   S U N K", "green"):
             print("  " + line)
         time.sleep(0.8)
@@ -780,6 +820,9 @@ def _burst_print(text, styles, hold):
 def burst_shot(pos, hit, ship, sunk, opp=False):
     cell = cell_name(pos)
 
+    _hit_stop(bool(sunk))
+    _screen_shake(2 if sunk else 1)
+
     _shot_trail(pos, opp=opp)
 
     if vis("explosions") and can_animate():
@@ -825,6 +868,9 @@ def burst_shot(pos, hit, ship, sunk, opp=False):
 
 def burst_shot_lan(pos, hit, sunk_len, opp=False):
     cell = cell_name(pos)
+
+    _hit_stop(bool(sunk_len))
+    _screen_shake(2 if sunk_len else 1)
 
     _shot_trail(pos, opp=opp)
 

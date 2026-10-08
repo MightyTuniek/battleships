@@ -753,7 +753,7 @@ def term_width(default=100):
     """Visible terminal width, clamped to a usable range."""
     try:
         cols = os.get_terminal_size().columns
-        return max(60, min(160, int(cols)))
+        return max(40, min(160, int(cols)))
     except Exception:
         return default
 
@@ -762,7 +762,7 @@ def term_size(default=(100, 30)):
     """Visible terminal (columns, lines), clamped to usable ranges."""
     try:
         sz = os.get_terminal_size()
-        return max(60, min(160, int(sz.columns))), max(20, min(80, int(sz.lines)))
+        return max(40, min(160, int(sz.columns))), max(10, min(80, int(sz.lines)))
     except Exception:
         return default
 
@@ -833,19 +833,29 @@ def render_frame(lines):
     print("\n".join(lines))
 
 
-def _fit_box(box_lines, max_h):
-    """Cap a boxed panel's height while keeping its borders intact.
+def too_small_frame(need_c, need_r, what="THIS VIEW"):
+    """Clean minimum-size screen: one intact box, never sliced or scrolled.
 
-    Drops content rows from the bottom (keeps top border, remaining content,
-    bottom border). All content rows are pre-padded to equal visible width by
-    boxed_panel, so any kept subset still forms a valid box. Never slices a
-    line in half. Returns the original list when it already fits.
+    Shown when even the bare core (boards + controls) cannot fit the
+    terminal — an honest prompt beats gutted boxes. Auto-resumes: any
+    keypress re-renders, and render_frame full-clears on size change so
+    centering snaps back after enlarging.
     """
-    box_lines = list(box_lines)
-    if max_h < 3 or len(box_lines) <= max_h:
-        return box_lines
-    # Keep top border + first (max_h - 2) content rows + bottom border.
-    return box_lines[:max_h - 1] + box_lines[-1:]
+    cols, rows = term_size()
+    try:
+        have_c, have_r = raw_term_size()
+    except Exception:
+        have_c, have_r = cols, rows
+    content = [
+        paint("Needs %d x %d   (terminal has %d x %d)" % (need_c, need_r, have_c, have_r), "white"),
+        paint("Enlarge the window, then press any key.", "grey"),
+    ]
+    box = boxed_panel(paint("%s — TERMINAL TOO SMALL" % what, "bold"), content)
+    frame = [""] + center_block([_clip_vis(l, cols - 2) for l in box], width=cols)
+    if len(frame) > rows:
+        # Box is 5 lines; rows clamp at >= 10, so this never slices in practice.
+        frame = frame[:rows]
+    return frame
 
 
 def _center_pad(line, width):
@@ -2146,7 +2156,7 @@ def _density_board_rows(k):
 
 def render_density(k):
     rows = _density_board_rows(k)
-    hint = paint("High numbers = likely ship locations.  ○ = already tried.", "grey")
+    hint = paint("High numbers = likely ship cells.", "grey")
     return "\n".join(boxed_panel(paint("TARGET DENSITY", "bold"), rows + [hint]))
 
 
@@ -2164,7 +2174,7 @@ def hint_text(k, rng=random):
         lines.append("%s  %s" % (
             paint("RECOMMENDATION", "grey"), paint(cell_name(top[0][0]), "bold", "cyan")))
     if len(top) > 1 and top[0][1] == top[1][1]:
-        lines.append(paint("Tie on score — variance, then random, breaks the tie.", "grey"))
+        lines.append(paint("Tie broken by variance, then random.", "grey"))
     return "\n".join(boxed_panel(paint("TACTICAL ADVISORY", "bold"), lines))
 
 
@@ -2921,6 +2931,9 @@ def interactive_place_fleet(board):
                 # Drop the single-line legend as a whole unit; the board and
                 # status boxes are never sliced mid-border.
                 frame = base + cmd_block
+            if len(frame) > rows:
+                need_c = max([max((_vis_len(l) for l in frame), default=cols), cols])
+                frame = too_small_frame(need_c, len(frame), "DEPLOYMENT")
             render_frame(frame)
 
             key = kr.get_key()
@@ -3341,6 +3354,12 @@ class Game:
         core = header + boards + [""] + panels
         tail = ([""] + foot) if foot else []
 
+        # Minimum-size guard: if even the bare core cannot fit, say so with
+        # one intact box instead of scrolling gutted panels.
+        if len(core) + len(tail) > rows:
+            need_c = max([max((_vis_len(l) for l in core + tail), default=cols), cols])
+            return too_small_frame(need_c, len(core) + len(tail), "BATTLE")
+
         def centered(block):
             # Hard clip (no '...' tails): over-wide boxes are dropped whole by
             # the width gate below, this only guards against line wrapping.
@@ -3379,6 +3398,11 @@ class Game:
             # one honest line instead of a sliced box with '...' tails.
             note = _clip_vis(paint("Overlay hidden — widen the terminal to show it.", "grey"), cols - 2)
             extras_options.append([""] + ([_clip_vis(extra_line, cols - 2)] if extra_line else []) + [note])
+        elif blocks:
+            # Height fallback: boxes fit the width but not the rows — one
+            # honest line instead of vanishing silently when toggled open.
+            extras_options.append([""] + ([_clip_vis(extra_line, cols - 2)] if extra_line else [])
+                + [_clip_vis(paint("Overlay hidden: no room. Enlarge or press ? / .", "grey"), cols - 2)])
         extras_options.append([])
 
         # -- feed candidates: full -> compact -> gone (whole box or nothing) --
@@ -3396,16 +3420,10 @@ class Game:
                 frame = self._collapse_blanks(frame)
                 if len(frame) <= rows:
                     return frame
-        # Even bare extras overflow (tiny terminal): shrink the tallest extras
-        # box with intact borders as a last resort; core + footer never slice.
-        room = rows - len(core) - len(tail) - (1 if blocks else 0)
-        shrunk = []
-        per = max(3, room // max(1, len(blocks))) if blocks else 0
-        for b in blocks:
-            shrunk.append("")
-            shrunk.extend(_fit_box(b, per))
-        frame = core + centered(shrunk) + tail
-        return self._collapse_blanks(frame)
+        # Ladder always terminates: core + tail fits (guarded above), and the
+        # option lists end with "everything dropped". Overlays are dropped
+        # whole before they could ever be gutted mid-box; core is never sliced.
+        return core + tail
 
     @staticmethod
     def _collapse_blanks(frame):
@@ -3442,6 +3460,9 @@ class Game:
                 frame = header + boards + [""] + panels + [""] + feed + [""] + foot
             if len(frame) > rows:
                 frame = header + boards + [""] + panels + [""] + foot
+            if len(frame) > rows:
+                need_c = max([max((_vis_len(l) for l in frame), default=cols), cols])
+                frame = too_small_frame(need_c, len(frame), "BATTLE")
             render_frame(frame)
             return
         render_frame(self._frame_lines(notes, cursor=cursor, footer=footer))
@@ -4107,6 +4128,9 @@ class HotseatGame:
                 # Drop the single-line legend as a whole unit; the board and
                 # status boxes are never sliced mid-border.
                 frame = base + cmd_block
+            if len(frame) > rows:
+                need_c = max([max((_vis_len(l) for l in frame), default=cols), cols])
+                frame = too_small_frame(need_c, len(frame), "HOTSEAT")
             render_frame(frame)
 
             try:

@@ -348,7 +348,8 @@ USE_COLOR = False
 ANSI_OK = False
 CODES = {
     "red": "31", "green": "32", "yellow": "33", "blue": "34",
-    "cyan": "36", "white": "97", "grey": "90", "bold": "1"
+    "cyan": "36", "white": "97", "grey": "90", "bold": "1",
+    "dim": "2", "magenta": "35",
 }
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -361,10 +362,15 @@ def strip_ansi(s):
 def paint(text: str, *styles: str) -> str:
     if not is_color_enabled() or not styles:
         return text
-    return "\033[%sm%s\033[0m" % (";".join(CODES[s] for s in styles), text)
+    codes = [CODES[s] for s in styles if s in CODES]
+    if not codes:
+        return text
+    return "\033[%sm%s\033[0m" % (";".join(codes), text)
 
 
 def cursor_reverse(text: str) -> str:
+    if is_ansi_ok() and is_color_enabled():
+        return "\033[1;7;36m%s\033[0m" % strip_ansi(text)
     if is_ansi_ok():
         return "\033[7m%s\033[0m" % strip_ansi(text)
     return "[" + strip_ansi(text) + "]"
@@ -560,11 +566,40 @@ def burst_banner(text, styles=("bold",), hold=0.35):
 
 
 def water_char(r, c):
+    # Subtle animated water: never obscures ships/shots, calm between actions.
     if vis("animated_water") and USE_COLOR and sys.stdout.isatty():
-        chars = ["~", "~", "=", "."]
+        chars = ["~", "~", "·", "~"]
         idx = (r * 7 + c * 13 + int(time.time() * 2.0)) % len(chars)
         return paint(chars[idx], "blue")
-    return paint("~", "blue")
+    if is_color_enabled():
+        return paint("~", "blue")
+    return "~"
+
+
+def _cell_gap():
+    # Larger boards on wide terminals; compact on narrow to prevent wrapping.
+    try:
+        w = term_width()
+    except Exception:
+        return " "
+    if w >= 110 and SIZE <= 12:
+        return "  "
+    return " "
+
+
+def _board_header():
+    gap = _cell_gap()
+    letters = gap.join(COLS)
+    if is_color_enabled():
+        letters = gap.join(paint(ch, "bold", "cyan") for ch in COLS)
+    return "    " + letters
+
+
+def _row_label(r):
+    lab = "%2d" % (r + 1)
+    if is_color_enabled():
+        return paint(lab, "bold", "white")
+    return lab
 
 
 def _highlight(ch):
@@ -583,25 +618,28 @@ def show_sunk_reveal(player, enemy, ship_name, last_player=None):
         return
     try:
         clear()
+        for line in center_block(brand_masthead("Target neutralized")):
+            print(line)
         print(render_boards(player, enemy, reveal=False,
                             last_player=last_player, reveal_cells=set(cells)))
         print()
         if vis("kill_cam"):
             step = ""
-            for ch in "S U N K".split():
-                step = (step + " " + ch).strip()
+            for ch in "SUNK":
+                step = (step + " " + ch).strip() if step else ch
                 try:
                     if can_animate():
-                        sys.stdout.write("\r  " + paint(step, "green", "bold"))
+                        sys.stdout.write("\r" + _center_pad("  " + paint(step, "green", "bold"), term_width()))
                         sys.stdout.flush()
                         time.sleep(0.15 if vis("epic_mode") else 0.06)
                 except Exception:
                     pass
             print()
-            print("  " + paint("enemy %s destroyed — %d shots to kill" % (ship_name, len(cells)), "green"))
+            for line in center_block([paint("Enemy %s destroyed" % ship_name, "green", "bold")]):
+                print(line)
             print()
-        for line in big_banner("S H I P   S U N K", "green"):
-            print("  " + line)
+        for line in center_block(big_banner("SHIP SUNK", "green")):
+            print(line)
         time.sleep(0.8)
     except Exception:
         pass
@@ -625,12 +663,15 @@ def visual_settings_menu():
         options = []
         for title, entries in VISUAL_CATEGORIES:
             on = sum(1 for _, key in entries if VISUAL.get(key))
-            options.append("%-24s %d/%d ON" % (title, on, len(entries)))
+            badge = status_badge("%d/%d ON" % (on, len(entries)), "ok" if on else "disabled")
+            marker = "★ " if title == "Master" else ""
+            options.append("%-26s %s" % (marker + title.upper(), badge))
 
         options.append("Reset to defaults")
         options.append("Back")
 
-        idx = select_menu(paint("VISUAL SETTINGS", "bold"), options, start_idx=top_sel)
+        header = "\n".join(brand_masthead("Visual settings — console calibration"))
+        idx = select_menu(header, options, start_idx=top_sel)
         top_sel = idx
 
         if idx == len(VISUAL_CATEGORIES) + 1:
@@ -645,11 +686,17 @@ def visual_settings_menu():
         while True:
             sub_options = []
             for label, key in entries:
-                state = paint("ON ", "green", "bold") if VISUAL.get(key) else paint("OFF", "red")
-                sub_options.append("%-32s %s" % (label, state))
+                if key == "epic_mode":
+                    badge = status_badge("EPIC", "focus") if VISUAL.get(key) else status_badge("OFF", "disabled")
+                else:
+                    badge = status_badge("ON", "ok") if VISUAL.get(key) else status_badge("OFF", "disabled")
+                sub_options.append("%-34s %s" % (label, badge))
             sub_options.append("Back")
 
-            sub_idx = select_menu(paint("VISUAL — %s" % title, "bold"),
+            sub_header = "\n".join(
+                brand_masthead("Visual — %s" % title)
+                + [paint("Toggles apply immediately. Animations require a TTY.", "grey")])
+            sub_idx = select_menu(sub_header,
                                   sub_options, start_idx=pos)
             pos = sub_idx
             sub_sel[title] = pos
@@ -661,7 +708,7 @@ def visual_settings_menu():
 
 
 # ----------------------------------------------------------------------------
-# Box drawing
+# Box drawing + tactical design system (single-file, zero-dependency)
 # ----------------------------------------------------------------------------
 
 BOX_TL, BOX_TR, BOX_BL, BOX_BR = "╭", "╮", "╰", "╯"
@@ -700,6 +747,242 @@ def _truncate_vis(s, width):
     if width <= 3:
         return plain[:width]
     return plain[:width - 3] + "..."
+
+
+def term_width(default=100):
+    """Visible terminal width, clamped to a usable range."""
+    try:
+        cols = os.get_terminal_size().columns
+        return max(60, min(160, int(cols)))
+    except Exception:
+        return default
+
+
+def term_size(default=(100, 30)):
+    """Visible terminal (columns, lines), clamped to usable ranges."""
+    try:
+        sz = os.get_terminal_size()
+        return max(60, min(160, int(sz.columns))), max(20, min(80, int(sz.lines)))
+    except Exception:
+        return default
+
+
+def home():
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[H")
+        sys.stdout.flush()
+
+
+def render_frame(lines):
+    """Atomic full-frame write: home + body + erase-below. Less flash than clear().
+
+    Every line carries its own erase-to-end-of-line so a shorter new frame can
+    never leave tails of a previous wider frame (ghost borders/text). The final
+    erase-below-display clears leftover lines when the new frame is shorter.
+    """
+    if sys.stdout.isatty():
+        try:
+            out = "\033[H" + "\n".join(l + "\033[K" for l in lines) + "\033[J"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+            return
+        except Exception:
+            pass
+    print("\n".join(lines))
+
+
+def _fit_box(box_lines, max_h):
+    """Cap a boxed panel's height while keeping its borders intact.
+
+    Drops content rows from the bottom (keeps top border, remaining content,
+    bottom border). All content rows are pre-padded to equal visible width by
+    boxed_panel, so any kept subset still forms a valid box. Never slices a
+    line in half. Returns the original list when it already fits.
+    """
+    box_lines = list(box_lines)
+    if max_h < 3 or len(box_lines) <= max_h:
+        return box_lines
+    # Keep top border + first (max_h - 2) content rows + bottom border.
+    return box_lines[:max_h - 1] + box_lines[-1:]
+
+
+def _center_pad(line, width):
+    v = _vis_len(line)
+    if v >= width:
+        return line
+    left = (width - v) // 2
+    return " " * left + line
+
+
+def center_block(lines, width=None):
+    """Horizontally center a block of lines for wide-terminal composition."""
+    if width is None:
+        width = term_width()
+    # Never indent on very narrow terminals; keep content at x=0.
+    if width < 78:
+        return list(lines)
+    return [_center_pad(l, width) for l in lines]
+
+
+def rule(width=None, char="─", style=("grey",)):
+    if width is None:
+        width = min(72, term_width() - 8)
+    width = max(20, min(width, term_width() - 4))
+    return paint(char * width, *style)
+
+
+def section_header(title, subtitle=None):
+    """Compact uppercase section title with thin accent rule."""
+    title = str(title).upper()
+    lines = [paint(title, "bold", "cyan")]
+    if subtitle:
+        lines.append(paint(str(subtitle), "grey"))
+    return lines
+
+
+def status_badge(text, kind="neutral"):
+    """Consistent state badge that survives no-color mode via text."""
+    t = str(text).upper()
+    if not is_color_enabled():
+        markers = {
+            "ok": "[OK] ", "damaged": "[DMG] ", "critical": "[CRIT] ",
+            "sunk": "[SUNK] ", "focus": ">> ", "warn": "[!] ",
+            "success": "[OK] ", "disabled": "-- ",
+        }
+        return markers.get(kind, "") + t
+    if kind in ("ok", "success"):
+        return paint(t, "green", "bold")
+    if kind == "damaged":
+        return paint(t, "yellow", "bold")
+    if kind in ("critical", "sunk", "severe"):
+        return paint(t, "red", "bold")
+    if kind in ("focus", "info"):
+        return paint(t, "cyan", "bold")
+    if kind == "warn":
+        return paint(t, "yellow", "bold")
+    if kind == "disabled":
+        return paint(t, "grey")
+    return paint(t, "white")
+
+
+def metric_row(label, value, label_width=10):
+    """Label secondary, value prominent: 'TURN       08'."""
+    lab = paint(str(label).upper().ljust(label_width), "grey")
+    val = paint(str(value), "bold", "white")
+    return "%s %s" % (lab, val)
+
+
+def event_row(kind, cell, text):
+    """Compact battle-feed row: 'HIT    D7   Carrier damaged'."""
+    k = str(kind).upper()
+    if kind == "hit":
+        badge = paint(k.ljust(6), "yellow", "bold")
+    elif kind == "sunk":
+        badge = paint(k.ljust(6), "green", "bold")
+    elif kind in ("lost", "damage"):
+        badge = paint(k.ljust(6), "red", "bold")
+    elif kind == "miss":
+        badge = paint(k.ljust(6), "grey")
+    else:
+        badge = paint(k.ljust(6), "cyan")
+    return "%s %-5s %s" % (badge, cell, text)
+
+
+def command_bar(items, width=None):
+    """Compact secondary command bar that wraps on whole-item boundaries."""
+    if width is None:
+        width = term_width() - 4
+    parts = []
+    for key, desc in items:
+        parts.append("%s %s" % (paint("[%s]" % key, "cyan", "bold"), paint(desc, "grey")))
+    # Greedy wrap without splitting a command.
+    lines, cur = [], ""
+    for p in parts:
+        cand = (cur + "   " + p) if cur else p
+        if _vis_len(cand) > width and cur:
+            lines.append(cur)
+            cur = p
+        else:
+            cand = cand
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def fleet_health_bar(length, hits):
+    """Consistent health bar: intact cyan, damaged amber, critical red, sunk dim."""
+    if hits >= length:
+        if is_color_enabled():
+            return paint("#" * length, "red", "bold")
+        return "X" * length
+    if hits == 0:
+        if is_color_enabled():
+            return paint("█" * length, "cyan")
+        return "=" * length
+    if hits == length - 1:
+        if is_color_enabled():
+            return paint("#" * hits, "red", "bold") + paint("-" * (length - hits), "grey")
+        return "#" * hits + "-" * (length - hits)
+    if is_color_enabled():
+        return paint("#" * hits, "yellow") + paint("-" * (length - hits), "grey")
+    return "#" * hits + "-" * (length - hits)
+
+
+def fleet_status_rows(board):
+    """Modular fleet rows: NAME + health bar + state badge (no prose sentence)."""
+    rows = []
+    name_w = max([len(n) for n, _ in FLEET] + [8])
+    for name, length in FLEET:
+        if name not in board.ship_cells:
+            continue
+        hits = sum(1 for p in board.ship_cells[name] if p in board.shots and board.shots[p])
+        bar = fleet_health_bar(length, hits)
+        # Pad bar to longest fleet length for column alignment.
+        max_len = max((n for _, n in FLEET), default=length)
+        bar_vis = _vis_len(bar)
+        bar_pad = " " * max(0, max_len - bar_vis)
+        if hits >= length:
+            state = status_badge("SUNK", "sunk")
+        elif hits == 0:
+            state = status_badge("OPERATIONAL", "ok")
+        elif hits == length - 1:
+            state = status_badge("CRITICAL", "critical")
+        else:
+            state = status_badge("DAMAGED", "damaged")
+        rows.append("%s  %s%s  %s" % (
+            paint(name.upper().ljust(name_w), "bold", "white"), bar, bar_pad, state))
+    return rows or [paint("NO SHIPS DEPLOYED", "grey")]
+
+
+def enemy_status_rows(enemy=None, knowledge=None):
+    """Enemy fleet as compact rows without revealing hidden positions."""
+    rows = []
+    if knowledge is not None:
+        remaining = sorted(list(knowledge.remaining), reverse=True)
+        if not remaining:
+            return [status_badge("FLEET DESTROYED", "success")]
+        # Group by length: LEN 5 ×1  AFLOAT etc.
+        from collections import Counter as _Counter
+        counts = _Counter(remaining)
+        for length in sorted(counts, reverse=True):
+            rows.append("%s  %s  %s" % (
+                paint(("HULL-%d" % length).ljust(10), "white"),
+                paint("■" * length if is_color_enabled() else "=" * length, "yellow"),
+                paint("×%d AFLOAT" % counts[length], "grey")))
+        return rows
+    if enemy is not None:
+        for name in enemy.afloat():
+            rows.append("%s  %s" % (
+                paint(name.upper().ljust(12), "white"),
+                status_badge("AFLOAT", "warn")))
+        sunk = [n for n, _ in FLEET if n in getattr(enemy, "ship_cells", {}) and enemy.is_sunk(n)]
+        for name in sunk:
+            rows.append("%s  %s" % (
+                paint(name.upper().ljust(12), "grey"),
+                status_badge("SUNK", "disabled")))
+        return rows or [paint("NO CONTACTS", "grey")]
+    return [paint("NO CONTACTS", "grey")]
 
 
 def box_top_line(inner_width, title=None, double=False):
@@ -747,51 +1030,73 @@ def boxed_panel(title, content_lines, double=False):
     return out
 
 
-def title_banner():
+def brand_masthead(context=None, width=None):
+    """Modern branding: letter-spaced title, thin rule, compact subtitle."""
     lines = [
-        paint("B A T T L E S H I P S", "bold"),
-        paint("~ Terminal Fleet Command ~", "cyan"),
+        paint("B A T T L E S H I P S", "bold", "white"),
+        paint("TACTICAL OPERATIONS", "cyan"),
     ]
-    inner = max(_vis_len(t) for t in lines) + 6
-    box = []
-    box.append("╔" + "═" * inner + "╗")
-    box.append("║" + " " * inner + "║")
-    for text in lines:
-        box.append("║" + _pad_vis(text, inner, "center") + "║")
-    box.append("║" + " " * inner + "║")
-    box.append("╚" + "═" * inner + "╝")
-    return box
+    if context:
+        lines.append(paint(str(context).upper(), "grey"))
+    w = 56 if width is None else width
+    w = max(30, min(w, term_width() - 6))
+    lines.append(rule(w))
+    return lines
+
+
+def title_banner():
+    # Retain name for call sites; now a restrained masthead (no double box).
+    return brand_masthead()
 
 
 def big_banner(text, style="bold"):
-    inner = _vis_len(text) + 6
-    painted = paint(text, style)
+    # Compact after-action banner: thin rules + centered text, no giant box.
+    t = " ".join(str(text).split()).upper()
+    width = min(max(_vis_len(t) + 8, 30), term_width() - 8)
+    painted = paint(t, style) if style else t
     return [
-        "╔" + "═" * inner + "╗",
-        "║" + " " * inner + "║",
-        "║" + _pad_vis(painted, inner, "center") + "║",
-        "║" + " " * inner + "║",
-        "╚" + "═" * inner + "╝",
+        paint("─" * width, "grey"),
+        _pad_vis(painted, width, "center"),
+        paint("─" * width, "grey"),
     ]
 
 
+def tactical_panel(title, content_lines):
+    """Single major tactical boundary with thin rule header (not a box per sentence)."""
+    head = paint(str(title).upper(), "bold", "cyan")
+    body = list(content_lines) or [paint("—", "grey")]
+    inner = max([_vis_len(head)] + [_vis_len(x) for x in body])
+    inner = min(inner, term_width() - 8)
+    out = [head, rule(inner)]
+    out.extend(body)
+    return out
+
+
 def fleet_panel(board, current_name=None, title="FLEET"):
-    NAME_W = 10
     rows = []
+    name_w = max([len(n) for n, _ in FLEET] + [8])
+    max_len = max((n for _, n in FLEET), default=5)
     for name, length in FLEET:
         if name == current_name:
             marker = paint("▶", "cyan", "bold")
         elif name in board.ship_cells:
             marker = paint("✓", "green", "bold")
         else:
-            marker = " "
+            marker = paint("○", "grey")
         if name in board.ship_cells:
             sil = paint("█" * length, "cyan")
         else:
             sil = paint("░" * length, "grey")
-        pad = " " * max(0, NAME_W - len(name))
-        rows.append("%s %s%s  %s" % (marker, name, pad, sil))
-    return boxed_panel(paint(title, "bold"), rows)
+        sil_pad = " " * max(0, max_len - length)
+        if name == current_name:
+            state = status_badge("PLACING", "focus")
+        elif name in board.ship_cells:
+            state = status_badge("READY", "ok")
+        else:
+            state = status_badge("QUEUED", "disabled")
+        rows.append("%s %s  %s%s  %s" % (
+            marker, paint(name.upper().ljust(name_w), "white"), sil, sil_pad, state))
+    return boxed_panel(paint(str(title).upper(), "bold"), rows)
 
 
 class Spinner:
@@ -928,24 +1233,24 @@ def burst_shot(pos, hit, ship, sunk, opp=False, level="Easy"):
 
     if opp:
         if sunk:
-            text = "* * *   SHIP LOST   * * *   enemy sank your %s at %s" % (ship, cell)
-            _burst_print(text, ("red", "bold"), hold=1.5)
+            text = "INCOMING — your %s lost at %s" % (ship, cell)
+            _burst_print(text, ("red", "bold"), hold=1.2)
         elif hit:
-            text = "*  enemy HIT at %s  *" % cell
-            _burst_print(text, ("red", "bold"), hold=0.9)
+            text = "INCOMING — hit at %s" % cell
+            _burst_print(text, ("red", "bold"), hold=0.8)
         else:
-            text = "·  enemy missed at %s" % cell
-            _burst_print(text, ("white",), hold=0.5)
+            text = "Splash at %s — no damage" % cell
+            _burst_print(text, ("white",), hold=0.4)
     else:
         if sunk:
-            text = "* * *   S U N K   * * *   enemy %s destroyed at %s" % (ship, cell)
-            _burst_print(text, ("green", "bold"), hold=1.5)
+            text = "SUNK — enemy %s destroyed at %s" % (ship, cell)
+            _burst_print(text, ("green", "bold"), hold=1.2)
         elif hit:
-            text = "*  H I T  at %s  *" % cell
-            _burst_print(text, ("yellow", "bold"), hold=0.9)
+            text = "HIT at %s" % cell
+            _burst_print(text, ("yellow", "bold"), hold=0.8)
         else:
-            text = "·  splash at %s" % cell
-            _burst_print(text, ("blue",), hold=0.5)
+            text = "MISS at %s — no contact" % cell
+            _burst_print(text, ("blue",), hold=0.4)
 
     if not opp:
         try:
@@ -997,24 +1302,24 @@ def burst_shot_lan(pos, hit, sunk_len, opp=False, level="Easy"):
 
     if opp:
         if sunk_len:
-            text = "* * *   LOST A SHIP   * * *   opponent hit %s (len %d)" % (cell, sunk_len)
-            _burst_print(text, ("red", "bold"), hold=1.5)
+            text = "INCOMING — ship hit at %s (len %d)" % (cell, sunk_len)
+            _burst_print(text, ("red", "bold"), hold=1.2)
         elif hit:
-            text = "*  opponent HIT at %s" % cell
-            _burst_print(text, ("red", "bold"), hold=0.9)
+            text = "INCOMING — hit at %s" % cell
+            _burst_print(text, ("red", "bold"), hold=0.8)
         else:
-            text = "·  opponent missed at %s" % cell
-            _burst_print(text, ("white",), hold=0.5)
+            text = "Splash at %s — no damage" % cell
+            _burst_print(text, ("white",), hold=0.4)
     else:
         if sunk_len:
-            text = "* * *   S U N K   * * *   enemy ship (len %d) down at %s" % (sunk_len, cell)
-            _burst_print(text, ("green", "bold"), hold=1.5)
+            text = "SUNK — enemy ship (len %d) at %s" % (sunk_len, cell)
+            _burst_print(text, ("green", "bold"), hold=1.2)
         elif hit:
-            text = "*  H I T  at %s  *" % cell
-            _burst_print(text, ("yellow", "bold"), hold=0.9)
+            text = "HIT at %s" % cell
+            _burst_print(text, ("yellow", "bold"), hold=0.8)
         else:
-            text = "·  splash at %s" % cell
-            _burst_print(text, ("blue",), hold=0.5)
+            text = "MISS at %s — no contact" % cell
+            _burst_print(text, ("blue",), hold=0.4)
 
 
 class Quit(Exception):
@@ -1172,7 +1477,7 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
     if not supports_cursor_ui():
         print(header)
         for i, opt in enumerate(options, 1):
-            print("  %d) %s" % (i, opt))
+            print("  %d) %s" % (i, strip_ansi(opt)))
         while True:
             raw = ask("Choose 1-%d > " % len(options))
             if allow_quit and raw.lower() in ("q", "quit"):
@@ -1184,23 +1489,42 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
     idx = max(0, min(start_idx, len(options) - 1)) if options else 0
     with KeyReader() as kr:
         while True:
-            clear()
-            print(header)
-            print()
+            # NOTE: callers must pass a RAW (uncentered) header. Centering happens
+            # exactly once here; pre-centered headers double-indent (right drift).
+            cols, _rows = term_size()
+            avail = max(40, cols - 8)
+            header_lines = [strip_ansi(h) if False else h for h in str(header).split("\n")]
+            # Keep header itself within width so wide terminals never push it right.
+            header_lines = [_truncate_vis(h, avail) for h in header_lines]
+            menu_rows = []
             for i, opt in enumerate(options):
+                label = "%d) %s" % (i + 1, opt)
+                label = _truncate_vis(label, avail - 4)
                 if i == idx:
-                    line = "  " + paint("▶ %d) %s" % (i + 1, opt), "cyan", "bold")
+                    # Unmistakable focus: marker + strong highlight, works mono too.
+                    if is_color_enabled():
+                        row = paint("▶ ", "cyan", "bold") + paint(label, "bold", "white")
+                    else:
+                        row = ">> %s" % strip_ansi(label)
+                    menu_rows.append(row)
                 else:
-                    line = "    %d) %s" % (i + 1, opt)
-                print(line)
-            print()
-            print(paint("  " + "─" * 46, "grey"))
-            hint = "  ↑/↓ move · Enter select · 1-%d jump" % len(options)
+                    if is_color_enabled():
+                        menu_rows.append("  " + paint(label, "grey"))
+                    else:
+                        menu_rows.append("   " + strip_ansi(label))
+            panel = boxed_panel(paint("COMMAND", "bold"), menu_rows)
+            composed = []
+            composed.extend(header_lines)
+            composed.append("")
+            composed.extend(panel)
+            composed.append("")
+            bar = "↑/↓ move · Enter select · 1-%d jump" % len(options)
             if allow_quit:
-                hint += " · Q quit"
+                bar += " · Q quit"
             if footer:
-                hint += " · " + footer
-            print(hint)
+                bar += " · " + footer
+            composed.append(_truncate_vis(paint(bar, "grey"), avail))
+            render_frame(center_block(composed, width=cols))
             key = kr.get_key()
             if key == "UP":
                 idx = (idx - 1) % len(options)
@@ -1737,11 +2061,15 @@ def best_cell(k, rng=random):
 
 
 def _density_char(d):
-    if not (vis("color_density") and USE_COLOR):
+    # Controlled radar heatmap: intensity glyph + color; monochrome uses 0-9 digits.
+    if not (vis("color_density") and is_color_enabled()):
+        if not is_color_enabled():
+            shades = " .:-=+*#%@"
+            return shades[max(0, min(d, 9))]
         return str(d)
 
     if d <= 0:
-        return paint(".", "grey")
+        return paint("·", "grey")
     if d <= 2:
         return paint(str(d), "blue")
     if d <= 4:
@@ -1749,37 +2077,53 @@ def _density_char(d):
     if d <= 6:
         return paint(str(d), "green")
     if d <= 8:
-        return paint(str(d), "yellow")
+        return paint(str(d), "yellow", "bold")
 
     return paint(str(d), "red", "bold")
 
 
-def render_density(k):
+def _density_board_rows(k):
+    gap = _cell_gap()
     digits = density_digits(k)
-    rows = ["    " + " ".join(COLS)]
-
+    header = _board_header()
+    rows = [header]
     for r in range(SIZE):
-        row = []
+        cells = []
         for c in range(SIZE):
-            if k.tried((r, c)):
-                row.append("X" if (r, c) in k.hit or (r, c) in k.sunk else "o")
+            pos = (r, c)
+            if pos in k.hit or pos in k.sunk:
+                cells.append(paint("×", "yellow", "bold"))
+            elif pos in k.miss or k.tried(pos):
+                # Keep already-shot positions visually distinct from heat values.
+                cells.append(paint("○", "grey"))
             else:
-                row.append(_density_char(digits[r][c]))
+                cells.append(_density_char(digits[r][c]))
+        rows.append("%s  " % _row_label(r) + gap.join(cells))
+    return rows
 
-        rows.append("%2d  " % (r + 1) + " ".join(row))
 
-    return "\n".join(boxed_panel(paint("DENSITY MAP", "bold"), rows))
+def render_density(k):
+    rows = _density_board_rows(k)
+    hint = paint("High numbers = likely ship locations.  ○ = already tried.", "grey")
+    return "\n".join(boxed_panel(paint("TARGET DENSITY", "bold"), rows + [hint]))
 
 
 def hint_text(k, rng=random):
     top = top_candidates(k, n=3, rng=rng)
-    lines = []
+    lines = [paint("TOP TARGETS", "cyan", "bold")]
     for i, (p, score, count) in enumerate(top, 1):
-        why = "covered by %d remaining placements" % count
-        lines.append("%d) %s score=%d (%s)" % (i, cell_name(p), score, why))
+        marker = paint("▶", "cyan", "bold") if i == 1 else paint("%02d" % i, "grey")
+        lines.append("%s  %s  %s" % (
+            marker,
+            paint(cell_name(p).ljust(4), "bold", "white"),
+            paint("score %d · %d placements" % (score, count), "grey")))
+    if top:
+        lines.append("")
+        lines.append("%s  %s" % (
+            paint("RECOMMENDATION", "grey"), paint(cell_name(top[0][0]), "bold", "cyan")))
     if len(top) > 1 and top[0][1] == top[1][1]:
-        lines.append("Tie on score — tie-break prefers highest coverage variance, then random.")
-    return "\n".join(boxed_panel(paint("HINT", "bold"), lines))
+        lines.append(paint("Tie on score — variance, then random, breaks the tie.", "grey"))
+    return "\n".join(boxed_panel(paint("TACTICAL ADVISORY", "bold"), lines))
 
 
 def expert_par(ship_cells, rng=random):
@@ -2265,17 +2609,20 @@ def own_char(board, r, c, last=None):
     shot = (r, c) in board.shots
 
     if ship and shot:
-        if vis("damage_fire") and can_animate() and not board.is_sunk(ship):
+        if board.is_sunk(ship):
+            ch = paint("#", "red", "bold")
+        elif vis("damage_fire") and can_animate() and not board.is_sunk(ship):
             frame = int(time.time() * 4) % 2
-            ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
+            ch = paint("!", "red", "bold") if frame else paint("×", "yellow", "bold")
             if last == (r, c):
                 ch = _highlight(ch)
             return ch
-        ch = paint("X", "red", "bold")
+        else:
+            ch = paint("×", "red", "bold")
     elif ship:
-        ch = paint("S", "cyan", "bold")
+        ch = paint("■", "cyan", "bold")
     elif shot:
-        ch = paint("o", "white")
+        ch = paint("○", "white")
     else:
         ch = water_char(r, c)
 
@@ -2289,22 +2636,24 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
     ship = enemy.cells[r][c]
 
     if reveal_cells is not None and (r, c) in reveal_cells:
-        ch = paint("@", "cyan", "bold")
+        ch = paint("◉", "cyan", "bold")
     elif (r, c) in enemy.shots:
         if not ship:
-            ch = paint("o", "white")
-        elif not enemy.is_sunk(ship) and vis("damage_fire") and can_animate():
+            ch = paint("○", "white")
+        elif enemy.is_sunk(ship):
+            ch = paint("#", "green", "bold")
+        elif vis("damage_fire") and can_animate():
             frame = int(time.time() * 4) % 2
-            ch = paint("!", "red", "bold") if frame else paint("*", "yellow", "bold")
+            ch = paint("!", "red", "bold") if frame else paint("×", "yellow", "bold")
             if last == (r, c):
                 ch = _highlight(ch)
             return ch
         else:
-            ch = paint("#", "green", "bold") if enemy.is_sunk(ship) else paint("X", "yellow", "bold")
+            ch = paint("×", "yellow", "bold")
     elif reveal and ship:
-        ch = paint("S", "cyan")
+        ch = paint("■", "cyan")
     else:
-        ch = paint(".", "grey")
+        ch = paint("·", "grey")
 
     if last == (r, c):
         ch = _highlight(ch)
@@ -2312,35 +2661,45 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
     return ch
 
 
-def _board_header():
-    return "    " + " ".join(COLS)
-
-
 def _own_row(board, r, last_ai=None):
-    return "%2d  " % (r + 1) + " ".join(own_char(board, r, c, last=last_ai) for c in range(SIZE))
+    gap = _cell_gap()
+    return "%s  " % _row_label(r) + gap.join(own_char(board, r, c, last=last_ai) for c in range(SIZE))
 
 
 def _track_row(enemy, r, reveal=False, last_player=None, cursor=None, reveal_cells=None):
+    gap = _cell_gap()
     cells = []
     for c in range(SIZE):
         ch = track_char(enemy, r, c, reveal, last=last_player, reveal_cells=reveal_cells)
         if cursor == (r, c):
             ch = cursor_reverse(ch)
         cells.append(ch)
-    return "%2d  " % (r + 1) + " ".join(cells)
+    return "%s  " % _row_label(r) + gap.join(cells)
 
 
 def _own_row_with_ghost(board, r, ghost, ghost_valid, ghost_cursor):
+    gap = _cell_gap()
     cells = []
     for c in range(SIZE):
         if ghost_cursor == (r, c):
-            ch = paint("@", "green", "bold") if ghost_valid else paint("@", "red", "bold")
+            # Strongest focus: reverse-video target marker, valid=cyan/green, invalid=red.
+            base = "◉" if is_color_enabled() else "@"
+            ch = paint(base, "green", "bold") if ghost_valid else paint(base, "red", "bold")
+            ch = cursor_reverse(ch)
         elif (r, c) in ghost:
-            ch = paint("+", "green", "bold") if ghost_valid else paint("+", "red", "bold")
+            ch = paint("■" if is_color_enabled() else "+", "green", "bold") if ghost_valid else paint("×" if is_color_enabled() else "x", "red", "bold")
         else:
             ch = own_char(board, r, c)
         cells.append(ch)
-    return "%2d  " % (r + 1) + " ".join(cells)
+    return "%s  " % _row_label(r) + gap.join(cells)
+
+
+def _boards_fit_side_by_side():
+    # Visible width of one board box ≈ row label + cells + box chrome.
+    gap_n = len(_cell_gap())
+    board_vis = 4 + SIZE + (SIZE - 1) * gap_n
+    total = board_vis * 2 + 6 + 8  # gap + box borders + margin
+    return total <= term_width()
 
 
 def render_boards(player, enemy, reveal=False, last_player=None, last_ai=None, cursor=None, reveal_cells=None):
@@ -2350,24 +2709,29 @@ def render_boards(player, enemy, reveal=False, last_player=None, last_ai=None, c
     left_box = boxed_panel(paint("YOUR FLEET", "bold"), left_rows)
     right_box = boxed_panel(paint("ENEMY WATERS", "bold"), right_rows)
 
-    return "\n".join("  " + line for line in side_by_side(left_box, right_box, gap="   "))
+    if _boards_fit_side_by_side():
+        lines = side_by_side(left_box, right_box, gap="    ")
+    else:
+        # Narrow terminal: stack vertically, preserve coordinates, never wrap rows.
+        lines = left_box + [""] + right_box
+    return "\n".join(center_block(["  " + line if line else "" for line in lines]))
 
 
 def render_own(board, cursor=None, ghost=None, ghost_valid=True, ghost_cursor=None):
     ghost = ghost or set()
+    gap = _cell_gap()
     rows = [_board_header()]
     for r in range(SIZE):
         if ghost or ghost_cursor:
             row = _own_row_with_ghost(board, r, ghost, ghost_valid, ghost_cursor)
-            if cursor and cursor[0] == r:
+            if cursor and cursor[0] == r and ghost_cursor is None:
                 cells = []
                 for c in range(SIZE):
                     ch = own_char(board, r, c)
                     if cursor == (r, c):
                         ch = cursor_reverse(ch)
                     cells.append(ch)
-                row_parts = row.split("  ", 1)
-                row = row_parts[0] + "  " + " ".join(cells)
+                row = "%s  " % _row_label(r) + gap.join(cells)
         else:
             row = _own_row(board, r)
             if cursor and cursor[0] == r:
@@ -2377,10 +2741,11 @@ def render_own(board, cursor=None, ghost=None, ghost_valid=True, ghost_cursor=No
                     if cursor == (r, c):
                         ch = cursor_reverse(ch)
                     cells.append(ch)
-                row = "%2d  " % (r + 1) + " ".join(cells)
+                row = "%s  " % _row_label(r) + gap.join(cells)
         rows.append(row)
 
-    return "\n".join("  " + line for line in boxed_panel(paint("YOUR FLEET", "bold"), rows))
+    boxed = boxed_panel(paint("YOUR FLEET", "bold"), rows)
+    return "\n".join(center_block(["  " + line for line in boxed]))
 
 
 def _strip_prefix(lines):
@@ -2388,9 +2753,15 @@ def _strip_prefix(lines):
 
 
 def legend():
-    return ("Legend: %s water  %s your ship  %s hit (yellow=enemy, red=own)  %s miss  %s sunk  %s not fired at"
-            % (paint("~", "blue"), paint("S", "cyan", "bold"), paint("X", "yellow", "bold"),
-               paint("o", "white"), paint("#", "green", "bold"), paint(".", "grey")))
+    sep = paint("  ·  ", "grey")
+    return sep.join([
+        "%s %s" % (paint("~", "blue"), paint("water", "grey")),
+        "%s %s" % (paint("■", "cyan", "bold"), paint("your ship", "grey")),
+        "%s %s" % (paint("×", "yellow", "bold"), paint("hit", "grey")),
+        "%s %s" % (paint("○", "white"), paint("miss", "grey")),
+        "%s %s" % (paint("#", "green", "bold"), paint("sunk", "grey")),
+        "%s %s" % (paint("·", "grey"), paint("unknown", "grey")),
+    ])
 
 
 def fleet_text(names):
@@ -2447,7 +2818,6 @@ def interactive_place_fleet(board):
 
     with KeyReader() as kr:
         while True:
-            clear()
             if placed < len(FLEET):
                 name, length = FLEET[placed]
                 ghost, err = board.check_placement(length, cursor[0], cursor[1], horiz)
@@ -2458,28 +2828,58 @@ def interactive_place_fleet(board):
                 valid = True
                 ghost_set = set()
 
-            board_lines = _strip_prefix(
-                render_own(board, ghost=ghost_set, ghost_valid=valid,
-                           ghost_cursor=cursor).split("\n"))
+            cols, rows = term_size()
+            frame = []
+            frame.extend(center_block(brand_masthead("Deployment phase"), width=cols))
+            frame.extend(render_own(board, ghost=ghost_set, ghost_valid=valid,
+                                    ghost_cursor=cursor).split("\n"))
+            frame.append("")
             fleet_lines = fleet_panel(board, current_name=name if name else None)
-            for line in side_by_side(board_lines, fleet_lines, gap="  "):
-                print("  " + line)
-
-            print(legend())
-            print()
-            if name:
-                orient = "HORIZONTAL" if horiz else "VERTICAL"
-                print("  " + paint("Placing:", "bold") + " %s (%d)   " % (name, length) +
-                      paint("Cursor:", "bold") + " %s   " % cell_name(cursor) +
-                      paint("Dir:", "bold") + " %s" % orient)
+            # Deployment console: board is centerpiece; fleet + status alongside.
+            if cols >= 90:
+                status_rows = []
+                if name:
+                    status_rows.append(metric_row("PLACE", "%s (%d)" % (name.upper(), length)))
+                    status_rows.append(metric_row("LENGTH", str(length)))
+                    status_rows.append(metric_row("ORIENTATION", "HORIZONTAL" if horiz else "VERTICAL"))
+                    status_rows.append(metric_row("CURSOR", cell_name(cursor)))
+                    status_rows.append(metric_row("STATUS", "VALID" if valid else "BLOCKED"))
+                else:
+                    status_rows.append(status_badge("All ships placed — ready", "success"))
+                status_rows.append(metric_row("PROGRESS", "%d/%d" % (placed, len(FLEET))))
+                if msg:
+                    status_rows.append(strip_ansi(msg) if not is_color_enabled() else msg)
+                status_panel = boxed_panel(paint("DEPLOYMENT", "bold"), status_rows)
+                frame.extend(center_block(side_by_side(fleet_lines, status_panel, gap="    "), width=cols))
             else:
-                print("  " + paint("All ships placed.", "green", "bold") + "  Press Enter to continue.")
-            print("  Ships placed: %d/%d" % (placed, len(FLEET)))
-            if msg:
-                print(msg)
-            print()
-            print("  " + paint("─" * 46, "grey"))
-            print("  Arrows move · R rotate · Enter place · Z undo · Q quit")
+                frame.extend(center_block(fleet_lines, width=cols))
+                if name:
+                    orient = "HORIZONTAL" if horiz else "VERTICAL"
+                    state = status_badge("VALID", "ok") if valid else status_badge("BLOCKED", "critical")
+                    frame.extend(center_block([
+                        "%s %s (%d)  %s %s  %s %s  %s %s" % (
+                            paint("PLACE", "grey"), paint(name.upper(), "bold", "white"), length,
+                            paint("CURSOR", "grey"), paint(cell_name(cursor), "bold", "cyan"),
+                            paint("DIR", "grey"), paint(orient, "white"), paint("STATUS", "grey"), state),
+                        metric_row("PROGRESS", "%d/%d" % (placed, len(FLEET))),
+                    ], width=cols))
+                    if msg:
+                        frame.extend(center_block([msg], width=cols))
+                else:
+                    frame.extend(center_block([status_badge("All ships placed. Press Enter.", "success")], width=cols))
+            legend_block = [""] + center_block([_truncate_vis(legend(), cols - 4)], width=cols)
+            cmd_block = [""] + center_block(command_bar([
+                ("ARROWS", "MOVE"), ("R", "ROTATE"), ("ENTER", "PLACE"),
+                ("Z", "UNDO"), ("Q", "ABORT"),
+            ]), width=cols)
+            base = list(frame)
+            frame.extend(legend_block)
+            frame.extend(cmd_block)
+            if len(frame) > rows:
+                # Drop the single-line legend as a whole unit; the board and
+                # status boxes are never sliced mid-border.
+                frame = base + cmd_block
+            render_frame(frame)
 
             key = kr.get_key()
             msg = ""
@@ -2519,35 +2919,46 @@ def interactive_place_fleet(board):
 # ----------------------------------------------------------------------------
 
 HOW_TO_PLAY = """
-HOW TO PLAY
-1. Each side hides ships on a grid. Ship count and board size vary by setup.
-2. Ships lie in straight lines, across or down. They never overlap.
-3. Take turns firing at one square. You fire first.
-4. Squares are named column letter + row number: A1 (top-left).
-5. You are told HIT, MISS or SUNK. A ship sinks when all its squares are hit.
-   First to sink the other fleet wins.
+FIELD MANUAL
+RULES
+  Each side hides ships on a grid. Ship count and board size vary by setup.
+  Ships lie in straight horizontal/vertical lines. They never overlap.
+  Take turns firing at one square. You fire first.
+  Squares are named column letter + row number: A1 (top-left).
+  HIT, MISS or SUNK is reported. A ship sinks when all squares are hit.
+  First to sink the other fleet wins.
 
-SYMBOLS
-  ~ water     S your ship     X hit     o miss     # sunk enemy ship     . not fired
+BOARD
+  ~ water    ■ your ship    × hit    ○ miss    # sunk    · unknown
+  Left: YOUR FLEET. Right: ENEMY WATERS. Cursor shows current target.
 
-CONTROLS (interactive mode)
-  Arrows / WASD    move the cursor
-  Enter or Space   fire at the cursor
-  A–J              jump to that column
-  1–9, 0           jump to that row (0 = row 10)
-  ?                toggle hint suggestions
-  /                toggle density map
-  W                save game
-  Q or Esc         abandon the game
-  You can still type a cell (e.g. B7) and press Enter.
+CONTROLS — SHOOTING
+  Arrows / WASD    move cursor          Enter / Space   fire
+  A-N              jump to column       1-9, 0          jump to row
+  ?                tactical advisory    /               density map
+  W                save game            Q / Esc         abandon
+  Typed fallback: B7 + Enter, hint, map, board, save NAME, quit.
 
-PLACING SHIPS (interactive mode)
-  Arrows           move the placement cursor
-  R                rotate (horizontal / vertical)
-  Enter            place the ship
-  Z / Backspace    undo the last ship
-  Q or Esc         abandon setup
+PLACEMENT
+  Arrows           move cursor          R               rotate
+  Enter            place ship           Z / Backspace   undo
+  Q / Esc          abandon setup        Typed: A1 H / A1 V, undo, random.
+
+TACTICAL TOOLS
+  ? hint: top-3 expert cells with scores.  / map: 0-9 density heatmap.
+  Coach grades every shot against expert top-3. Shot review + Expert par
+  available after victory.
+
+SAVE / LOAD
+  In game: W or save <file>. Resume: python3 battleships.py --load save.json
+  Saves preserve boards, turn, stats and RNG state.
+
+LAN
+  10x10 classic. Commands: list, requests, request, accept, reject, cancel,
+  pref, name, password, anticheat, status, say, tell, chat, start, help, quit.
+  In game: T talk, L chat history, Q surrender. Verified vs forfeit wins.
 """
+
 
 SHOT_HELP = """
 Interactive controls:
@@ -2580,28 +2991,35 @@ Or type a start cell and direction like A1 H.
 def shot_msg_player(pos, hit, ship, sunk):
     cell = cell_name(pos)
     if sunk:
-        return paint(">>> SUNK! You destroyed the enemy %s (%d) with %s!" % (ship, SHIP_LEN[ship], cell),
-                     "green", "bold")
+        return event_row("sunk", cell, "Enemy %s destroyed" % ship)
     if hit:
-        return paint(">>> HIT at %s!" % cell, "yellow", "bold")
-    return "You fired at %s: miss." % cell
+        return event_row("hit", cell, "Target damaged")
+    return event_row("miss", cell, "No contact")
 
 
 def shot_msg_ai(pos, hit, ship, sunk):
     cell = cell_name(pos)
     if sunk:
-        return paint("Enemy fires at %s: SUNK your %s!" % (cell, ship), "red", "bold")
+        return event_row("lost", cell, "Enemy sank your %s" % ship)
     if hit:
-        return paint("Enemy fires at %s: hit on your %s." % (cell, ship), "red")
-    return "Enemy fires at %s: miss." % cell
+        return event_row("damage", cell, "Your %s hit" % ship)
+    return event_row("miss", cell, "Enemy missed")
+
+
+def _feed_lines(notes, limit=4):
+    items = list(notes or [])[-limit:]
+    if not items:
+        return [paint("No contact yet. Maneuver to firing position.", "grey")]
+    # Strip any leading whitespace; notes already carry semantic color.
+    return [_truncate_vis("  " + strip_ansi(n) if not is_color_enabled() else "  " + n,
+                           term_width() - 8) for n in items]
 
 
 def print_log(notes):
     if not notes:
         return
-    print("  " + paint("── LOG " + "─" * 46, "grey"))
-    for note in notes:
-        print("    " + note)
+    for line in center_block(boxed_panel(paint("BATTLE FEED", "bold"), _feed_lines(notes, limit=4))):
+        print(line)
 
 
 # ----------------------------------------------------------------------------
@@ -2611,30 +3029,33 @@ def print_log(notes):
 def show_shot_review(game):
     """Full shot-by-shot review with per-turn top-3 annotations."""
     clear()
-    print()
-    for line in big_banner("SHOT REVIEW", "cyan"):
-        print("  " + line)
+    for line in center_block(brand_masthead("Shot review")):
+        print(line)
+    for line in center_block(big_banner("SHOT REVIEW", "cyan")):
+        print(line)
     print()
 
     history = getattr(game, "shot_history", [])
     if not history:
-        print("  No shots recorded.")
+        for line in center_block(["  No shots recorded."]):
+            print(line)
         print()
         return
 
     for i, e in enumerate(history, 1):
         cell = cell_name(e["pos"])
         if e["sunk"]:
-            desc = paint("SUNK %s" % (e["ship"] or "ship"), "green", "bold")
+            desc = status_badge("SUNK %s" % (e["ship"] or "ship"), "success")
         elif e["hit"]:
-            desc = paint("HIT", "yellow", "bold")
+            desc = status_badge("HIT", "warn")
         else:
-            desc = paint("miss", "white")
+            desc = paint("miss".ljust(6), "grey")
         suffix = ""
         if not e["coach_opt"] and e.get("top3"):
             top3 = ", ".join(cell_name(p) for p in e["top3"])
             suffix = "   " + paint("(top-3: %s)" % top3, "grey")
-        print("  %3d.  %-5s  %s%s" % (i, cell, desc, suffix))
+        for line in center_block(["  %3d.  %-5s  %s%s" % (i, cell, desc, suffix)]):
+            print(line)
 
     print()
     print_coach_summary(history)
@@ -2648,23 +3069,27 @@ def print_coach_summary(history):
     opt = sum(1 for e in history if e["coach_opt"])
     off = total - opt
 
-    print("  " + paint("── COACH " + "─" * 46, "grey"))
-    print("    Shots: %d   Hits: %d   Accuracy: %d%%"
-          % (total, hits, 100 * hits // total))
-    print("    Expert top-3 picks: %d/%d (%d%%)" % (opt, total, 100 * opt // total))
+    for line in center_block(boxed_panel(paint("COACH", "bold"), [
+        metric_row("SHOTS", str(total)) + "   " + metric_row("HITS", str(hits)) + "   " + metric_row("ACCURACY", "%d%%" % (100 * hits // total)),
+        metric_row("OPTIMAL", "%d/%d (%d%%)" % (opt, total, 100 * opt // total)),
+    ])):
+        print(line)
 
     if off:
         print()
-        print("    Shots outside the expert top-3:")
+        for line in center_block([paint("SHOTS OUTSIDE EXPERT TOP-3", "grey")]):
+            print(line)
         for i, e in enumerate(history, 1):
             if not e["coach_opt"]:
                 top3 = ", ".join(cell_name(p) for p in e["top3"])
                 desc = "HIT" if e["hit"] else "miss"
-                print("      Turn %2d:  %-5s  %-5s   top-3: %s"
-                      % (i, cell_name(e["pos"]), desc, top3))
+                for line in center_block(["      Turn %2d:  %-5s  %-5s   top-3: %s"
+                      % (i, cell_name(e["pos"]), desc, top3)]):
+                    print(line)
     else:
         print()
-        print("    " + paint("Flawless! Every shot was in the expert top-3.", "green", "bold"))
+        for line in center_block([status_badge("Flawless — every shot in expert top-3", "success")]):
+            print(line)
 
 
 # ----------------------------------------------------------------------------
@@ -2707,7 +3132,7 @@ class Game:
             return self._setup_typed()
 
         choice = select_menu(
-            paint("FLEET SETUP", "bold"),
+            "\n".join(brand_masthead("Fleet setup")),
             ["Place my ships by hand", "Random layout"],
             start_idx=_MENU_STATE.last_setup_choice,
         )
@@ -2715,13 +3140,23 @@ class Game:
 
         if choice == 1:
             self.player.place_randomly(FLEET)
-            clear()
-            print(render_own(self.player))
-            print()
-            print("Random layout shown above.")
-            with KeyReader() as kr:
-                while True:
-                    print("  Enter = start · R = reroll · Q = abandon")
+            while True:
+                clear()
+                for line in center_block(brand_masthead("Random deployment — review layout")):
+                    print(line)
+                print(render_own(self.player))
+                print()
+                for line in center_block(boxed_panel(paint("READY", "bold"), [
+                    metric_row("SHIPS", "%d placed" % len(self.player.order)),
+                    paint("Reroll for a new layout, or confirm to sail.", "grey"),
+                ])):
+                    print(line)
+                print()
+                for line in center_block(command_bar([
+                    ("ENTER", "CONFIRM"), ("R", "REROLL"), ("Q", "ABANDON"),
+                ])):
+                    print(line)
+                with KeyReader() as kr:
                     key = kr.get_key()
                     if key == "ENTER":
                         return True
@@ -2729,9 +3164,6 @@ class Game:
                         while self.player.undo():
                             pass
                         self.player.place_randomly(FLEET)
-                        clear()
-                        print(render_own(self.player))
-                        print()
                         continue
                     if key in ("Q", "q", "ESC", "CTRL_C"):
                         return False
@@ -2803,28 +3235,162 @@ class Game:
     def status_lines(self) -> List[str]:
         s = self.stats
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
+        mode_name = "Salvo" if self.mode == "salvo" else "Normal"
         return [
-            "%s %d  ·  %s  ·  You: %d shots, %d hits (%s)"
-            % (paint("Turn", "bold"), self.turn, self.level, s["shots"], s["hits"], acc),
-            "%s  %s" % (paint("Your fleet:  ", "bold"), fleet_damage_text(self.player)),
-            "%s %s" % (paint("Enemy afloat:", "bold"), fleet_text(self.enemy.afloat())),
+            "%s  %s  %s" % (
+                metric_row("TURN", "%02d" % self.turn),
+                metric_row("OPPONENT", self.level.upper()),
+                metric_row("MODE", mode_name.upper())),
+            "%s  %s  %s" % (
+                metric_row("SHOTS", str(s["shots"])),
+                metric_row("HITS", str(s["hits"])),
+                metric_row("ACCURACY", acc)),
         ]
 
+    def _header_block(self):
+        title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("TACTICAL OPERATIONS", "cyan")
+        return [title] + self.status_lines() + [rule(min(72, term_width() - 8))]
+
+    def _tactical_side_panels(self, cursor=None):
+        fleet_rows = fleet_status_rows(self.player)
+        foe_rows = enemy_status_rows(enemy=self.enemy)
+        if cursor is not None:
+            target = cell_name(cursor)
+            fired = cursor in self.enemy.shots
+            state = "ENGAGED" if fired else "READY TO FIRE"
+        else:
+            target = "--"
+            state = "STANDBY"
+        target_rows = [
+            "%s  %s" % (paint("TARGET", "grey"), paint(target, "bold", "cyan")),
+            "%s  %s" % (paint("ACTION", "grey"), paint("FIRE", "bold", "white")),
+            "%s  %s" % (paint("STATUS", "grey"), status_badge(state, "focus" if state != "STANDBY" else "disabled")),
+        ]
+        left = boxed_panel(paint("FLEET STATUS", "bold"), fleet_rows)
+        mid = boxed_panel(paint("ENEMY FLEET", "bold"), foe_rows)
+        right = boxed_panel(paint("TARGET", "bold"), target_rows)
+        cols, _rows = term_size()
+        # Three balanced columns when they fit — saves ~6 vertical lines
+        # versus stacking TARGET below. Fall back gracefully on narrow terms.
+        three = side_by_side(side_by_side(left, mid, gap="    "), right, gap="    ")
+        three_w = max((_vis_len(l) for l in three), default=0)
+        if cols >= 100 and three_w <= cols - 2:
+            return three
+        w = term_width()
+        if w >= 80:
+            # Balanced columns for fleets; target acquisition stays visible beneath.
+            return side_by_side(left, mid, gap="    ") + [""] + right
+        return left + [""] + mid + [""] + right
+
+    def _frame_lines(self, notes, cursor=None, hint_block=None, density_block=None,
+                     extra_line=None, footer=None):
+        cols, rows = term_size()
+        header = center_block(self._header_block(), width=cols)
+        boards = render_boards(
+            self.player, self.enemy,
+            last_player=getattr(self, "last_player", None),
+            last_ai=getattr(self, "last_ai", None),
+            cursor=cursor).split("\n")
+        panels = center_block(self._tactical_side_panels(cursor=cursor), width=cols)
+        foot = center_block(footer, width=cols) if footer else []
+
+        # Core is sacred: header + boards + tactical panels + controls.
+        # Overlays (hint/density) and the feed share whatever rows remain.
+        core = header + boards + [""] + panels
+        tail = ([""] + foot) if foot else []
+
+        def centered(block):
+            return center_block([_truncate_vis(l, cols - 4) for l in block], width=cols)
+
+        # -- extras candidates, richest first; every box stays intact --------
+        extra_line_block = ([_truncate_vis(extra_line, cols - 4)] if extra_line else [])
+        blocks = [b for b in (hint_block, density_block) if b is not None]
+        side = None
+        if len(blocks) == 2:
+            cand = side_by_side(blocks[0], blocks[1], gap="    ")
+            if (max((_vis_len(l) for l in cand), default=0) <= cols - 2
+                    and len(cand) < len(blocks[0]) + 1 + len(blocks[1])):
+                side = cand
+        extras_options = []
+        if side is not None:
+            extras_options.append(([""] + extra_line_block + [""] + side) if extra_line_block else ([""] + side))
+        if blocks:
+            stacked = []
+            if extra_line_block:
+                stacked.append("")
+                stacked.extend(extra_line_block)
+            for b in blocks:
+                stacked.append("")
+                stacked.extend(b)
+            extras_options.append(stacked)
+        if extra_line_block:
+            extras_options.append([""] + extra_line_block)
+        extras_options.append([])
+
+        # -- feed candidates: full -> compact -> gone (whole box or nothing) --
+        feed_options = [
+            boxed_panel(paint("BATTLE FEED", "bold"), _feed_lines(notes, limit=4)),
+            boxed_panel(paint("BATTLE FEED", "bold"), _feed_lines(notes, limit=2)),
+            [],
+        ]
+
+        for ex in extras_options:
+            ex_c = centered(ex) if ex else []
+            for feed in feed_options:
+                feed_c = (centered(feed) + [""]) if feed else []
+                frame = core + ([""] + ex_c if ex_c else []) + ([""] + feed_c if feed_c else []) + tail
+                frame = self._collapse_blanks(frame)
+                if len(frame) <= rows:
+                    return frame
+        # Even bare extras overflow (tiny terminal): shrink the tallest extras
+        # box with intact borders as a last resort; core + footer never slice.
+        room = rows - len(core) - len(tail) - (1 if blocks else 0)
+        shrunk = []
+        per = max(3, room // max(1, len(blocks))) if blocks else 0
+        for b in blocks:
+            shrunk.append("")
+            shrunk.extend(_fit_box(b, per))
+        frame = core + centered(shrunk) + tail
+        return self._collapse_blanks(frame)
+
+    @staticmethod
+    def _collapse_blanks(frame):
+        out = []
+        for line in frame:
+            if line == "" and out and out[-1] == "":
+                continue
+            out.append(line)
+        return out
+
     def show(self, notes, cursor=None, extras=None):
-        clear()
-        print(render_boards(self.player, self.enemy,
-                            last_player=getattr(self, "last_player", None),
-                            last_ai=getattr(self, "last_ai", None),
-                            cursor=cursor))
-        print()
-        for line in boxed_panel(paint("STATUS", "bold"), self.status_lines()):
-            print("  " + line)
+        # Legacy flat-extras callers (none in hot paths) render as a single block.
+        footer = command_bar([
+            ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("?", "HINT"),
+            ("/", "DENSITY"), ("W", "SAVE"), ("Q", "QUIT"),
+        ])
         if extras:
-            print()
-            for line in extras:
-                print("  " + line)
-        print()
-        print_log(notes)
+            cols, rows = term_size()
+            header = center_block(self._header_block(), width=cols)
+            boards = render_boards(
+                self.player, self.enemy,
+                last_player=getattr(self, "last_player", None),
+                last_ai=getattr(self, "last_ai", None),
+                cursor=cursor).split("\n")
+            panels = center_block(self._tactical_side_panels(cursor=cursor), width=cols)
+            foot = center_block(footer, width=cols)
+            ex = center_block([_truncate_vis(l, cols - 4) for l in extras], width=cols)
+            feed = center_block(boxed_panel(paint("BATTLE FEED", "bold"),
+                                            _feed_lines(notes, limit=2)), width=cols)
+            frame = header + boards + [""] + panels + [""] + ex + [""] + feed + [""] + foot
+            if len(frame) > rows:
+                # Drop the flat extras block as a whole before anything else;
+                # never slice a box in half.
+                frame = header + boards + [""] + panels + [""] + feed + [""] + foot
+            if len(frame) > rows:
+                frame = header + boards + [""] + panels + [""] + foot
+            render_frame(frame)
+            return
+        render_frame(self._frame_lines(notes, cursor=cursor, footer=footer))
 
     # -- Properties (computed views; kept after public display methods) ---------
     @property
@@ -2848,19 +3414,18 @@ class Game:
         return (0, 0)
 
     def _cursor_shot_render(self, cursor, notes, extra="", hint=None, density=None):  # type: ignore[no-untyped-def]
-        extras = []
-        if extra:
-            extras.append(extra)
-        if hint is not None:
-            extras.append("")
-            extras.extend(hint.split("\n"))
-        if density is not None:
-            extras.append("")
-            extras.extend(density.split("\n"))
-        self.show(notes, cursor=cursor, extras=extras)
-        print()
-        print("  " + paint("─" * 60, "grey"))
-        print("  Arrows move · Enter fire · A–J col · 1–0 row · ? hint · / map · W save · Q quit")
+        # Structured blocks: _frame_lines lays them out with height budgeting
+        # (side-by-side when they fit, shrinking whole boxes before dropping).
+        footer = command_bar([
+            ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("?", "HINT"),
+            ("/", "DENSITY"), ("W", "SAVE"), ("Q", "QUIT"),
+        ])
+        render_frame(self._frame_lines(
+            notes, cursor=cursor,
+            hint_block=hint.split("\n") if hint is not None else None,
+            density_block=density.split("\n") if density is not None else None,
+            extra_line=extra or None,
+            footer=footer))
 
     # -- Shooting -------------------------------------------------------------
 
@@ -3139,52 +3704,65 @@ class Game:
 
     def finish_abandoned(self):
         clear()
+        for line in center_block(brand_masthead("After-action — abandoned")):
+            print(line)
         print(render_boards(self.player, self.enemy, reveal=True,
                             last_player=getattr(self, "last_player", None),
                             last_ai=getattr(self, "last_ai", None)))
         print()
-        print("  " + paint("Game abandoned. Enemy fleet revealed above.", "yellow"))
+        for line in center_block([paint("MISSION ABORTED — enemy fleet revealed.", "yellow", "bold")]):
+            print(line)
         print()
-        for line in boxed_panel(paint("STATUS", "bold"), self.status_lines()):
-            print("  " + line)
+        for line in center_block(boxed_panel(paint("STATUS", "bold"), self.status_lines())):
+            print(line)
 
     def rebuild_knowledge(self):
         self.pk = Knowledge.from_board(self.enemy)
 
     def finish(self, won, notes):
         clear()
-        print(render_boards(self.player, self.enemy, reveal=not won))
+        for line in center_block(brand_masthead("After-action report")):
+            print(line)
+        print(render_boards(self.player, self.enemy, reveal=not won,
+                            last_player=getattr(self, "last_player", None),
+                            last_ai=getattr(self, "last_ai", None)))
         finish_cinematic(won)
         print()
 
-        for line in big_banner("V I C T O R Y" if won else "D E F E A T",
-                               "green" if won else "red"):
-            print("  " + line)
+        title = "MISSION COMPLETE" if won else "MISSION FAILED"
+        subtitle = "Enemy fleet neutralized" if won else "Your fleet has been disabled"
+        for line in center_block(big_banner(title, "green" if won else "red")):
+            print(line)
+        for line in center_block([paint(subtitle, "grey")]):
+            print(line)
         print()
 
-        for note in notes:
-            print("    " + note)
+        for line in center_block(_feed_lines(notes, limit=6)):
+            print(line)
         print()
 
         s = self.stats
         if won:
             par = expert_par({n: list(c) for n, c in self.enemy.ship_cells.items()})
-            print("  " + paint(par_line(s["shots"], par), "cyan"))
+            for line in center_block([paint(par_line(s["shots"], par), "cyan")]):
+                print(line)
+            print()
 
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
         summary = [
-            "Turns: %d" % self.turn,
-            "Your shots:   %d  (%d hits, %s)" % (s["shots"], s["hits"], acc),
-            "Enemy shots:  %d  (%d hits)" % (s["ai_shots"], s["ai_hits"]),
-            "Ships afloat: %d/%d" % (len(self.player.afloat()), len(FLEET)),
-            "Hints used:   %d" % s["hints"],
+            metric_row("TURNS", str(self.turn)),
+            metric_row("YOUR SHOTS", "%d (%d hits, %s)" % (s["shots"], s["hits"], acc)),
+            metric_row("ENEMY SHOTS", "%d (%d hits)" % (s["ai_shots"], s["ai_hits"])),
+            metric_row("AFLOAT", "%d/%d" % (len(self.player.afloat()), len(FLEET))),
+            metric_row("HINTS", str(s["hints"])),
             coach_line(s["coach_opt"], s["coach_total"]),
-            "War: %s" % war_sparkline(self.shot_history),
+            metric_row("WAR", war_sparkline(self.shot_history)),
             mvp_line(self),
         ]
-        print()
-        for line in boxed_panel(paint("SUMMARY", "bold"), summary):
-            print("  " + line)
+        for line in center_block([paint("AFTER-ACTION REPORT", "bold", "cyan")]):
+            print(line)
+        for line in center_block(boxed_panel(paint("REPORT", "bold"), summary)):
+            print(line)
 
 
 # ----------------------------------------------------------------------------
@@ -3241,26 +3819,47 @@ class CampaignGame:
         self._show_summary("C A M P A I G N   C O M P L E T E", "green", lost_at=None)
         return "win"
 
+    def _mission_rows(self):
+        rows = []
+        for idx, name in enumerate(self.missions):
+            done = [r for r in self.results if r[0] == name]
+            if done:
+                _, won, shots, hits = done[0]
+                acc = "%d%%" % (100 * hits // shots) if shots else "-"
+                badge = status_badge("COMPLETE", "success") if won else status_badge("FAILED", "sunk")
+                rows.append("%s  %-9s  %s  %d shots (%s)" % (
+                    paint("●", "green", "bold"), name.upper().ljust(9), badge, shots, acc))
+            elif len(self.results) == idx:
+                rows.append("%s  %-9s  %s" % (
+                    paint("▶", "cyan", "bold"), name.upper().ljust(9), status_badge("CURRENT", "focus")))
+            else:
+                rows.append("%s  %-9s  %s" % (
+                    paint("○", "grey"), name.upper().ljust(9), status_badge("LOCKED", "disabled")))
+        return rows
+
     def _between_missions(self, done_idx):
         clear()
+        for line in center_block(brand_masthead("Campaign — mission debrief")):
+            print(line)
+        for line in center_block(big_banner("MISSION COMPLETE", "green")):
+            print(line)
         print()
-        for line in big_banner("MISSION COMPLETE", "green"):
-            print("  " + line)
+        for line in center_block([
+            paint("You defeated %s." % self.missions[done_idx], "white"),
+            paint("Next: %s" % (self.missions[done_idx + 1] if done_idx + 1 < len(self.missions) else "—"), "cyan"),
+        ]):
+            print(line)
         print()
-        print("  You defeated %s." % self.missions[done_idx])
-        if done_idx + 1 < len(self.missions):
-            print("  Next: %s" % self.missions[done_idx + 1])
-        print()
-        print("  Campaign so far:")
-        for name, won, shots, hits in self.results:
-            acc = "%d%%" % (100 * hits // shots) if shots else "-"
-            mark = paint("WIN ", "green", "bold") if won else paint("LOSS", "red", "bold")
-            print("    %s  %-7s  %d shots (%s)" % (mark, name, shots, acc))
+        for line in center_block([paint("CAMPAIGN PROGRESS", "bold", "cyan")]):
+            print(line)
+        for line in center_block(boxed_panel(paint("MISSIONS", "bold"), self._mission_rows())):
+            print(line)
         print()
 
         if supports_cursor_ui():
+            for line in center_block(command_bar([("ENTER", "NEXT MISSION"), ("Q", "END CAMPAIGN")])):
+                print(line)
             with KeyReader() as kr:
-                print("  Press Enter for next mission, or Q to end campaign...")
                 while True:
                     k = kr.get_key()
                     if k == "ENTER":
@@ -3271,33 +3870,34 @@ class CampaignGame:
 
     def _show_summary(self, title, color, lost_at):
         clear()
+        for line in center_block(brand_masthead("Campaign report")):
+            print(line)
+        for line in center_block(big_banner(title, color)):
+            print(line)
         print()
-        for line in big_banner(title, color):
-            print("  " + line)
-        print()
-
-        print("  Missions:")
-        for name, won, shots, hits in self.results:
-            acc = "%d%%" % (100 * hits // shots) if shots else "-"
-            mark = paint("WIN ", "green", "bold") if won else paint("LOSS", "red", "bold")
-            print("    %s  %-7s  %d shots (%s)" % (mark, name, shots, acc))
+        if self.results:
+            for line in center_block([paint("MISSIONS", "bold", "cyan")]):
+                print(line)
+            for line in center_block(boxed_panel(paint("PROGRESS", "bold"), self._mission_rows())):
+                print(line)
+            print()
 
         if lost_at:
+            for line in center_block([paint("Campaign stopped at %s." % lost_at, "yellow")]):
+                print(line)
             print()
-            print("  Campaign stopped at %s." % lost_at)
 
-        print()
         acc = "%d%%" % (100 * self.total_hits // self.total_shots) if self.total_shots else "-"
         summary = [
-            "Missions won:   %d/%d" % (sum(1 for r in self.results if r[1]), len(self.missions)),
-            "Total shots:    %d" % self.total_shots,
-            "Total hits:     %d  (%s)" % (self.total_hits, acc),
-            "Enemy shots:    %d" % self.total_ai_shots,
-            "Enemy hits:     %d" % self.total_ai_hits,
+            metric_row("WON", "%d/%d" % (sum(1 for r in self.results if r[1]), len(self.missions))),
+            metric_row("SHOTS", str(self.total_shots)),
+            metric_row("HITS", "%d (%s)" % (self.total_hits, acc)),
+            metric_row("ENEMY SHOTS", str(self.total_ai_shots)),
+            metric_row("ENEMY HITS", str(self.total_ai_hits)),
         ]
         print()
-        for line in boxed_panel(paint("CAMPAIGN SUMMARY", "bold"), summary):
-            print("  " + line)
+        for line in center_block(boxed_panel(paint("CAMPAIGN SUMMARY", "bold"), summary)):
+            print(line)
 
 
 # ----------------------------------------------------------------------------
@@ -3330,14 +3930,22 @@ class HotseatGame:
     def handoff(self, seat):
         _reset_burst_state()
         clear()
+        for line in center_block(brand_masthead("Secure transfer")):
+            print(line)
+        for line in center_block(big_banner("CLASSIFIED HANDOFF", "cyan")):
+            print(line)
         print()
-        for line in big_banner("PLAYER %d" % (seat + 1), "cyan"):
-            print("  " + line)
+        for line in center_block([
+            metric_row("PLAYER", "%d READY" % (seat + 1)),
+            paint("Transfer terminal. Keep opponent away from screen.", "yellow", "bold"),
+            paint("Hidden fleet information is never shown here.", "grey"),
+        ]):
+            print(line)
         print()
-        print("  " + paint("Hand the terminal to Player %d. Opponent look away.", "bold") % (seat + 1))
         if supports_cursor_ui():
+            for line in center_block(command_bar([("ENTER", "SECURE — CONTINUE"), ("Q", "ABORT")])):
+                print(line)
             with KeyReader() as kr:
-                print("  Press Enter when ready...")
                 while True:
                     k = kr.get_key()
                     if k == "ENTER":
@@ -3345,7 +3953,7 @@ class HotseatGame:
                     if k in ("Q", "q", "ESC", "CTRL_C"):
                         raise Quit
         else:
-            ask("  Press Enter when ready > ")
+            ask("  Press Enter when secure > ")
 
     def setup_board(self, seat):
         board = self.boards[seat]
@@ -3354,7 +3962,7 @@ class HotseatGame:
             return True
 
         choice = select_menu(
-            paint("PLAYER %d — FLEET SETUP" % (seat + 1), "bold"),
+            "\n".join(brand_masthead("Player %d — fleet setup" % (seat + 1))),
             ["Place my ships by hand", "Random layout"],
             start_idx=_MENU_STATE.last_setup_choice,
         )
@@ -3367,11 +3975,14 @@ class HotseatGame:
                 return False
 
         clear()
+        for line in center_block(brand_masthead("Player %d — fleet ready" % (seat + 1))):
+            print(line)
         print(render_own(board))
         print()
         if supports_cursor_ui():
+            for line in center_block(command_bar([("ENTER", "HAND OVER"), ("Q", "ABORT")])):
+                print(line)
             with KeyReader() as kr:
-                print("  Player %d fleet ready. Press Enter to hand over." % (seat + 1))
                 while True:
                     k = kr.get_key()
                     if k == "ENTER":
@@ -3415,34 +4026,34 @@ class HotseatGame:
         cursor = self.cursors[seat] if self.cursors[seat] is not None else self._first_untried(foe)
         extra = ""
         while True:
-            clear()
-            for line in big_banner("PLAYER %d" % (seat + 1), "cyan"):
-                print("  " + line)
-            print()
-
-            left_rows = [_board_header()] + [_own_row(self.boards[seat], r) for r in range(SIZE)]
-            right_rows = [_board_header()] + [_track_row(foe, r, False, cursor=cursor) for r in range(SIZE)]
-            left_box = boxed_panel(paint("YOUR FLEET", "bold"), left_rows)
-            right_box = boxed_panel(paint("ENEMY WATERS", "bold"), right_rows)
-            for line in side_by_side(left_box, right_box, gap="   "):
-                print("  " + line)
-
-            print()
-            print(legend())
-            print()
-            status = [
-                "Player %d  ·  Shots: %d  ·  Hits: %d"
-                % (seat + 1, self.stats[seat]["shots"], self.stats[seat]["hits"]),
-                "Enemy afloat: " + fleet_text(foe.afloat()),
-            ]
-            for line in boxed_panel(paint("STATUS", "bold"), status):
-                print("  " + line)
+            cols, rows = term_size()
+            frame = []
+            frame.extend(center_block(brand_masthead("Hotseat — Player %d firing" % (seat + 1)), width=cols))
+            frame.extend(render_boards(self.boards[seat], foe, cursor=cursor).split("\n"))
+            frame.append("")
+            frame.extend(center_block(boxed_panel(paint("STATUS", "bold"), [
+                "%s  %s" % (metric_row("PLAYER", str(seat + 1)),
+                            metric_row("TARGET", cell_name(cursor))),
+                "%s  %s" % (metric_row("SHOTS", str(self.stats[seat]["shots"])),
+                            metric_row("HITS", str(self.stats[seat]["hits"]))),
+            ]), width=cols))
+            foe_rows = enemy_status_rows(enemy=foe)
+            frame.extend(center_block(boxed_panel(paint("ENEMY FLEET", "bold"), foe_rows), width=cols))
             if extra:
-                print()
-                print("  " + extra)
-            print()
-            print("  " + paint("─" * 60, "grey"))
-            print("  Arrows move · Enter fire · A–J col · 1–0 row · Q quit")
+                frame.append("")
+                frame.extend(center_block([extra], width=cols))
+            legend_block = [""] + center_block([_truncate_vis(legend(), cols - 4)], width=cols)
+            cmd_block = [""] + center_block(command_bar([
+                ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("Q", "QUIT"),
+            ]), width=cols)
+            base = list(frame)
+            frame.extend(legend_block)
+            frame.extend(cmd_block)
+            if len(frame) > rows:
+                # Drop the single-line legend as a whole unit; the board and
+                # status boxes are never sliced mid-border.
+                frame = base + cmd_block
+            render_frame(frame)
 
             try:
                 with KeyReader() as kr:
@@ -3499,17 +4110,21 @@ class HotseatGame:
             res = self.fire_shells(seat, [pos])
             hit, ship, sunk = res[0]
             burst_shot(pos, hit, ship, sunk, opp=False)
-            print("  " + shot_msg_player(pos, *res[0]))
+            for line in center_block([shot_msg_player(pos, *res[0])]):
+                print(line)
 
             if foe.all_sunk():
                 print()
-                for line in big_banner("PLAYER %d WINS" % (seat + 1), "green"):
-                    print("  " + line)
+                for line in center_block(big_banner("PLAYER %d WINS" % (seat + 1), "green")):
+                    print(line)
+                for line in center_block([paint("Enemy fleet neutralized.", "grey")]):
+                    print(line)
                 return "p1" if seat == 0 else "p2"
 
             if supports_cursor_ui():
                 print()
-                print("  Press Enter to end your turn...")
+                for line in center_block(command_bar([("ENTER", "END TURN"), ("Q", "ABANDON")])):
+                    print(line)
                 try:
                     with KeyReader() as kr:
                         while True:
@@ -3796,20 +4411,19 @@ def lengths_text(lengths):
 def lan_shot_msg_player(pos, hit, sunk_len):
     cell = cell_name(pos)
     if sunk_len:
-        return paint(">>> SUNK! You destroyed an enemy ship of length %d with %s!" % (sunk_len, cell),
-                     "green", "bold")
+        return event_row("sunk", cell, "Enemy ship (len %d) destroyed" % sunk_len)
     if hit:
-        return paint(">>> HIT at %s!" % cell, "yellow", "bold")
-    return "You fired at %s: miss." % cell
+        return event_row("hit", cell, "Target damaged")
+    return event_row("miss", cell, "No contact")
 
 
 def lan_shot_msg_opp(pos, hit, ship, sunk):
     cell = cell_name(pos)
     if sunk:
-        return paint("Opponent fires at %s: SUNK your %s!" % (cell, ship), "red", "bold")
+        return event_row("lost", cell, "Opponent sank your %s" % ship)
     if hit:
-        return paint("Opponent fires at %s: hit on your %s." % (cell, ship), "red")
-    return "Opponent fires at %s: miss." % cell
+        return event_row("damage", cell, "Opponent hit your %s" % ship)
+    return event_row("miss", cell, "Opponent missed")
 
 
 # ----------------------------------------------------------------------------
@@ -4013,13 +4627,13 @@ def remote_char(k, r, c, last=None, extra_sunk=None):
     if extra_sunk is not None and pos in extra_sunk:
         ch = paint("#", "green", "bold")
     elif pos in k.miss:
-        ch = paint("o", "white")
+        ch = paint("○", "white")
     elif pos in k.sunk:
         ch = paint("#", "green", "bold")
     elif pos in k.hit:
-        ch = paint("X", "yellow", "bold")
+        ch = paint("×", "yellow", "bold")
     else:
-        ch = paint(".", "grey")
+        ch = paint("·", "grey")
 
     if last == pos:
         ch = _highlight(ch)
@@ -4029,8 +4643,9 @@ def remote_char(k, r, c, last=None, extra_sunk=None):
 
 def render_lan_boards(player, k, last_player=None, last_opp=None,
                       extra_sunk=None, cursor=None):
+    gap = _cell_gap()
     left_rows = [_board_header()] + [
-        "%2d  " % (r + 1) + " ".join(own_char(player, r, c, last=last_opp) for c in range(SIZE))
+        "%s  " % _row_label(r) + gap.join(own_char(player, r, c, last=last_opp) for c in range(SIZE))
         for r in range(SIZE)
     ]
     right_rows = [_board_header()]
@@ -4041,11 +4656,15 @@ def render_lan_boards(player, k, last_player=None, last_opp=None,
             if cursor == (r, c):
                 ch = cursor_reverse(ch)
             cells.append(ch)
-        right_rows.append("%2d  " % (r + 1) + " ".join(cells))
+        right_rows.append("%s  " % _row_label(r) + gap.join(cells))
 
     left_box = boxed_panel(paint("YOUR FLEET", "bold"), left_rows)
     right_box = boxed_panel(paint("ENEMY WATERS", "bold"), right_rows)
-    return "\n".join("  " + line for line in side_by_side(left_box, right_box, gap="   "))
+    if _boards_fit_side_by_side():
+        lines = side_by_side(left_box, right_box, gap="    ")
+    else:
+        lines = left_box + [""] + right_box
+    return "\n".join(center_block(["  " + line if line else "" for line in lines]))
 
 
 PROTOCOL_TYPES = {
@@ -4492,13 +5111,8 @@ class LANGame:
         if not supports_cursor_ui():
             return self._setup_typed()
 
-        print()
-        for line in big_banner("FLEET SETUP (LAN)", "bold"):
-            print("  " + line)
-        print()
-
         choice = select_menu(
-            paint("FLEET SETUP (LAN)", "bold"),
+            "\n".join(brand_masthead("LAN deployment — vs %s" % str(getattr(self.conn, 'peer_name', 'peer'))[:20])),
             ["Place my ships by hand", "Random layout"],
             start_idx=_MENU_STATE.last_setup_choice,
         )
@@ -4506,13 +5120,17 @@ class LANGame:
 
         if choice == 1:
             self.player.place_randomly(FLEET)
-            clear()
-            print(render_own(self.player))
-            print()
-            print("Random layout shown above.")
-            with KeyReader() as kr:
-                while True:
-                    print("  Enter = start · R = reroll · Q = surrender")
+            while True:
+                clear()
+                for line in center_block(brand_masthead("LAN deployment — review layout")):
+                    print(line)
+                print(render_own(self.player))
+                print()
+                for line in center_block(command_bar([
+                    ("ENTER", "CONFIRM"), ("R", "REROLL"), ("Q", "SURRENDER"),
+                ])):
+                    print(line)
+                with KeyReader() as kr:
                     key = kr.get_key()
                     if key == "ENTER":
                         return True
@@ -4520,9 +5138,6 @@ class LANGame:
                         while self.player.undo():
                             pass
                         self.player.place_randomly(FLEET)
-                        clear()
-                        print(render_own(self.player))
-                        print()
                         continue
                     if key in ("Q", "q", "ESC", "CTRL_C"):
                         if confirm("Surrender this match?"):
@@ -4698,34 +5313,87 @@ class LANGame:
         s = self.stats
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
         mode_name = "Salvo" if self.mode == "salvo" else "Normal"
+        ver = "CELL" if getattr(self.conn, "cell_anticheat", False) else "HASH"
         return [
-            "%s %d  ·  %s  ·  %s  ·  You: %d shots, %d hits (%s)"
-            % (paint("Turn", "bold"), self.turn, self.peer_name, mode_name, s["shots"], s["hits"], acc),
-            "%s  %s" % (paint("Your fleet:  ", "bold"), fleet_damage_text(self.player)),
-            "%s %s" % (paint("Enemy lengths:", "bold"), lengths_text(self.pk.remaining)),
+            "%s  %s  %s" % (
+                metric_row("TURN", "%02d" % self.turn),
+                metric_row("OPPONENT", str(self.peer_name).upper()[:16]),
+                metric_row("MODE", mode_name.upper())),
+            "%s  %s  %s" % (
+                metric_row("SHOTS", str(s["shots"])),
+                metric_row("HITS", str(s["hits"])),
+                metric_row("ACCURACY", acc)),
+            "%s  %s" % (
+                metric_row("SECURE", ver),
+                metric_row("LINK", "STABLE" if not getattr(self.conn, "closed", False) else "LOST")),
         ]
 
+    def _lan_header(self):
+        title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS · %s" % str(self.peer_name).upper()[:20], "cyan")
+        return [title] + self.status_lines() + [rule(min(72, term_width() - 8))]
+
     def show(self, notes, cursor=None, extras=None):
-        clear()
+        cols, rows = term_size()
+        footer = command_bar([
+            ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("T", "TALK"),
+            ("L", "CHAT"), ("Q", "SURRENDER"),
+        ])
+        frame = []
+        frame.extend(center_block(self._lan_header(), width=cols))
         extra_sunk = self.verified_sunk_cells if self.conn.cell_anticheat else None
 
-        print(render_lan_boards(
+        frame.extend(render_lan_boards(
             self.player, self.pk,
             last_player=self.last_player,
             last_opp=self.last_opp,
             extra_sunk=extra_sunk,
             cursor=cursor,
-        ))
+        ).split("\n"))
 
-        print()
-        for line in boxed_panel(paint("STATUS", "bold"), self.status_lines()):
-            print("  " + line)
+        frame.append("")
+        fleet_rows = fleet_status_rows(self.player)
+        foe_rows = enemy_status_rows(knowledge=self.pk)
+        if cursor is not None:
+            target_rows = [
+                "%s  %s" % (paint("TARGET", "grey"), paint(cell_name(cursor), "bold", "cyan")),
+                "%s  %s" % (paint("OPPONENT", "grey"), paint(str(self.peer_name)[:18], "white")),
+                "%s  %s" % (paint("STATUS", "grey"), status_badge("READY TO FIRE", "focus")),
+            ]
+        else:
+            target_rows = [
+                "%s  %s" % (paint("OPPONENT", "grey"), paint(str(self.peer_name)[:18], "white")),
+                "%s  %s" % (paint("MODE", "grey"), paint("Salvo" if self.mode == "salvo" else "Normal", "white")),
+            ]
+        left = boxed_panel(paint("FLEET STATUS", "bold"), fleet_rows)
+        mid = boxed_panel(paint("ENEMY FLEET", "bold"), foe_rows)
+        right = boxed_panel(paint("TARGET", "bold"), target_rows)
+        three = side_by_side(side_by_side(left, mid, gap="    "), right, gap="    ")
+        three_w = max((_vis_len(l) for l in three), default=0)
+        if cols >= 100 and three_w <= cols - 2:
+            frame.extend(center_block(three, width=cols))
+        elif cols >= 80:
+            frame.extend(center_block(side_by_side(left, mid, gap="    "), width=cols))
+            frame.append("")
+            frame.extend(center_block(right, width=cols))
+        else:
+            frame.extend(center_block(left + [""] + mid + [""] + right, width=cols))
         if extras:
-            print()
-            for line in extras:
-                print("  " + line)
-        print()
-        print_log(notes)
+            frame.append("")
+            frame.extend(center_block([_truncate_vis(l, cols - 4) for l in extras], width=cols))
+        base = list(frame)
+        foot_block = [""] + center_block(footer, width=cols)
+        for limit in (4, 2, 0):
+            if limit:
+                feed_block = [""] + center_block(boxed_panel(
+                    paint("BATTLE FEED", "bold"), _feed_lines(notes, limit=limit)), width=cols)
+            else:
+                feed_block = []
+            frame = base + feed_block + foot_block
+            if len(frame) <= rows:
+                break
+        else:
+            frame = base + foot_block
+        render_frame(frame)
 
     def _first_untried(self):
         for r in range(SIZE):
@@ -4737,13 +5405,10 @@ class LANGame:
     def _render_shot_cursor(self, cursor, notes, extra="", salvo=False, remaining=1, current=None):
         extras = []
         if salvo:
-            extras.append(paint("Salvo shell %d of %d" % (len(current or []) + 1, remaining), "cyan"))
+            extras.append(paint("Salvo shell %d of %d" % (len(current or []) + 1, remaining), "cyan", "bold"))
         if extra:
             extras.append(extra)
         self.show(notes, cursor=cursor, extras=extras)
-        print()
-        print("  " + paint("─" * 60, "grey"))
-        print("  Arrows move · Enter fire · A–J col · 1–0 row · T talk · L chat · Q surrender")
 
     def _get_shot_typed(self, notes, salvo=False, remaining=1, current=None):
         current = current or []
@@ -5290,6 +5955,8 @@ class LANGame:
 
     def show_finish(self):
         clear()
+        for line in center_block(brand_masthead("LAN after-action — vs %s" % str(self.peer_name)[:20])):
+            print(line)
 
         reveal_board = None
 
@@ -5320,42 +5987,48 @@ class LANGame:
         print()
 
         if self.result == "win":
-            title, color = "V I C T O R Y", "green"
+            title, color = "MISSION COMPLETE", "green"
         elif self.result == "loss":
-            title, color = "D E F E A T", "red"
+            title, color = "MISSION FAILED", "red"
         else:
-            title, color = "A B A N D O N E D", "yellow"
+            title, color = "ABANDONED", "yellow"
 
-        for line in big_banner(title, color):
-            print("  " + line)
+        for line in center_block(big_banner(title, color)):
+            print(line)
         print()
 
         if self.interrupt_msg:
-            print("  " + self.interrupt_msg)
+            for line in center_block([paint(self.interrupt_msg, "yellow")]):
+                print(line)
 
         if self.result == "win" and self.win_kind == "verified":
-            print("  " + paint("(verified win)", "cyan"))
+            for line in center_block([paint("(VERIFIED WIN)", "cyan", "bold")]):
+                print(line)
         elif self.result == "win":
-            print("  " + paint("(forfeit win)", "cyan"))
+            for line in center_block([paint("(FORFEIT WIN)", "cyan")]):
+                print(line)
 
         if self.anti_cheat_msg:
-            print("  " + self.anti_cheat_msg)
+            for line in center_block([_truncate_vis(self.anti_cheat_msg, term_width() - 8)]):
+                print(line)
         print()
 
-        for note in self.finish_notes:
-            print("    " + note)
+        for line in center_block(_feed_lines(self.finish_notes, limit=6)):
+            print(line)
         print()
 
         s = self.stats
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
         summary = [
-            "Turns: %d" % self.turn,
-            "Your shots:      %d  (%d hits, %s)" % (s["shots"], s["hits"], acc),
-            "Opponent shots:  %d  (%d hits)" % (s["opp_shots"], s["opp_hits"]),
+            metric_row("TURNS", str(self.turn)),
+            metric_row("YOUR SHOTS", "%d (%d hits, %s)" % (s["shots"], s["hits"], acc)),
+            metric_row("OPP SHOTS", "%d (%d hits)" % (s["opp_shots"], s["opp_hits"])),
             coach_line(s["coach_opt"], s["coach_total"]),
         ]
-        for line in boxed_panel(paint("SUMMARY", "bold"), summary):
-            print("  " + line)
+        for line in center_block([paint("AFTER-ACTION REPORT", "bold", "cyan")]):
+            print(line)
+        for line in center_block(boxed_panel(paint("REPORT", "bold"), summary)):
+            print(line)
 
     def _finalize(self):
         if self.finished:
@@ -6530,9 +7203,9 @@ class LANClient:
         self.notifications.append(line)
 
     def _lobby_header(self):
-        lines = list(title_banner())
+        lines = []
+        lines.extend(brand_masthead("LAN operations"))
         lines.append("")
-        lines.append("  " + paint("LAN LOBBY", "bold"))
 
         with self.peer_lock:
             peer_count = len(self.peers)
@@ -6541,29 +7214,20 @@ class LANClient:
             req_count = len(self.incoming_requests)
 
         status = [
-            "Name: %s" % self.name,
-            "Port: %d" % self.port,
-            "Players seen: %d" % peer_count,
-            "Incoming requests: %d" % req_count,
-            "Mode preference: %s" % ("Salvo" if self.pref == "salvo" else "Normal"),
-            "Password lobby: %s" % ("enabled" if self.lobby_key else "disabled"),
-            "Cell anti-cheat: %s" % ("enabled" if self.cell_anticheat else "disabled"),
-            "LAN score: %d W (%d verified, %d forfeit) / %d L" % (
-                self.lan_score["win"],
-                self.lan_score["verified_win"],
-                self.lan_score["forfeit_win"],
-                self.lan_score["loss"],
-            ),
+            "%s  %s" % (metric_row("YOU", self.name[:18]), metric_row("PORT", str(self.port))),
+            "%s  %s" % (metric_row("PEERS", str(peer_count)), metric_row("REQUESTS", str(req_count))),
+            "%s  %s" % (metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
+                        metric_row("LOCK", "ON" if self.lobby_key else "OFF")),
+            "%s  %s" % (metric_row("ANTICHEAT", "CELL" if self.cell_anticheat else "HASH"),
+                        metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
         ]
 
         if self.outgoing_request:
-            status.append(paint("Outgoing request pending...", "cyan"))
+            status.append(paint("Outgoing request pending…", "cyan"))
 
         if self.pending_match:
-            status.append(paint("Pending match: %s" % self.pending_match.peer_name,
-                                "green", "bold"))
+            status.append(status_badge("Pending match: %s" % self.pending_match.peer_name, "success"))
 
-        lines.append("")
         lines.extend(boxed_panel(paint("STATUS", "bold"), status))
 
         notices = list(self.notifications)[-4:]
@@ -6878,9 +7542,8 @@ class LANClient:
 
     def _status_menu(self):
         clear()
-        print()
-        print(paint("LAN STATUS", "bold"))
-        print()
+        for line in center_block(brand_masthead("LAN status — operations")):
+            print(line)
 
         with self.peer_lock:
             peer_count = len(self.peers)
@@ -6888,49 +7551,56 @@ class LANClient:
         with self.request_lock:
             req_count = len(self.incoming_requests)
 
-        print("  Name: %s" % self.name)
-        print("  Port: %d" % self.port)
-        print("  Players seen: %d" % peer_count)
-        print("  Incoming requests: %d" % req_count)
-        print("  Mode preference: %s" % ("Salvo" if self.pref == "salvo" else "Normal"))
-        print("  Password lobby: %s" % ("enabled" if self.lobby_key else "disabled"))
-        print("  Per-cell anti-cheat: %s" % ("enabled" if self.cell_anticheat else "disabled"))
-        print()
-        print("  LAN score:")
-        print("    Wins: %d" % self.lan_score["win"])
-        print("    Verified wins: %d" % self.lan_score["verified_win"])
-        print("    Forfeit wins: %d" % self.lan_score["forfeit_win"])
-        print("    Losses: %d" % self.lan_score["loss"])
+        rows = [
+            metric_row("YOU", self.name),
+            metric_row("PORT", str(self.port)),
+            metric_row("PEERS", str(peer_count)),
+            metric_row("REQUESTS", str(req_count)),
+            metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
+            metric_row("LOCK", "ON" if self.lobby_key else "OFF"),
+            metric_row("ANTICHEAT", "CELL" if self.cell_anticheat else "HASH"),
+            metric_row("WINS", str(self.lan_score["win"])),
+            metric_row("VERIFIED", str(self.lan_score["verified_win"])),
+            metric_row("FORFEIT", str(self.lan_score["forfeit_win"])),
+            metric_row("LOSSES", str(self.lan_score["loss"])),
+        ]
+        for line in center_block(boxed_panel(paint("STATUS", "bold"), rows)):
+            print(line)
         print()
 
         if self.pending_match:
-            print("  " + paint("Pending match: %s" % self.pending_match.peer_name,
-                               "green", "bold"))
+            for line in center_block([status_badge("Pending match: %s" % self.pending_match.peer_name, "success")]):
+                print(line)
         else:
-            print("  No pending match.")
+            for line in center_block([paint("No pending match.", "grey")]):
+                print(line)
 
         if self.outgoing_request:
-            print("  " + paint("Outgoing request pending...", "cyan"))
+            for line in center_block([paint("Outgoing request pending…", "cyan")]):
+                print(line)
         else:
-            print("  No outgoing request pending.")
+            for line in center_block([paint("No outgoing request pending.", "grey")]):
+                print(line)
 
         print()
         ask("Press Enter to return > ")
 
     def _help_menu(self):
         clear()
+        for line in center_block(brand_masthead("LAN field manual")):
+            print(line)
+        for line in center_block(boxed_panel(paint("LIVE LOBBY", "bold"), [
+            paint("Lobby auto-refreshes. Players and chat stay side-by-side.", "grey"),
+            "",
+            paint("↑/↓ select · Enter action · 1-9 challenge · C chat · T tell", "white"),
+            paint("R requests · A accept first · G start · X cancel · S settings", "white"),
+            paint("U status · / command · E advanced · L log · Q quit", "white"),
+        ])):
+            print(line)
         print()
-        print(paint("LAN HELP — live lobby", "bold"))
+        for line in center_block(LAN_HELP.strip("\n").split("\n")):
+            print(line)
         print()
-        print("  The lobby auto-refreshes (~1s). Players (left) and chat (right)")
-        print("  stay side-by-side with no manual refresh.")
-        print()
-        print("  ↑/↓ select player · Enter action · 1-9 quick challenge")
-        print("  C public chat · T private to selected · L full chat log")
-        print("  R review requests · A accept first · G start match · X cancel")
-        print("  S settings · U status · / one command · E advanced commands")
-        print("  Q quit")
-        print(LAN_HELP)
         ask("Press Enter to return > ")
 
     def _command_menu(self):
@@ -7064,50 +7734,58 @@ class LANClient:
         player_content = []
         if not peers:
             player_content = [
-                "No players yet.",
-                "Waiting for beacons...",
+                paint("No players yet.", "grey"),
+                paint("Waiting for beacons…", "grey"),
                 "",
-                "Ask a friend to open",
-                "LAN Matchmaking too.",
+                paint("Ask a friend to open", "grey"),
+                paint("LAN Matchmaking too.", "grey"),
             ]
         else:
             for i, p in enumerate(peers[:player_rows_n]):
-                marker = paint("▶", "cyan", "bold") if i == sel_idx else " "
-                pref = "Salvo" if p.pref == "salvo" else "Normal"
+                marker = paint("▶", "cyan", "bold") if i == sel_idx else paint(" ", "grey")
+                pref = "SALVO" if p.pref == "salvo" else "NORMAL"
                 state = p.state or "available"
                 if state == "available":
-                    state_txt = paint("avail", "green")
+                    state_txt = status_badge("AVAIL", "ok")
                 else:
-                    state_txt = paint(state[:8], "yellow")
-                prefix = _truncate_vis("%d %-14s %s " % (i + 1, p.name[:14], pref), 24)
-                player_content.append("%s %s%s" % (marker, prefix, state_txt))
+                    state_txt = status_badge(state[:8].upper(), "warn")
+                prefix = "%d %-14s %s " % (i + 1, p.name[:14], pref)
+                player_content.append("%s %s%s" % (marker, _truncate_vis(prefix, 24), state_txt))
             if len(peers) > player_rows_n:
-                player_content.append("+%d more" % (len(peers) - player_rows_n))
+                player_content.append(paint("+%d more" % (len(peers) - player_rows_n), "grey"))
         while len(player_content) < 5:
             player_content.append("")
         left = boxed_panel(paint("PLAYERS (%d)" % len(peers), "bold"), player_content)
 
         # -- right: chat (always tailed, auto-updated) ----------------------
         history = list(self.chat_history)[-chat_rows_n:]
-        chat_w = max(24, cols - 46)
+        chat_w = max(24, cols - 48)
         chat_content = []
         if not history:
-            chat_content = ["No messages yet.", "Press C to say hi!"]
+            chat_content = [paint("No messages yet.", "grey"), paint("Press C to say hi!", "cyan")]
         else:
             for line in history:
                 chat_content.append(_truncate_vis(line, chat_w))
         while len(chat_content) < chat_rows_n:
             chat_content.insert(0, "")
-        right = boxed_panel(paint("CHAT * LIVE", "bold"), chat_content)
+        right = boxed_panel(paint("CHAT — LIVE", "bold"), chat_content)
 
-        # -- top header ------------------------------------------------------
+        # -- top header: masthead + metric blocks ---------------------------
         spin = "|/-\\"[frame % 4]
         stamp = time.strftime("%H:%M:%S")
-        lock = "on" if self.lobby_key else "off"
-        header = paint("LAN LOBBY * LIVE", "bold") + "  %s %s" % (spin, stamp)
-        status = "You: %s | %s | port %d | lock %s | score %dW/%dL | peers %d" % (
-            self.name, "Salvo" if self.pref == "salvo" else "Normal",
-            self.port, lock, self.lan_score["win"], self.lan_score["loss"], len(peers))
+        lock = "ON" if self.lobby_key else "OFF"
+        mast = [
+            paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS", "cyan") + paint("  %s %s" % (spin, stamp), "grey"),
+            "%s  %s  %s" % (
+                metric_row("YOU", self.name[:16]),
+                metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
+                metric_row("PEERS", str(len(peers)))),
+            "%s  %s  %s" % (
+                metric_row("PORT", str(self.port)),
+                metric_row("LOCK", lock),
+                metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
+            rule(min(72, cols - 8)),
+        ]
 
         # -- bottom: match bar + notices ------------------------------------
         match_rows = self._live_match_rows(reqs)
@@ -7115,37 +7793,32 @@ class LANClient:
         notices = self._live_notices()
         notice_panel = boxed_panel(paint("NOTICES", "bold"), [_truncate_vis(n, 70) for n in notices]) if notices else None
 
-        # -- footer hints ----------------------------------------------------
-        req_badge = " (%d)" % len(reqs) if reqs else ""
-        hints = [
-            paint("↑/↓ select · Enter action · 1-9 challenge · C chat · T tell · R requests%s"
-                  % req_badge, "grey"),
-            paint("G start · X cancel · S settings · U status · H help · / cmd · E advanced · L log · Q quit",
-                  "grey"),
-        ]
-
-        clear()
-        print(header)
-        print("  " + status)
-        print()
+        frame = []
+        frame.extend(center_block(mast, width=cols))
+        frame.append("")
         if cols >= 78:
-            for line in side_by_side(left, right):
-                print(_truncate_vis(line, cols))
+            frame.extend(center_block(side_by_side(left, right), width=cols))
         else:
-            for line in left:
-                print(line)
-            print()
-            for line in right:
-                print(line)
-        print()
-        for line in match_panel:
-            print(_truncate_vis(line, cols))
+            frame.extend(center_block(left, width=cols))
+            frame.append("")
+            frame.extend(center_block(right, width=cols))
+        frame.append("")
+        frame.extend(center_block(match_panel, width=cols))
         if notice_panel:
-            for line in notice_panel:
-                print(_truncate_vis(line, cols))
-        print()
-        for h in hints:
-            print("  " + h)
+            frame.extend(center_block(notice_panel, width=cols))
+        frame.append("")
+        req_badge = " (%d)" % len(reqs) if reqs else ""
+        frame.extend(center_block(command_bar([
+            ("↑↓", "SELECT"), ("ENTER", "ACTION"), ("1-9", "CHALLENGE"),
+            ("C", "CHAT"), ("T", "TELL"), ("R", "REQUESTS%s" % req_badge),
+        ]), width=cols))
+        frame.extend(center_block(command_bar([
+            ("G", "START"), ("X", "CANCEL"), ("S", "SETTINGS"),
+            ("U", "STATUS"), ("H", "HELP"), ("Q", "QUIT"),
+        ]), width=cols))
+        # Truncate to width and atomic-write (no clear flash on 1s refresh).
+        frame = [_truncate_vis(l, cols) for l in frame]
+        render_frame(frame)
         return peers, sel_idx
 
     def _live_poll_key(self, kr, timeout):
@@ -7433,16 +8106,35 @@ class LANClient:
 # ----------------------------------------------------------------------------
 
 def choose_level():  # type: ignore[no-untyped-def]
-    options = ["%-7s  %s" % (name, desc) for name, _, desc in LEVELS]
-    idx = select_menu(paint("DIFFICULTY", "bold"), options,
+    dots = ["●○○○○", "●●○○○", "●●●○○", "●●●●○", "●●●●●"]
+    options = []
+    for i, (name, _, desc) in enumerate(LEVELS):
+        threat = dots[min(i, len(dots) - 1)]
+        threat_styled = paint(threat, "red", "bold") if i >= 3 else paint(threat, "yellow") if i >= 1 else paint(threat, "green")
+        options.append("%-9s  %s  %s" % (name.upper(), threat_styled, desc))
+    header = "\n".join(brand_masthead("Select opponent — threat assessment"))
+    idx = select_menu(header, options,
                       start_idx=_MENU_STATE.last_level)
     _MENU_STATE.last_level = idx
     return LEVELS[idx]
 
 
+def _setup_option_label(display, size, fleet_name):
+    fleet = FLEET_PRESETS.get(fleet_name, [])
+    total = sum(n for _, n in fleet)
+    try:
+        short = display.split("—")[0].strip().upper()
+    except Exception:
+        short = display.upper()
+    profile = "BALANCED ENGAGEMENT" if size == 10 else ("FAST ENGAGEMENT" if size < 10 else "LARGE-SCALE ENGAGEMENT")
+    return "%-8s  %2d×%-2d  %-7s FLEET (%d ships, %d cells)  %s" % (
+        short, size, size, fleet_name.upper(), len(fleet), total, profile)
+
+
 def choose_setup():  # type: ignore[no-untyped-def]
-    options = [p[0] for p in SETUP_PRESETS]
-    idx = select_menu(paint("GAME SETUP", "bold"), options,
+    options = [_setup_option_label(p[0], p[1], p[2]) for p in SETUP_PRESETS]
+    header = "\n".join(brand_masthead("Tactical configuration — board & fleet") + [paint("Board size and fleet scale define the engagement profile.", "grey")])
+    idx = select_menu(header, options,
                       start_idx=_MENU_STATE.last_game_setup)
     _MENU_STATE.last_game_setup = idx
     _, size, fleet_name = SETUP_PRESETS[idx]
@@ -7450,9 +8142,11 @@ def choose_setup():  # type: ignore[no-untyped-def]
 
 
 def choose_mode():  # type: ignore[no-untyped-def]
+    header = "\n".join(brand_masthead("Rules of engagement"))
     idx = select_menu(
-        paint("MODE", "bold"),
-        ["Normal — one shot per turn", "Salvo — one shot per ship afloat"],
+        header,
+        ["NORMAL  —  one shot per turn",
+         "SALVO   —  one shot per afloat ship (both sides)"],
         start_idx=_MENU_STATE.last_mode,
     )
     _MENU_STATE.last_mode = idx
@@ -7460,10 +8154,11 @@ def choose_mode():  # type: ignore[no-untyped-def]
 
 
 def choose_tactic():  # type: ignore[no-untyped-def]
+    header = "\n".join(brand_masthead("Enemy deployment doctrine"))
     idx = select_menu(
-        paint("ENEMY TACTIC", "bold"),
-        ["Random placement — ships anywhere",
-         "Contrarian — ships hide in low-probability cells"],
+        header,
+        ["RANDOM      —  unpredictable fleet arrangement",
+         "CONTRARIAN  —  hides in low-probability cells (samples layouts)"],
         start_idx=_MENU_STATE.last_tactic,
     )
     _MENU_STATE.last_tactic = idx
@@ -7561,22 +8256,35 @@ def main():
 
         menu_sel = 0
         while True:
-            banner = title_banner()
-            header_lines = list(banner)
+            preset_name = next((name for name, s, fn in SETUP_PRESETS
+                                if s == SIZE and FLEET_PRESETS[fn] == FLEET), "custom")
+            session_rows = [
+                "%s  %s" % (paint("VS AI".ljust(9), "grey"), paint("%d–%d" % (score["win"], score["loss"]), "bold", "white")),
+                "%s  %s" % (paint("LAN".ljust(9), "grey"), paint("%dW / %dL" % (lan_score["win"], lan_score["loss"]), "white")),
+                "%s  %s" % (paint("VERIFIED".ljust(9), "grey"), paint(str(lan_score["verified_win"]), "cyan")),
+                "%s  %s" % (paint("FORFEITS".ljust(9), "grey"), paint(str(lan_score["forfeit_win"]), "grey")),
+            ]
+            profile_rows = [
+                "%s  %s" % (paint("BOARD".ljust(9), "grey"), paint("%d × %d" % (SIZE, SIZE), "bold", "white")),
+                "%s  %s" % (paint("PRESET".ljust(9), "grey"), paint(preset_name.upper(), "cyan")),
+                "%s  %s" % (paint("FLEET".ljust(9), "grey"), paint("%d SHIPS" % len(FLEET), "white")),
+            ]
+            session_panel = boxed_panel(paint("SESSION", "bold"), session_rows)
+            profile_panel = boxed_panel(paint("PROFILE", "bold"), profile_rows)
+            header_lines = []
+            header_lines.extend(brand_masthead("Naval command console"))
             header_lines.append("")
-            header_lines.append("  " + paint("MAIN MENU", "bold"))
+            header_lines.append(_pad_vis(paint("TACTICAL OPERATIONS", "cyan"), term_width(), "center") if term_width() >= 78 else paint("TACTICAL OPERATIONS", "cyan"))
             header_lines.append("")
-            header_lines.append(
-                "  vs AI: %d-%d   ·   LAN: %d W (%d verified, %d forfeit) / %d L   ·   board %d×%d, %s"
-                % (score["win"], score["loss"],
-                   lan_score["win"], lan_score["verified_win"],
-                   lan_score["forfeit_win"], lan_score["loss"],
-                   SIZE, SIZE,
-                   next((name for name, s, fn in SETUP_PRESETS
-                         if s == SIZE and FLEET_PRESETS[fn] == FLEET), "custom"))
-            )
-            header = "\n".join("  " + line if not line.startswith("  ") else line
-                               for line in header_lines)
+            if term_width() >= 78:
+                header_lines.extend(side_by_side(session_panel, profile_panel, gap="    "))
+            else:
+                header_lines.extend(session_panel)
+                header_lines.append("")
+                header_lines.extend(profile_panel)
+            header_lines.append("")
+            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–7", "QUICK"), ("Q", "QUIT")]))
+            header = "\n".join(header_lines)
 
             menu_opts = [
                 "New game (vs computer)",
@@ -7658,13 +8366,16 @@ def main():
             if choice == 4:
                 if supports_cursor_ui():
                     clear()
+                    for line in center_block(brand_masthead("Field manual")):
+                        print(line)
+                    # Responsive manual: two columns on wide, stacked on narrow.
+                    manual = [l for l in HOW_TO_PLAY.strip("\n").split("\n")]
+                    for line in center_block(manual):
+                        print(line)
                     print()
-                    for line in title_banner():
-                        print("  " + line)
-                    print()
-                    print(HOW_TO_PLAY)
+                    for line in center_block(command_bar([("ANY KEY", "RETURN")])):
+                        print(line)
                     with KeyReader() as kr:
-                        print("  " + paint("Press any key to return...", "grey"))
                         kr.get_key()
                 else:
                     print(HOW_TO_PLAY)

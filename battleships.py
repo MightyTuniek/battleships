@@ -288,6 +288,50 @@ try:
 except ImportError:
     pass
 
+
+def _ensure_utf8_output() -> None:
+    """Switch stdout/stderr to UTF-8 so rounded corners + all symbols work.
+
+    On Windows Python defaults to a legacy code page (e.g. cp1250), which
+    has no box-drawing glyphs at all — every ╭╮╰╯─┐│ renders as "?".
+    Reconfiguring to UTF-8 keeps the real rounded corners (and ●○■×▶█░·)
+    on any modern terminal (Windows Terminal, conhost with TrueType font).
+    If the terminal truly cannot do UTF-8, the ASCII-rounded fallback in
+    _box_chars() still keeps boxes intact. Never raises.
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stderr, "reconfigure"):
+            try:
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            try:
+                import ctypes
+                try:
+                    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+                except Exception:
+                    pass
+                try:
+                    ctypes.windll.kernel32.SetConsoleCP(65001)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_ensure_utf8_output()
+
 # ----------------------------------------------------------------------------
 # Board / fleet configuration (all runtime-tunable via configure_board)
 # ----------------------------------------------------------------------------
@@ -743,7 +787,8 @@ def _box_chars(double: bool = False):
         return BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V
     if double:
         return "+", "+", "+", "+", "=", "|"
-    return "+", "+", "+", "+", "-", "|"
+    # Closest to rounded that cp1250 can render: .--. on top, `--' below.
+    return ".", ".", "`", "'", "-", "|"
 
 
 def _rule_char(char: str = "─") -> str:

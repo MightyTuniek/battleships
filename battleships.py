@@ -716,6 +716,41 @@ BOX_H, BOX_V = "─", "│"
 DBOX_TL, DBOX_TR, DBOX_BL, DBOX_BR = "╔", "╗", "╚", "╝"
 DBOX_H, DBOX_V = "═", "║"
 
+_BOX_GLYPHS = "╭╮╰╯─│╔╗╚╝═║"
+
+
+def _box_glyphs_supported() -> bool:
+    """True when the current stdout encoding can render box-drawing glyphs.
+
+    Terminals stuck on a legacy code page (e.g. cp1250 on Windows) render
+    every box corner/border as "?" — the reported "box with a question
+    mark". Detect via the stdout encoding and fall back to ASCII so boxes
+    stay intact everywhere.
+    """
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        _BOX_GLYPHS.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+def _box_chars(double: bool = False):
+    """Effective (tl, tr, bl, br, h, v) chars for the current terminal."""
+    if _box_glyphs_supported():
+        if double:
+            return DBOX_TL, DBOX_TR, DBOX_BL, DBOX_BR, DBOX_H, DBOX_V
+        return BOX_TL, BOX_TR, BOX_BL, BOX_BR, BOX_H, BOX_V
+    if double:
+        return "+", "+", "+", "+", "=", "|"
+    return "+", "+", "+", "+", "-", "|"
+
+
+def _rule_char(char: str = "─") -> str:
+    if char == "─" and not _box_glyphs_supported():
+        return "-"
+    return char
+
 
 def _vis_len(s):
     return len(strip_ansi(s))
@@ -877,6 +912,7 @@ def center_block(lines, width=None):
 
 
 def rule(width=None, char="─", style=("grey",)):
+    char = _rule_char(char)
     if width is None:
         width = min(72, term_width() - 8)
     width = max(20, min(width, term_width() - 4))
@@ -1038,7 +1074,7 @@ def enemy_status_rows(enemy=None, knowledge=None):
 
 
 def box_top_line(inner_width, title=None, double=False):
-    tl, tr, h = (DBOX_TL, DBOX_TR, DBOX_H) if double else (BOX_TL, BOX_TR, BOX_H)
+    tl, tr, _bl, _br, h, _v = _box_chars(double)
     if not title:
         return tl + h * (inner_width + 2) + tr
     t = " " + title + " "
@@ -1052,12 +1088,13 @@ def box_top_line(inner_width, title=None, double=False):
 
 
 def box_bottom_line(inner_width, double=False):
-    bl, br, h = (DBOX_BL, DBOX_BR, DBOX_H) if double else (BOX_BL, BOX_BR, BOX_H)
+    _tl, _tr, bl, br, h, _v = _box_chars(double)
     return bl + h * (inner_width + 2) + br
 
 
-def box_content_line(content, inner_width):
-    return BOX_V + " " + _pad_vis(content, inner_width) + " " + BOX_V
+def box_content_line(content, inner_width, double=False):
+    _tl, _tr, _bl, _br, _h, v = _box_chars(double)
+    return v + " " + _pad_vis(content, inner_width) + " " + v
 
 
 def side_by_side(left_lines, right_lines, gap="   "):
@@ -1077,7 +1114,7 @@ def boxed_panel(title, content_lines, double=False):
     inner = max(inner, _vis_len(title) + 4)
     out = [box_top_line(inner, title, double)]
     for line in content_lines:
-        out.append(box_content_line(line, inner))
+        out.append(box_content_line(line, inner, double))
     out.append(box_bottom_line(inner, double))
     return out
 
@@ -1106,10 +1143,11 @@ def big_banner(text, style="bold"):
     t = " ".join(str(text).split()).upper()
     width = min(max(_vis_len(t) + 8, 30), term_width() - 8)
     painted = paint(t, style) if style else t
+    bar = _rule_char("─") * width
     return [
-        paint("─" * width, "grey"),
+        paint(bar, "grey"),
         _pad_vis(painted, width, "center"),
-        paint("─" * width, "grey"),
+        paint(bar, "grey"),
     ]
 
 
@@ -4233,11 +4271,94 @@ REQUEST_TIMEOUT = 20.0
 CHAT_HISTORY_LIMIT = 200
 MAX_NET_LINE = 65536
 
+
+def local_lan_ips():
+    """Best-effort local IPv4 addresses for showing a connectable LAN address.
+
+    Zero-dependency and mobile-friendly (Pydroid 3 / phone hotspot): the
+    hostname lookup alone often returns 127.0.0.1 on Android, so also probe
+    the outbound interface via a UDP connect (sends no traffic). Returns a
+    sorted list, private-LAN addresses first, never raises.
+    """
+    found = []
+    seen = set()
+
+    def _add(ip):
+        if not isinstance(ip, str) or "." not in ip:
+            return
+        ip = ip.strip()
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            return
+        if ip in seen:
+            return
+        seen.add(ip)
+        found.append(ip)
+
+    try:
+        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+        for a in addrs or []:
+            try:
+                _add(a)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.settimeout(0.5)
+            # No packets are sent; connect() only selects the outbound iface.
+            s.connect(("8.8.8.8", 80))
+            _add(s.getsockname()[0])
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    def _sort_key(ip):
+        if ip.startswith("192.168."):
+            return (0, ip)
+        if ip.startswith("10."):
+            return (1, ip)
+        if ip.startswith("172."):
+            try:
+                second = int(ip.split(".")[1])
+                if 16 <= second <= 31:
+                    return (2, ip)
+            except Exception:
+                pass
+        if ip.startswith("169.254."):
+            return (4, ip)
+        return (3, ip)
+
+    try:
+        found.sort(key=_sort_key)
+    except Exception:
+        pass
+    return found
+
+
+def lan_connect_hint(port):
+    """Short 'others connect with: request IP:PORT' hint for status screens."""
+    try:
+        ips = local_lan_ips()
+    except Exception:
+        ips = []
+    if not ips:
+        return "Others connect with: request <this-phone-or-PC-IP>:%d" % int(port)
+    return "Others connect with: request %s:%d" % (ips[0], int(port))
+
 LAN_HELP = """
 LAN LOBBY COMMANDS
   list                 show available LAN players
   requests             show incoming match requests
-  request <#|IP>       send match request
+  request <#|IP[:port]> send match request (direct IP works when
+                       discovery is blocked, e.g. phone hotspot:
+                       request 192.168.43.1:48785)
   accept <#>           accept an incoming request
   reject <#>           reject an incoming request
   cancel               cancel outgoing request / pending match
@@ -6208,6 +6329,7 @@ class LANClient:
 
         self.udp_sock = None
         self.tcp_sock = None
+        self._beacon_no_broadcast_warned = False
 
     @property
     def peer_count(self) -> int:
@@ -6497,11 +6619,45 @@ class LANClient:
             obj = sign_obj(obj, self.lobby_key)
             payload = json.dumps(obj).encode("utf-8")
 
+            broadcast_ok = False
             for port in range(self.base_port, self.base_port + LAN_PORT_RANGE):
                 try:
                     self.udp_sock.sendto(payload, ("<broadcast>", port))
+                    broadcast_ok = True
                 except OSError:
                     pass
+
+            # Unicast refresh: phone hotspots / guest WiFi often filter
+            # broadcast in one or both directions, but direct UDP still
+            # works. Re-send our beacon straight to every known peer so a
+            # lobby discovered once (or added via manual IP) stays alive.
+            try:
+                with self.peer_lock:
+                    targets = [(p.addr[0], int(p.tcp_port or p.addr[1]))
+                               for p in list(self.peers.values())]
+            except Exception:
+                targets = []
+            for ip, pp in targets:
+                try:
+                    self.udp_sock.sendto(payload, (ip, pp))
+                except OSError:
+                    pass
+
+            if not broadcast_ok:
+                if not getattr(self, "_beacon_no_broadcast_warned", False):
+                    self._beacon_no_broadcast_warned = True
+                    try:
+                        hint = lan_connect_hint(self.port)
+                    except Exception:
+                        hint = ("Others connect with: request <this-device-IP>:%d"
+                                % int(self.port))
+                    self.print_now(
+                        "LAN discovery broadcast blocked on this network "
+                        "(common on phone hotspots / Pydroid 3). "
+                        "Discovery list may stay empty, but direct play still works. "
+                        + hint + ".")
+            else:
+                self._beacon_no_broadcast_warned = False
 
             time.sleep(2.0)
 
@@ -7226,6 +7382,17 @@ class LANClient:
                 self.print_now("Usage: anticheat cell | off")
 
         elif cmd == "status":
+            try:
+                ips = local_lan_ips()
+            except Exception:
+                ips = []
+            self.print_now("You are %s on port %d." % (self.name, int(self.port)))
+            self.print_now("Local IP: %s." % (", ".join(ips) if ips else "unknown (check WiFi settings)"))
+            try:
+                self.print_now(lan_connect_hint(self.port) + ".")
+            except Exception:
+                pass
+            self.print_now("If 'list' stays empty (broadcast blocked), use direct: request <IP>[:port].")
             self.print_now("Password lobby: %s" % ("enabled" if self.lobby_key else "disabled"))
             self.print_now("Per-cell anti-cheat preference: %s" %
                            ("enabled" if self.cell_anticheat else "disabled"))
@@ -7299,6 +7466,19 @@ class LANClient:
             "%s  %s" % (metric_row("ANTICHEAT", "CELL" if self.cell_anticheat else "HASH"),
                         metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
         ]
+        try:
+            _ips = local_lan_ips()
+            if _ips:
+                status.append(metric_row("IP", _ips[0]))
+                for _extra in _ips[1:]:
+                    status.append(metric_row("", _extra))
+                status.append(paint("Join: request %s:%d" % (_ips[0], int(self.port)), "grey"))
+            else:
+                status.append(metric_row("IP", "unknown"))
+                status.append(paint("Join: request <your-IP>:%d" % int(self.port), "grey"))
+            status.append(paint("No peers? request <IP>[:port].", "grey"))
+        except Exception:
+            pass
 
         if self.outgoing_request:
             status.append(paint("Outgoing request pending…", "cyan"))
@@ -7642,6 +7822,27 @@ class LANClient:
             metric_row("FORFEIT", str(self.lan_score["forfeit_win"])),
             metric_row("LOSSES", str(self.lan_score["loss"])),
         ]
+        try:
+            ips = local_lan_ips()
+        except Exception:
+            ips = []
+        if ips:
+            rows.append(metric_row("IP", ips[0]))
+            for extra_ip in ips[1:]:
+                rows.append(metric_row("", extra_ip))
+        else:
+            rows.append(metric_row("IP", "unknown"))
+        # Slim boxed hints: this panel must stay <= 40 cols (minimum
+        # terminal) so its rounded borders never wrap. Full wording lives
+        # in the typed `status` output, where wrapping is harmless.
+        try:
+            if ips:
+                rows.append(paint("Join: request %s:%d" % (ips[0], int(self.port)), "grey"))
+            else:
+                rows.append(paint("Join: request <your-IP>:%d" % int(self.port), "grey"))
+        except Exception:
+            pass
+        rows.append(paint("No peers? request <IP>[:port].", "grey"))
         for line in center_block(boxed_panel(paint("STATUS", "bold"), rows)):
             print(line)
         print()
@@ -7815,8 +8016,8 @@ class LANClient:
                 paint("No players yet.", "grey"),
                 paint("Waiting for beacons…", "grey"),
                 "",
-                paint("Ask a friend to open", "grey"),
-                paint("LAN Matchmaking too.", "grey"),
+                paint("Broadcast blocked? Use / :", "grey"),
+                paint("request <IP>:%d" % int(self.port), "cyan"),
             ]
         else:
             for i, p in enumerate(peers[:player_rows_n]):
@@ -7852,6 +8053,14 @@ class LANClient:
         spin = "|/-\\"[frame % 4]
         stamp = time.strftime("%H:%M:%S")
         lock = "ON" if self.lobby_key else "OFF"
+        try:
+            _live_ips = local_lan_ips()
+            if _live_ips:
+                _ip_short = _live_ips[0] + (" +%d" % (len(_live_ips) - 1) if len(_live_ips) > 1 else "")
+            else:
+                _ip_short = "unknown"
+        except Exception:
+            _ip_short = "unknown"
         mast = [
             paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS", "cyan") + paint("  %s %s" % (spin, stamp), "grey"),
             "%s  %s  %s" % (
@@ -7862,6 +8071,9 @@ class LANClient:
                 metric_row("PORT", str(self.port)),
                 metric_row("LOCK", lock),
                 metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
+            _truncate_vis("%s  %s" % (
+                metric_row("IP", _ip_short),
+                paint("join: request <IP>:%d" % int(self.port), "grey")), max(40, cols - 8)),
             rule(min(72, cols - 8)),
         ]
 
@@ -8134,9 +8346,20 @@ class LANClient:
     def _live_side_snapshot(self):
         peers = self._live_peers()
         reqs = self._live_reqs()
+        try:
+            _ips = local_lan_ips()
+        except Exception:
+            _ips = []
+        print("--- you: %s | port %d | IP %s ---" % (
+            self.name, int(self.port),
+            ", ".join(_ips) if _ips else "unknown"))
+        try:
+            print("--- " + lan_connect_hint(self.port) + " ---")
+        except Exception:
+            pass
         print("--- players (%d) ---" % len(peers))
         if not peers:
-            print("  (none yet)")
+            print("  (none yet — if broadcast is blocked, ask peer for IP and use: request <IP>[:port])")
         for i, p in enumerate(peers, 1):
             print("  %d) %s pref=%s state=%s %s:%d" % (
                 i, p.name, "Salvo" if p.pref == "salvo" else "Normal",

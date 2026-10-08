@@ -773,17 +773,59 @@ def home():
         sys.stdout.flush()
 
 
+def _clip_vis(s, width):
+    """Hard-clip to visible width: layout safety net, never adds '...'.
+
+    Unlike _truncate_vis (prose ellipsis), layout fitting must not sprinkle
+    dot tails beside boxes/borders when a terminal is narrower than content.
+    Over-wide boxes are dropped whole by the frame ladders; this only guards
+    against wrapping. Strips ANSI only when clipping is actually needed.
+    """
+    if width <= 0:
+        return ""
+    if _vis_len(s) <= width:
+        return s
+    return strip_ansi(s)[:width]
+
+
+_LAST_TERM_SIZE = None
+
+
+def raw_term_size(default=(100, 30)):
+    """Actual terminal size, unclamped. Used for resize detection only."""
+    try:
+        sz = os.get_terminal_size()
+        return max(1, int(sz.columns)), max(1, int(sz.lines))
+    except Exception:
+        return default
+
+
 def render_frame(lines):
     """Atomic full-frame write: home + body + erase-below. Less flash than clear().
 
     Every line carries its own erase-to-end-of-line so a shorter new frame can
     never leave tails of a previous wider frame (ghost borders/text). The final
     erase-below-display clears leftover lines when the new frame is shorter.
+
+    When the terminal was resized since the previous frame, wrapped/scrolled
+    fragments of the old geometry may sit anywhere on screen, so issue a full
+    clear first — this is what lets centering snap back after shrink/enlarge.
+    Steady-state frames keep the cheap home+erase-below path (no flicker).
     """
+    global _LAST_TERM_SIZE
+    try:
+        raw = raw_term_size()
+    except Exception:
+        raw = None
+    resized = _LAST_TERM_SIZE is not None and raw != _LAST_TERM_SIZE
+    _LAST_TERM_SIZE = raw
     if sys.stdout.isatty():
         try:
-            out = "\033[H" + "\n".join(l + "\033[K" for l in lines) + "\033[J"
-            sys.stdout.write(out)
+            body = "\n".join(l + "\033[K" for l in lines)
+            if resized:
+                sys.stdout.write("\033[2J\033[H" + body + "\033[J")
+            else:
+                sys.stdout.write("\033[H" + body + "\033[J")
             sys.stdout.flush()
             return
         except Exception:
@@ -2867,7 +2909,7 @@ def interactive_place_fleet(board):
                         frame.extend(center_block([msg], width=cols))
                 else:
                     frame.extend(center_block([status_badge("All ships placed. Press Enter.", "success")], width=cols))
-            legend_block = [""] + center_block([_truncate_vis(legend(), cols - 4)], width=cols)
+            legend_block = [""] + center_block([_clip_vis(legend(), cols - 2)], width=cols)
             cmd_block = [""] + center_block(command_bar([
                 ("ARROWS", "MOVE"), ("R", "ROTATE"), ("ENTER", "PLACE"),
                 ("Z", "UNDO"), ("Q", "ABORT"),
@@ -3300,11 +3342,18 @@ class Game:
         tail = ([""] + foot) if foot else []
 
         def centered(block):
-            return center_block([_truncate_vis(l, cols - 4) for l in block], width=cols)
+            # Hard clip (no '...' tails): over-wide boxes are dropped whole by
+            # the width gate below, this only guards against line wrapping.
+            return center_block([_clip_vis(l, cols - 2) for l in block], width=cols)
 
         # -- extras candidates, richest first; every box stays intact --------
-        extra_line_block = ([_truncate_vis(extra_line, cols - 4)] if extra_line else [])
+        extra_line_block = ([_clip_vis(extra_line, cols - 2)] if extra_line else [])
         blocks = [b for b in (hint_block, density_block) if b is not None]
+        # Width gate: a box wider than the terminal is dropped whole (with a
+        # one-line note) instead of being sliced mid-border with '...' tails.
+        fit = lambda b: max((_vis_len(l) for l in b), default=0) <= cols - 2
+        blocks = [b for b in blocks if fit(b)]
+        dropped_narrow = (hint_block is not None or density_block is not None) and not blocks
         side = None
         if len(blocks) == 2:
             cand = side_by_side(blocks[0], blocks[1], gap="    ")
@@ -3325,6 +3374,11 @@ class Game:
             extras_options.append(stacked)
         if extra_line_block:
             extras_options.append([""] + extra_line_block)
+        if dropped_narrow:
+            # Overlay requested but terminal too narrow for an intact box:
+            # one honest line instead of a sliced box with '...' tails.
+            note = _clip_vis(paint("Overlay hidden — widen the terminal to show it.", "grey"), cols - 2)
+            extras_options.append([""] + ([_clip_vis(extra_line, cols - 2)] if extra_line else []) + [note])
         extras_options.append([])
 
         # -- feed candidates: full -> compact -> gone (whole box or nothing) --
@@ -3378,7 +3432,7 @@ class Game:
                 cursor=cursor).split("\n")
             panels = center_block(self._tactical_side_panels(cursor=cursor), width=cols)
             foot = center_block(footer, width=cols)
-            ex = center_block([_truncate_vis(l, cols - 4) for l in extras], width=cols)
+            ex = center_block([_clip_vis(l, cols - 2) for l in extras], width=cols)
             feed = center_block(boxed_panel(paint("BATTLE FEED", "bold"),
                                             _feed_lines(notes, limit=2)), width=cols)
             frame = header + boards + [""] + panels + [""] + ex + [""] + feed + [""] + foot
@@ -4042,7 +4096,7 @@ class HotseatGame:
             if extra:
                 frame.append("")
                 frame.extend(center_block([extra], width=cols))
-            legend_block = [""] + center_block([_truncate_vis(legend(), cols - 4)], width=cols)
+            legend_block = [""] + center_block([_clip_vis(legend(), cols - 2)], width=cols)
             cmd_block = [""] + center_block(command_bar([
                 ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("Q", "QUIT"),
             ]), width=cols)
@@ -5379,7 +5433,7 @@ class LANGame:
             frame.extend(center_block(left + [""] + mid + [""] + right, width=cols))
         if extras:
             frame.append("")
-            frame.extend(center_block([_truncate_vis(l, cols - 4) for l in extras], width=cols))
+            frame.extend(center_block([_clip_vis(l, cols - 2) for l in extras], width=cols))
         base = list(frame)
         foot_block = [""] + center_block(footer, width=cols)
         for limit in (4, 2, 0):

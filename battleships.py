@@ -1461,6 +1461,18 @@ class Quit(Exception):
     pass
 
 
+# Sentinel for "Back" navigation in multi-step wizards (setup/level/mode/
+# tactic/fleet). choose_* return BACK when the user picks the trailing
+# "Back" option; callers step back instead of abandoning the flow.
+BACK = "back"
+
+BACK_LABEL = "\u2190 Back"
+
+
+def is_back(value) -> bool:
+    return value == BACK
+
+
 def ask(prompt):
     try:
         return input(prompt).strip()
@@ -1613,13 +1625,23 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
         print(header)
         for i, opt in enumerate(options, 1):
             print("  %d) %s" % (i, strip_ansi(opt)))
+        # Mobile/typed friendliness: when the trailing option is a Back
+        # entry, accept "back"/"b" as well as its number so touch-keyboard
+        # users never have to guess. Never raises; EOF becomes Quit via ask.
+        has_back = bool(options) and "back" in strip_ansi(options[-1]).lower()
         while True:
             raw = ask("Choose 1-%d > " % len(options))
-            if allow_quit and raw.lower() in ("q", "quit"):
+            low = raw.strip().lower()
+            if allow_quit and low in ("q", "quit"):
                 return -1
-            if raw.isdigit() and 1 <= int(raw) <= len(options):
-                return int(raw) - 1
-            print("  Enter one of: 1-%d." % len(options))
+            if has_back and low in ("back", "b", "← back", "< back"):
+                return len(options) - 1
+            if raw.strip().isdigit() and 1 <= int(raw.strip()) <= len(options):
+                return int(raw.strip()) - 1
+            if has_back:
+                print("  Enter one of: 1-%d, or 'back'." % len(options))
+            else:
+                print("  Enter one of: 1-%d." % len(options))
 
     idx = max(0, min(start_idx, len(options) - 1)) if options else 0
     with KeyReader() as kr:
@@ -2945,7 +2967,8 @@ def fleet_damage_text(board):
 # ----------------------------------------------------------------------------
 
 def interactive_place_fleet(board):
-    """Cursor-based ship placement. Returns final cursor (r,c) on success, None on abort."""
+    """Cursor-based ship placement. Returns final cursor (r,c) on success,
+    None on abort, BACK on back-to-previous-step."""
     placed = 0
     cursor = (0, 0)
     horiz = True
@@ -3005,7 +3028,7 @@ def interactive_place_fleet(board):
             legend_block = [""] + center_block([_clip_vis(legend(), cols - 2)], width=cols)
             cmd_block = [""] + center_block(command_bar([
                 ("ARROWS", "MOVE"), ("R", "ROTATE"), ("ENTER", "PLACE"),
-                ("Z", "UNDO"), ("Q", "ABORT"),
+                ("Z", "UNDO"), ("B", "BACK"), ("Q", "ABORT"),
             ]), width=cols)
             base = list(frame)
             frame.extend(legend_block)
@@ -3048,6 +3071,12 @@ def interactive_place_fleet(board):
                     continue
                 board.place(name, cells)
                 placed += 1
+            elif key in ("B", "b"):
+                # Back to fleet-method choice (clears any partial placement
+                # so the next visit starts clean).
+                while board.undo():
+                    pass
+                return BACK
             elif key in ("Q", "q", "ESC", "CTRL_C"):
                 return None
 
@@ -3066,6 +3095,12 @@ RULES
   HIT, MISS or SUNK is reported. A ship sinks when all squares are hit.
   First to sink the other fleet wins.
 
+SETUP NAVIGATION
+  Every setup step offers ← Back: board → opponent → mode → doctrine
+  → fleet method → placement. Back returns one step; backing out of the
+  first step returns to the main menu (hotseat: previous player; LAN:
+  lobby). Typed fallback: type 'back' or its number.
+
 BOARD
   ~ water    ■ your ship    × hit    ○ miss    # sunk    · unknown
   Left: YOUR FLEET. Right: ENEMY WATERS. Cursor shows current target.
@@ -3080,7 +3115,8 @@ CONTROLS — SHOOTING
 PLACEMENT
   Arrows           move cursor          R               rotate
   Enter            place ship           Z / Backspace   undo
-  Q / Esc          abandon setup        Typed: A1 H / A1 V, undo, random.
+  B                back one step        Q / Esc         abandon setup
+  Typed: A1 H / A1 V, undo, random, back, quit.
 
 TACTICAL TOOLS
   ? hint: top-3 expert cells with scores.  / map: 0-9 density heatmap.
@@ -3117,8 +3153,10 @@ Interactive controls:
   R                 rotate
   Enter             place ship
   Z / Backspace     undo last ship
+  B                 back one step
   Q / Esc           abandon setup
 Or type a start cell and direction like A1 H.
+Typed: undo, random, back, quit. Back with no ships returns to method choice.
 """
 
 
@@ -3269,70 +3307,115 @@ class Game:
         if not supports_cursor_ui():
             return self._setup_typed()
 
-        choice = select_menu(
-            "\n".join(brand_masthead("Fleet setup")),
-            ["Place my ships by hand", "Random layout"],
-            start_idx=_MENU_STATE.last_setup_choice,
-        )
-        _MENU_STATE.last_setup_choice = choice
+        while True:
+            choice = select_menu(
+                "\n".join(brand_masthead("Fleet setup")),
+                ["Place my ships by hand", "Random layout", BACK_LABEL],
+                start_idx=min(_MENU_STATE.last_setup_choice, 1),
+            )
+            if choice == 2:
+                return BACK
+            _MENU_STATE.last_setup_choice = choice
 
-        if choice == 1:
-            self.player.place_randomly(FLEET)
-            while True:
-                clear()
-                for line in center_block(brand_masthead("Random deployment — review layout")):
-                    print(line)
-                print(render_own(self.player))
-                print()
-                for line in center_block(boxed_panel(paint("READY", "bold"), [
-                    metric_row("SHIPS", "%d placed" % len(self.player.order)),
-                    paint("Reroll for a new layout, or confirm to sail.", "grey"),
-                ])):
-                    print(line)
-                print()
-                for line in center_block(command_bar([
-                    ("ENTER", "CONFIRM"), ("R", "REROLL"), ("Q", "ABANDON"),
-                ])):
-                    print(line)
-                with KeyReader() as kr:
-                    key = kr.get_key()
-                    if key == "ENTER":
-                        return True
-                    if key in ("R", "r"):
-                        while self.player.undo():
-                            pass
-                        self.player.place_randomly(FLEET)
-                        continue
-                    if key in ("Q", "q", "ESC", "CTRL_C"):
-                        return False
+            if choice == 1:
+                self.player.place_randomly(FLEET)
+                while True:
+                    clear()
+                    for line in center_block(brand_masthead("Random deployment — review layout")):
+                        print(line)
+                    print(render_own(self.player))
+                    print()
+                    for line in center_block(boxed_panel(paint("READY", "bold"), [
+                        metric_row("SHIPS", "%d placed" % len(self.player.order)),
+                        paint("Reroll for a new layout, or confirm to sail.", "grey"),
+                    ])):
+                        print(line)
+                    print()
+                    for line in center_block(command_bar([
+                        ("ENTER", "CONFIRM"), ("R", "REROLL"),
+                        ("B", "BACK"), ("Q", "ABANDON"),
+                    ])):
+                        print(line)
+                    with KeyReader() as kr:
+                        key = kr.get_key()
+                        if key == "ENTER":
+                            return True
+                        if key in ("R", "r"):
+                            while self.player.undo():
+                                pass
+                            self.player.place_randomly(FLEET)
+                            continue
+                        if key in ("B", "b"):
+                            while self.player.undo():
+                                pass
+                            break
+                        if key in ("Q", "q", "ESC", "CTRL_C"):
+                            return False
+                continue
 
-        return self._setup_cursor()
+            res = self._setup_cursor()
+            if res == BACK:
+                continue
+            return res
 
     def _setup_typed(self):
-        print("\nFLEET SETUP")
-        print("  1) Place my ships by hand")
-        print("  2) Random layout")
-
-        if pick("Choose 1 or 2 > ", ["1", "2"]) == "2":
-            self.player.place_randomly(FLEET)
-
+        # Typed/mobile fallback with Back on every step. Returns True (ready),
+        # False (abandoned) or BACK (previous wizard step). Never gets stuck:
+        # every prompt accepts a documented command; unknown input re-prompts
+        # with guidance instead of looping silently. Outer loop re-offers the
+        # method choice whenever placement backs out with an empty board.
         board = self.player
+        while board.undo():
+            pass
+        method = None
         while True:
+            if method is None:
+                print("\nFLEET SETUP")
+                print("  1) Place my ships by hand")
+                print("  2) Random layout")
+                print("  3) Back")
+                raw = ask("Choose 1-3 (or 'back') > ").strip().lower()
+                if raw in ("3", "back", "b"):
+                    return BACK
+                if raw in ("quit", "q", "exit"):
+                    if confirm("  Abandon setup?"):
+                        return False
+                    continue
+                if raw in ("1", "manual", "hand"):
+                    method = "manual"
+                elif raw in ("2", "random", "auto", "r"):
+                    board.place_randomly(FLEET)
+                    method = "random"
+                else:
+                    print("  Enter 1, 2, 3/Back, or quit.")
+                    continue
+
             print("\n" + render_own(board))
             n = len(board.order)
 
             if n == len(FLEET):
-                raw = ask("Fleet ready. Enter = start | undo | random = new layout | help > ").lower()
+                raw = ask("Fleet ready. Enter = start | undo | random | back | help > ").lower()
                 if raw == "":
                     return True
             else:
                 name, length = FLEET[n]
-                raw = ask("[%d/%d] Place %s (%d squares). Example: A1 H  (or help) > "
+                raw = ask("[%d/%d] Place %s (%d squares). Example: A1 H  (or help, back) > "
                           % (n + 1, len(FLEET), name, length)).lower()
 
             if raw in ("quit", "q", "exit"):
                 if confirm("  Abandon setup?"):
                     return False
+                continue
+
+            if raw in ("back", "b"):
+                undone = board.undo()
+                if undone:
+                    print("  Back: removed %s." % undone)
+                    continue
+                # Empty board + back: forget method, re-offer method choice.
+                while board.undo():
+                    pass
+                method = None
                 continue
 
             if raw in ("help", "h", "?"):
@@ -3344,6 +3427,7 @@ class Game:
                 while board.undo():
                     pass
                 board.place_randomly(FLEET)
+                method = "random"
             elif raw == "":
                 continue
             elif n < len(FLEET):
@@ -3359,12 +3443,14 @@ class Game:
                 else:
                     board.place(name, cells)
             else:
-                print("  Press Enter to start, or type undo / random.")
+                print("  Press Enter to start, or type undo / random / back.")
 
     def _setup_cursor(self):
         result = interactive_place_fleet(self.player)
         if result is None:
             return False
+        if result == BACK:
+            return BACK
         self.cursor = result
         return True
 
@@ -3761,9 +3847,12 @@ class Game:
 
         if self.player.order and len(self.player.order) == len(FLEET):
             notes = ["Resumed. Your move."]
-        elif not self.setup():
-            return "abandoned"
         else:
+            setup_res = self.setup()
+            if setup_res == BACK:
+                return BACK
+            if not setup_res:
+                return "abandoned"
             notes = ["Your move. You fire first."]
 
         while True:
@@ -4111,45 +4200,153 @@ class HotseatGame:
                     if k in ("Q", "q", "ESC", "CTRL_C"):
                         raise Quit
         else:
-            ask("  Press Enter when secure > ")
+            # Typed/mobile: never strand the user — Enter continues, quit/q
+            # aborts (with confirm), anything else re-prompts.
+            while True:
+                raw = ask("  Press Enter when secure (or 'quit' to abandon) > ").strip().lower()
+                if raw in ("", "enter", "continue", "ok", "y", "yes"):
+                    return
+                if raw in ("quit", "q", "exit", "back"):
+                    if confirm("  Abandon this game?"):
+                        raise Quit
+                    continue
+                print("  Press Enter to continue, or type quit to abandon.")
 
     def setup_board(self, seat):
         board = self.boards[seat]
+        # Start clean so Back-navigation re-entry never overlaps old ships.
+        while board.undo():
+            pass
         if not supports_cursor_ui():
-            board.place_randomly(FLEET)
-            return True
+            return self._setup_board_typed(seat)
 
-        choice = select_menu(
-            "\n".join(brand_masthead("Player %d — fleet setup" % (seat + 1))),
-            ["Place my ships by hand", "Random layout"],
-            start_idx=_MENU_STATE.last_setup_choice,
-        )
-        _MENU_STATE.last_setup_choice = choice
+        while True:
+            choice = select_menu(
+                "\n".join(brand_masthead("Player %d — fleet setup" % (seat + 1))),
+                ["Place my ships by hand", "Random layout", BACK_LABEL],
+                start_idx=min(_MENU_STATE.last_setup_choice, 1),
+            )
+            if choice == 2:
+                return BACK
+            _MENU_STATE.last_setup_choice = choice
 
-        if choice == 1:
-            board.place_randomly(FLEET)
-        else:
-            if interactive_place_fleet(board) is None:
-                return False
+            if choice == 1:
+                board.place_randomly(FLEET)
+            else:
+                res = interactive_place_fleet(board)
+                if res is None:
+                    return False
+                if res == BACK:
+                    continue
 
-        clear()
-        for line in center_block(brand_masthead("Player %d — fleet ready" % (seat + 1))):
-            print(line)
-        print(render_own(board))
-        print()
-        if supports_cursor_ui():
-            for line in center_block(command_bar([("ENTER", "HAND OVER"), ("Q", "ABORT")])):
+            clear()
+            for line in center_block(brand_masthead("Player %d — fleet ready" % (seat + 1))):
                 print(line)
+            print(render_own(board))
+            print()
+            for line in center_block(command_bar([("ENTER", "HAND OVER"), ("B", "BACK"), ("Q", "ABORT")])):
+                print(line)
+            back_to_method = False
             with KeyReader() as kr:
                 while True:
                     k = kr.get_key()
                     if k == "ENTER":
                         return True
+                    if k in ("B", "b"):
+                        while board.undo():
+                            pass
+                        back_to_method = True
+                        break
                     if k in ("Q", "q", "ESC", "CTRL_C"):
                         return False
-        else:
-            ask("  Player %d fleet ready. Press Enter to continue > " % (seat + 1))
-        return True
+            if back_to_method:
+                continue
+            return True
+
+    def _setup_board_typed(self, seat):
+        # Mobile/typed hotseat setup with Back on every step. Returns
+        # True/False/BACK. Never gets stuck: every prompt documents its
+        # commands and unknown input re-prompts.
+        board = self.boards[seat]
+        while board.undo():
+            pass
+        method = None
+        while True:
+            if method is None:
+                print("\nPLAYER %d FLEET SETUP" % (seat + 1))
+                print("  1) Place ships by hand")
+                print("  2) Random layout")
+                print("  3) Back")
+                raw = ask("Choose 1-3 (or 'back') > ").strip().lower()
+                if raw in ("3", "back", "b"):
+                    return BACK
+                if raw in ("quit", "q", "exit"):
+                    if confirm("  Abandon this game?"):
+                        return False
+                    continue
+                if raw in ("1", "manual", "hand"):
+                    method = "manual"
+                elif raw in ("2", "random", "auto", "r"):
+                    board.place_randomly(FLEET)
+                    method = "random"
+                else:
+                    print("  Enter 1, 2, 3/Back, or quit.")
+                    continue
+            # -- placement --------------------------------------------------
+            print("\n" + render_own(board))
+            n = len(board.order)
+            if n == len(FLEET):
+                raw0 = ask("Fleet ready. Enter = continue | undo | random | back | help > ")
+                raw = raw0.strip().lower()
+                if raw == "":
+                    return True
+            else:
+                name, length = FLEET[n]
+                raw0 = ask("[%d/%d] Player %d place %s (%d). Example: A1 H | back > "
+                           % (n + 1, len(FLEET), seat + 1, name, length))
+                raw = raw0.strip().lower()
+            if raw in ("quit", "q", "exit"):
+                if confirm("  Abandon this game?"):
+                    return False
+                continue
+            if raw in ("back", "b"):
+                undone = board.undo()
+                if undone:
+                    print("  Back: removed %s." % undone)
+                    continue
+                while board.undo():
+                    pass
+                method = None
+                continue
+            if raw in ("help", "h", "?"):
+                print(PLACE_HELP)
+                continue
+            if raw == "undo":
+                undone = board.undo()
+                print("  Removed %s." % undone if undone else "  Nothing to undo.")
+                continue
+            if raw in ("random", "auto", "r"):
+                while board.undo():
+                    pass
+                board.place_randomly(FLEET)
+                method = "random"
+                continue
+            if raw == "":
+                continue
+            if n < len(FLEET):
+                parsed = parse_placement(raw)
+                if not parsed:
+                    print("  Can't read that. Use START DIRECTION, e.g. A1 H or A1 V.")
+                    continue
+                (r, c), horizontal = parsed
+                cells, err = board.check_placement(length, r, c, horizontal)
+                if err:
+                    print("  Can't place %s at %s %s: %s." %
+                          (name, cell_name((r, c)), "H" if horizontal else "V", err))
+                else:
+                    board.place(name, cells)
+            else:
+                print("  Press Enter to continue, or type undo / random / back.")
 
     def _first_untried(self, foe):
         for r in range(SIZE):
@@ -4251,10 +4448,22 @@ class HotseatGame:
                     cursor = (9, cursor[1])
 
     def run(self):
-        for seat in (0, 1):
-            self.handoff(seat)
-            if not self.setup_board(seat):
+        seat_idx = 0
+        while seat_idx in (0, 1):
+            self.handoff(seat_idx)
+            res = self.setup_board(seat_idx)
+            if res == BACK:
+                if seat_idx == 1:
+                    # Back from Player 2 to Player 1 setup.
+                    self.boards[1] = Board()
+                    self.knows[1] = Knowledge()
+                    self.cursors[1] = None
+                    seat_idx = 0
+                    continue
+                return BACK
+            if not res:
                 return "abandoned"
+            seat_idx += 1
 
         seat = 0
         while True:
@@ -5355,96 +5564,124 @@ class LANGame:
         if not supports_cursor_ui():
             return self._setup_typed()
 
-        choice = select_menu(
-            "\n".join(brand_masthead("LAN deployment — vs %s" % str(getattr(self.conn, 'peer_name', 'peer'))[:20])),
-            ["Place my ships by hand", "Random layout"],
-            start_idx=_MENU_STATE.last_setup_choice,
-        )
-        _MENU_STATE.last_setup_choice = choice
-
-        if choice == 1:
-            self.player.place_randomly(FLEET)
-            while True:
-                clear()
-                for line in center_block(brand_masthead("LAN deployment — review layout")):
-                    print(line)
-                print(render_own(self.player))
-                print()
-                for line in center_block(command_bar([
-                    ("ENTER", "CONFIRM"), ("R", "REROLL"), ("Q", "SURRENDER"),
-                ])):
-                    print(line)
-                with KeyReader() as kr:
-                    key = kr.get_key()
-                    if key == "ENTER":
-                        return True
-                    if key in ("R", "r"):
-                        while self.player.undo():
-                            pass
-                        self.player.place_randomly(FLEET)
-                        continue
-                    if key in ("Q", "q", "ESC", "CTRL_C"):
-                        if confirm("Surrender this match?"):
-                            self.send_surrender()
-                            self.result = "loss"
-                            return False
-
-        if interactive_place_fleet(self.player) is None:
-            return "QUIT"
-        return True
-
-    def _setup_typed(self):
-        print("\nFLEET SETUP (LAN)")
-        choice = None
-
         while True:
             if self.check_interrupt():
                 return False
+            choice = select_menu(
+                "\n".join(brand_masthead("LAN deployment — vs %s" % str(getattr(self.conn, 'peer_name', 'peer'))[:20])),
+                ["Place my ships by hand", "Random layout", BACK_LABEL],
+                start_idx=min(_MENU_STATE.last_setup_choice, 1),
+            )
+            if choice == 2:
+                return BACK
+            _MENU_STATE.last_setup_choice = choice
 
-            raw0 = ask("  1) Place my ships by hand  2) Random layout > ")
-            raw = raw0.strip().lower()
+            if choice == 1:
+                self.player.place_randomly(FLEET)
+                while True:
+                    if self.check_interrupt():
+                        return False
+                    clear()
+                    for line in center_block(brand_masthead("LAN deployment — review layout")):
+                        print(line)
+                    print(render_own(self.player))
+                    print()
+                    for line in center_block(command_bar([
+                        ("ENTER", "CONFIRM"), ("R", "REROLL"),
+                        ("B", "BACK"), ("Q", "SURRENDER"),
+                    ])):
+                        print(line)
+                    with KeyReader() as kr:
+                        key = kr.get_key()
+                        if key == "ENTER":
+                            return True
+                        if key in ("R", "r"):
+                            while self.player.undo():
+                                pass
+                            self.player.place_randomly(FLEET)
+                            continue
+                        if key in ("B", "b"):
+                            while self.player.undo():
+                                pass
+                            break
+                        if key in ("Q", "q", "ESC", "CTRL_C"):
+                            if confirm("Surrender this match?"):
+                                self.send_surrender()
+                                self.result = "loss"
+                                return False
+                continue
 
-            if self.check_interrupt():
-                return False
-
-            if raw in ("1", "2"):
-                choice = raw
-                break
-
-            if raw.startswith("say "):
-                self.send_chat(raw0.strip()[4:])
-            elif raw == "chat":
-                self.client.print_chat_history()
-            elif raw in ("quit", "q", "exit"):
-                if confirm("Surrender this match?"):
-                    self.send_surrender()
-                    self.result = "loss"
-                    return False
-            else:
-                print("Enter 1 or 2.")
-
-        if choice == "2":
-            self.player.place_randomly(FLEET)
+            res = interactive_place_fleet(self.player)
+            if res is None:
+                return "QUIT"
+            if res == BACK:
+                continue
             return True
 
+    def _setup_typed(self):
+        # Typed/mobile LAN setup with Back on every step. Returns True,
+        # False (surrender/abandoned) or BACK (cancel to lobby). check_interrupt
+        # is polled on every prompt so a surrender/disconnect never strands
+        # a mobile user in a dead prompt. say/chat stay available throughout.
+        print("\nFLEET SETUP (LAN)")
         board = self.player
+        while board.undo():
+            pass
+        method = None
         while True:
             if self.check_interrupt():
                 return False
+            if method is None:
+                raw0 = ask("  1) Place my ships by hand  2) Random layout  3) Back to lobby > ")
+                raw = raw0.strip().lower()
+                if self.check_interrupt():
+                    return False
+                if raw in ("3", "back", "b"):
+                    return BACK
+                if raw in ("1", "manual", "hand"):
+                    method = "manual"
+                elif raw in ("2", "random", "auto", "r"):
+                    board.place_randomly(FLEET)
+                    return True
+                elif raw.startswith("say "):
+                    self.send_chat(raw0.strip()[4:])
+                    continue
+                elif raw == "chat":
+                    self.client.print_chat_history()
+                    continue
+                elif raw in ("quit", "q", "exit"):
+                    if confirm("Surrender this match?"):
+                        self.send_surrender()
+                        self.result = "loss"
+                        return False
+                    continue
+                else:
+                    print("Enter 1, 2, or 3/Back.")
+                    continue
 
             print("\n" + render_own(board))
             n = len(board.order)
 
             if n == len(FLEET):
-                raw0 = ask("Fleet ready. Enter = start | undo | random | say | chat | quit > ")
+                raw0 = ask("Fleet ready. Enter = start | undo | random | back | say | chat | quit > ")
             else:
                 name, length = FLEET[n]
-                raw0 = ask("[%d/%d] Place %s (%d). Example: A1 H | random | undo | say | chat | quit > "
+                raw0 = ask("[%d/%d] Place %s (%d). Example: A1 H | random | undo | back > "
                            % (n + 1, len(FLEET), name, length))
 
             raw = raw0.strip().lower()
             if self.check_interrupt():
                 return False
+
+            if raw in ("back", "b"):
+                undone = board.undo()
+                if undone:
+                    print("  Back: removed %s." % undone)
+                    continue
+                while board.undo():
+                    pass
+                method = None
+                continue
 
             if raw in ("quit", "q", "exit"):
                 if confirm("Surrender this match?"):
@@ -5470,6 +5707,7 @@ class LANGame:
                 while board.undo():
                     pass
                 board.place_randomly(FLEET)
+                method = "random"
                 continue
 
             if raw == "" and n == len(FLEET):
@@ -5492,7 +5730,7 @@ class LANGame:
                 else:
                     board.place(name, cells)
             else:
-                print("  Press Enter to start, or type undo / random.")
+                print("  Press Enter to start, or type undo / random / back.")
 
     def exchange_ready(self):
         if self.conn.cell_anticheat:
@@ -6081,7 +6319,18 @@ class LANGame:
 
     def run(self):
         try:
-            if not self.setup_local_fleet():
+            setup_res = self.setup_local_fleet()
+            if setup_res == BACK:
+                # Back to lobby: cancel cleanly without a surrender loss.
+                # Tell the peer we are leaving so they don't hang in ready.
+                try:
+                    self.conn.send({"type": "abort", "reason": "cancelled"})
+                except Exception:
+                    pass
+                self.result = "abandoned"
+                self.interrupt_msg = "Match cancelled (back to lobby)."
+                return self._finalize_cancelled()
+            if not setup_res:
                 return self._finalize()
             if not self.exchange_ready():
                 return self._finalize()
@@ -6092,6 +6341,21 @@ class LANGame:
                 self.send_surrender()
                 self.result = "loss"
             return self._finalize()
+
+    def _finalize_cancelled(self):
+        # Lightweight finalize for pre-ready Back: close without reveal
+        # exchange or score side-effects; caller (_run_match_object) treats
+        # "abandoned" as no score change and returns to the lobby.
+        if self.finished:
+            return self.result or "abandoned"
+        self.finished = True
+        if self.result is None:
+            self.result = "abandoned"
+        try:
+            self.conn.send({"type": "end", "reason": self.result})
+        except Exception:
+            pass
+        return self.result
 
     def _send_reveal(self):
         if self.conn.cell_anticheat and self.cell_salt is not None:
@@ -8458,9 +8722,12 @@ def choose_level():  # type: ignore[no-untyped-def]
         threat = dots[min(i, len(dots) - 1)]
         threat_styled = paint(threat, "red", "bold") if i >= 3 else paint(threat, "yellow") if i >= 1 else paint(threat, "green")
         options.append("%-9s  %s  %s" % (name.upper(), threat_styled, desc))
+    options.append(BACK_LABEL)
     header = "\n".join(brand_masthead("Select opponent — threat assessment"))
     idx = select_menu(header, options,
-                      start_idx=_MENU_STATE.last_level)
+                      start_idx=min(_MENU_STATE.last_level, len(options) - 2))
+    if idx == len(options) - 1:
+        return BACK
     _MENU_STATE.last_level = idx
     return LEVELS[idx]
 
@@ -8479,12 +8746,16 @@ def _setup_option_label(display, size, fleet_name):
 
 def choose_setup():  # type: ignore[no-untyped-def]
     options = [_setup_option_label(p[0], p[1], p[2]) for p in SETUP_PRESETS]
+    options.append(BACK_LABEL)
     header = "\n".join(brand_masthead("Tactical configuration — board & fleet") + [paint("Board size and fleet scale define the engagement profile.", "grey")])
     idx = select_menu(header, options,
-                      start_idx=_MENU_STATE.last_game_setup)
+                      start_idx=min(_MENU_STATE.last_game_setup, len(options) - 2))
+    if idx == len(options) - 1:
+        return BACK
     _MENU_STATE.last_game_setup = idx
     _, size, fleet_name = SETUP_PRESETS[idx]
     configure_board(size, fleet_name)
+    return True
 
 
 def choose_mode():  # type: ignore[no-untyped-def]
@@ -8492,9 +8763,12 @@ def choose_mode():  # type: ignore[no-untyped-def]
     idx = select_menu(
         header,
         ["NORMAL  —  one shot per turn",
-         "SALVO   —  one shot per afloat ship (both sides)"],
-        start_idx=_MENU_STATE.last_mode,
+         "SALVO   —  one shot per afloat ship (both sides)",
+         BACK_LABEL],
+        start_idx=min(_MENU_STATE.last_mode, 1),
     )
+    if idx == 2:
+        return BACK
     _MENU_STATE.last_mode = idx
     return "single" if idx == 0 else "salvo"
 
@@ -8504,11 +8778,98 @@ def choose_tactic():  # type: ignore[no-untyped-def]
     idx = select_menu(
         header,
         ["RANDOM      —  unpredictable fleet arrangement",
-         "CONTRARIAN  —  hides in low-probability cells (samples layouts)"],
-        start_idx=_MENU_STATE.last_tactic,
+         "CONTRARIAN  —  hides in low-probability cells (samples layouts)",
+         BACK_LABEL],
+        start_idx=min(_MENU_STATE.last_tactic, 1),
     )
+    if idx == 2:
+        return BACK
     _MENU_STATE.last_tactic = idx
     return idx == 1
+
+
+def _solo_wizard(args):
+    """Step-through setup→level→mode→tactic with Back on every step.
+
+    Returns (name, cls, mode, contrarian) or BACK when the user backs out
+    of the first step (caller returns to the main menu). Never gets stuck:
+    each choose_* offers an explicit Back entry (number or 'back' typed).
+    """
+    need_setup = args.board is None and args.fleet is None
+    step = 0 if need_setup else 1
+    level_info = None
+    mode = None
+    contrarian = None
+    while True:
+        if step == 0:
+            res = choose_setup()
+            if res == BACK:
+                return BACK
+            step = 1
+        elif step == 1:
+            res = choose_level()
+            if res == BACK:
+                if need_setup:
+                    step = 0
+                else:
+                    return BACK
+            else:
+                level_info = res
+                step = 2
+        elif step == 2:
+            res = choose_mode()
+            if res == BACK:
+                step = 1
+            else:
+                mode = res
+                step = 3
+        elif step == 3:
+            if args.contrarian:
+                contrarian = True
+                break
+            res = choose_tactic()
+            if res == BACK:
+                step = 2
+            else:
+                contrarian = bool(res)
+                break
+        else:
+            break
+    name, cls, _ = level_info
+    return (name, cls, mode, contrarian)
+
+
+def _campaign_wizard(args):
+    """Same Back navigation for campaign setup. Returns (mode, contrarian)
+    or BACK."""
+    need_setup = args.board is None and args.fleet is None
+    step = 0 if need_setup else 1
+    mode = None
+    contrarian = None
+    while True:
+        if step == 0:
+            res = choose_setup()
+            if res == BACK:
+                return BACK
+            step = 1
+        elif step == 1:
+            res = choose_mode()
+            if res == BACK:
+                if need_setup:
+                    step = 0
+                else:
+                    return BACK
+            else:
+                mode = res
+                step = 2
+        elif step == 2:
+            if args.contrarian:
+                return (mode, True)
+            res = choose_tactic()
+            if res == BACK:
+                step = 1
+            else:
+                return (mode, bool(res))
 
 
 def main():
@@ -8593,10 +8954,11 @@ def main():
             return
 
         if args.campaign:
-            if args.board is None and args.fleet is None:
-                choose_setup()
-            mode = "single"
-            camp = CampaignGame(mode=mode, contrarian=args.contrarian)
+            wiz = _campaign_wizard(args)
+            if wiz == BACK:
+                return
+            mode, contrarian_flag = wiz
+            camp = CampaignGame(mode=mode, contrarian=contrarian_flag)
             camp.run()
             return
 
@@ -8651,36 +9013,77 @@ def main():
 
             # --- New game -------------------------------------------------
             if choice == 0:
-                if args.board is None and args.fleet is None:
-                    choose_setup()
-                name, cls, _ = choose_level()
-                mode = choose_mode()
-                contrarian = args.contrarian or choose_tactic()
-
+                need_setup = args.board is None and args.fleet is None
+                step = 0 if need_setup else 1
+                level_info = None
+                mode_v = None
+                contr_v = None
+                # Wizard loop with Back: 0 setup, 1 level, 2 mode, 3 tactic,
+                # 4 play. Fleet-method Back inside Game.run returns BACK and
+                # lands here, stepping back to tactic/mode (not main menu).
                 while True:
-                    game = Game(name, cls, mode=mode, contrarian=contrarian)
-                    result = game.run()
-                    if result in score:
-                        score[result] += 1
-
-                    if result in ("win", "loss"):
-                        print()
-                        if confirm("Review your shots?"):
-                            show_shot_review(game)
-
-                    print()
-                    print("Session score: you %d - %d computer" % (score["win"], score["loss"]))
-                    if confirm("Play again on %s?" % name):
+                    if step == 0:
+                        res = choose_setup()
+                        if res == BACK:
+                            break
+                        step = 1
                         continue
-                    break
+                    if step == 1:
+                        res = choose_level()
+                        if res == BACK:
+                            if need_setup:
+                                step = 0
+                            else:
+                                break
+                            continue
+                        level_info = res
+                        step = 2
+                        continue
+                    if step == 2:
+                        res = choose_mode()
+                        if res == BACK:
+                            step = 1
+                            continue
+                        mode_v = res
+                        step = 3
+                        continue
+                    if step == 3:
+                        if args.contrarian:
+                            contr_v = True
+                        else:
+                            res = choose_tactic()
+                            if res == BACK:
+                                step = 2
+                                continue
+                            contr_v = bool(res)
+                        step = 4
+                        continue
+                    if step == 4:
+                        name, cls, _ = level_info
+                        game = Game(name, cls, mode=mode_v, contrarian=contr_v)
+                        result = game.run()
+                        if result == BACK:
+                            step = 2 if args.contrarian else 3
+                            continue
+                        if result in score:
+                            score[result] += 1
+                        if result in ("win", "loss"):
+                            print()
+                            if confirm("Review your shots?"):
+                                show_shot_review(game)
+                        print()
+                        print("Session score: you %d - %d computer" % (score["win"], score["loss"]))
+                        if confirm("Play again on %s?" % name):
+                            continue
+                        break
                 continue
 
             # --- Campaign -------------------------------------------------
             if choice == 1:
-                if args.board is None and args.fleet is None:
-                    choose_setup()
-                mode = choose_mode()
-                contrarian = args.contrarian or choose_tactic()
+                wiz = _campaign_wizard(args)
+                if wiz == BACK:
+                    continue
+                mode, contrarian = wiz
 
                 camp = CampaignGame(mode=mode, contrarian=contrarian)
                 result = camp.run()

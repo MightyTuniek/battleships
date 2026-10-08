@@ -61,7 +61,7 @@ Main menu:
 3. `Hotseat (2 players)`
 4. `LAN Matchmaking`
 5. `How to play`
-6. `Visual Settings`
+6. `Settings`
 7. `Quit`
 
 You fire first in solo games. First to sink the entire enemy fleet wins.
@@ -192,11 +192,14 @@ LAN typed adds: `say <msg>`, `chat`, `surrender`.
 - Shot review: turn-by-turn `HIT/miss/SUNK` plus what the top-3 were for off-optimal shots.
 - Expert par: on win, a headless Expert plays your exact enemy layout to benchmark you: `You won in N shots. Expert par: M.`
 
-## Visual settings
+## Settings
 
-`Main Menu → Visual Settings`:
+`Main Menu → Settings` has two groups:
 
-`animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
+- `Input`: `typed_mode (OFF)` — typed input only: no arrow-key menus or
+  cursor aiming, everything becomes numbered/typed commands. Ideal for
+  mobile keyboards (Pydroid 3) and touch terminals.
+- `Visuals`: `animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
 
 Disable color:
 
@@ -313,7 +316,8 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 ## Troubleshooting
 
 - Bad colors → `--no-color` or `NO_COLOR=1`.
-- No cursor menus → not a TTY, use typed commands (`B7`, `hint`, `map`, `save`, …).
+- No cursor menus → not a TTY, or `Settings → Input → typed mode` is ON. Use typed commands (`B7`, `hint`, `map`, `save`, …).
+- Narrow terminal (phone) → long help/chat/review texts wrap to fit and HUD rows stack; boxes and addresses stay intact. Minimum usable width is 40 columns.
 - `ship length X doesn't fit` → board too small for fleet, increase `--board` or use smaller `--fleet`.
 - No LAN peers → same subnet, UDP broadcast allowed, same port range + password, firewall open for UDP+TCP.
 - `No valid reply` → peer busy, wrong IP:port, or password mismatch.

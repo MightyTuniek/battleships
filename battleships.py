@@ -433,7 +433,7 @@ def supports_cursor_ui():
 
 
 # ----------------------------------------------------------------------------
-# Visual settings
+# Settings (looks + input behavior)
 # ----------------------------------------------------------------------------
 ESC = chr(27)
 BRK = chr(91)
@@ -465,6 +465,8 @@ VISUAL_DEFAULTS = {
     "captain_taunts": True,
     "streaks": True,
     "epic_mode": False,
+    # Input behavior (lives under Settings → Input, stored with the rest).
+    "typed_mode": False,
 }
 VISUAL = dict(VISUAL_DEFAULTS)
 _VISUAL_SETTINGS = VisualSettings(flags=VISUAL)  # single owner; VISUAL is compat view
@@ -515,6 +517,23 @@ def vis(name: str) -> bool:
 
 def can_animate():
     return supports_cursor_ui() and vis("animations")
+
+
+def use_cursor_ui():
+    """Arrow-key/cursor UI allowed? Honors the typed-input setting.
+
+    Output-only TTY features (colors, animations, spinners) still key off
+    supports_cursor_ui(); every branch that *reads* keys must use this so
+    Settings → Input → typed mode turns the whole game into commands.
+    """
+    if vis("typed_mode"):
+        return False
+    return supports_cursor_ui()
+
+
+INPUT_ENTRIES = [
+    ("Typed input only (no arrows, commands only)", "typed_mode"),
+]
 
 
 def _bell(kind="miss"):
@@ -700,55 +719,103 @@ def finish_cinematic(won):
         _burst_frames(frames, ("red", "bold"), 0.7)
 
 
-def visual_settings_menu():
-    top_sel = 0
-    sub_sel: Dict[str, int] = {}
+def _settings_entry_menu(context, entries, note, sel_store, sel_key):
+    """Toggle list with Back; shared by Input and Visuals sub-menus."""
+    pos = sel_store.get(sel_key, 0)
+    # Responsive label column: full width on wide terminals, slim on
+    # narrow ones so toggle rows never overflow (badges stay visible).
+    lw = max(12, min(34, term_width() - 16))
+    while True:
+        sub_options = []
+        for label, key in entries:
+            if key == "epic_mode":
+                badge = status_badge("EPIC", "focus") if VISUAL.get(key) else status_badge("OFF", "disabled")
+            else:
+                badge = status_badge("ON", "ok") if VISUAL.get(key) else status_badge("OFF", "disabled")
+            sub_options.append("%-*s %s" % (lw, label, badge))
+        sub_options.append("Back")
+
+        sub_header = "\n".join(
+            brand_masthead(context)
+            + [paint(note, "grey")])
+        sub_idx = select_menu(sub_header,
+                              sub_options, start_idx=pos)
+        pos = sub_idx
+        sel_store[sel_key] = pos
+
+        if sub_idx == len(entries):
+            return
+        _, key = entries[sub_idx]
+        _VISUAL_SETTINGS.toggle(key)
+
+
+def _visuals_menu(sel_store):
+    """Middle level: the looks-affecting categories live here."""
+    top_sel = sel_store.get("__visuals__", 0)
+    tw = max(12, min(26, term_width() - 20))
     while True:
         options = []
         for title, entries in VISUAL_CATEGORIES:
             on = sum(1 for _, key in entries if VISUAL.get(key))
             badge = status_badge("%d/%d ON" % (on, len(entries)), "ok" if on else "disabled")
             marker = "★ " if title == "Master" else ""
-            options.append("%-26s %s" % (marker + title.upper(), badge))
-
-        options.append("Reset to defaults")
+            options.append("%-*s %s" % (tw, marker + title.upper(), badge))
         options.append("Back")
 
-        header = "\n".join(brand_masthead("Visual settings — console calibration"))
+        header = "\n".join(brand_masthead("Settings — Visuals"))
+        idx = select_menu(header, options, start_idx=top_sel)
+        top_sel = idx
+        sel_store["__visuals__"] = top_sel
+
+        if idx == len(VISUAL_CATEGORIES):
+            return
+
+        title, entries = VISUAL_CATEGORIES[idx]
+        _settings_entry_menu("Settings — %s" % title, entries,
+                             "Toggles apply immediately. Animations require a TTY.",
+                             sel_store, title)
+
+
+def settings_menu():
+    top_sel = 0
+    sub_sel: Dict[str, int] = {}
+    tw = max(12, min(26, term_width() - 20))
+    while True:
+        input_on = sum(1 for _, key in INPUT_ENTRIES if VISUAL.get(key))
+        visual_total = sum(len(entries) for _, entries in VISUAL_CATEGORIES)
+        visual_on = sum(1 for _, entries in VISUAL_CATEGORIES
+                        for _, key in entries if VISUAL.get(key))
+        options = [
+            "%-*s %s" % (tw, "INPUT", status_badge(
+                "ON" if input_on else "OFF",
+                "focus" if input_on else "disabled")),
+            "%-*s %s" % (tw, "VISUALS", status_badge(
+                "%d/%d ON" % (visual_on, visual_total),
+                "ok" if visual_on else "disabled")),
+            "Reset to defaults",
+            "Back",
+        ]
+
+        header = "\n".join(brand_masthead("Settings"))
         idx = select_menu(header, options, start_idx=top_sel)
         top_sel = idx
 
-        if idx == len(VISUAL_CATEGORIES) + 1:
+        if idx == 3:
             return
 
-        if idx == len(VISUAL_CATEGORIES):
+        if idx == 2:
             _VISUAL_SETTINGS.reset()
             continue
 
-        title, entries = VISUAL_CATEGORIES[idx]
-        pos = sub_sel.get(title, 0)
-        while True:
-            sub_options = []
-            for label, key in entries:
-                if key == "epic_mode":
-                    badge = status_badge("EPIC", "focus") if VISUAL.get(key) else status_badge("OFF", "disabled")
-                else:
-                    badge = status_badge("ON", "ok") if VISUAL.get(key) else status_badge("OFF", "disabled")
-                sub_options.append("%-34s %s" % (label, badge))
-            sub_options.append("Back")
+        if idx == 0:
+            _settings_entry_menu(
+                "Settings — Input", INPUT_ENTRIES,
+                "Takes effect immediately. Typed mode disables arrow-key "
+                "menus and cursor aiming — everything becomes typed commands.",
+                sub_sel, "__input__")
+            continue
 
-            sub_header = "\n".join(
-                brand_masthead("Visual — %s" % title)
-                + [paint("Toggles apply immediately. Animations require a TTY.", "grey")])
-            sub_idx = select_menu(sub_header,
-                                  sub_options, start_idx=pos)
-            pos = sub_idx
-            sub_sel[title] = pos
-
-            if sub_idx == len(entries):
-                break
-            _, key = entries[sub_idx]
-            _VISUAL_SETTINGS.toggle(key)
+        _visuals_menu(sub_sel)
 
 
 # ----------------------------------------------------------------------------
@@ -827,6 +894,158 @@ def _truncate_vis(s, width):
     if width <= 3:
         return plain[:width]
     return plain[:width - 3] + "..."
+
+
+def _span_open(s):
+    """True when s ends inside an ANSI color span (needs a reset)."""
+    try:
+        opens = re.findall(r"\033\[[0-9;]*m", s)
+        resets = [c for c in opens if c == "\033[0m"]
+        return len(opens) > len(resets)
+    except Exception:
+        return False
+
+
+def wrap_prose(text, width=None):
+    """Word-wrap a (possibly painted) message to fit narrow terminals.
+
+    Returns a list of lines, each within `width` visible columns
+    (default: terminal width minus 2, floor 24). Blank lines pass
+    through; a source line's leading whitespace becomes the hanging
+    indent of its continuations, so command tables and chat rows stay
+    aligned. ANSI color spans are carried across wrap points (active
+    codes re-emitted, cut lines reset). Words longer than the width
+    are hard-split so output never overflows. Never raises.
+    """
+    try:
+        w = max(24, term_width() - 2) if width is None else max(10, int(width))
+    except Exception:
+        w = 78
+    try:
+        chunks = str(text).split("\n")
+    except Exception:
+        return [str(text)]
+    out: List[str] = []
+    for chunk in chunks:
+        out.extend(_wrap_paragraph(chunk, w))
+    return out or [""]
+
+
+def _wrap_paragraph(line, width):
+    try:
+        if _vis_len(line) <= width:
+            return [line]
+    except Exception:
+        return [line]
+    try:
+        m = re.match(r"[ \t]*", line)
+        indent = m.group(0) if m else ""
+        hanging = indent if _vis_len(indent) < width - 10 else ""
+    except Exception:
+        indent, hanging = "", ""
+    # Tokenize into words, with the active ANSI prefix riding along.
+    words = []
+    active: List[str] = []
+    try:
+        for tok in re.findall(r"\033\[[0-9;]*m|\S+", line.strip()):
+            if tok.startswith("\033["):
+                if tok == "\033[0m":
+                    active = []
+                else:
+                    active.append(tok)
+                continue
+            words.append(("".join(active), tok))
+    except Exception:
+        return [line]
+    if not words:
+        return [line]
+    cap = max(10, width - _vis_len(hanging))
+    wrapped: List[str] = []
+    cur = indent
+    try:
+        cur_len = _vis_len(indent)
+    except Exception:
+        cur_len = len(indent)
+    base = cur_len
+    for prefix, word in words:
+        # Hard-split words wider than a full continuation line.
+        while len(word) > cap:
+            if cur_len > base:
+                if _span_open(cur):
+                    cur += "\033[0m"
+                wrapped.append(cur)
+                cur, cur_len, base = hanging, _vis_len(hanging), _vis_len(hanging)
+            chunk, word = word[:cap], word[cap:]
+            cur += prefix + chunk
+            cur_len += len(chunk)
+            prefix = ""
+            if _span_open(cur):
+                cur += "\033[0m"
+            wrapped.append(cur)
+            cur, cur_len, base = hanging, _vis_len(hanging), _vis_len(hanging)
+        need = 1 if cur_len > base else 0
+        if cur_len + need + len(word) > width and cur_len > base:
+            if _span_open(cur):
+                cur += "\033[0m"
+            wrapped.append(cur)
+            cur, cur_len, base = hanging, _vis_len(hanging), _vis_len(hanging)
+            need = 0
+        if need:
+            cur += " "
+            cur_len += 1
+        cur += prefix + word
+        cur_len += len(word)
+    if cur.strip() or not wrapped:
+        if _span_open(cur):
+            cur += "\033[0m"
+        wrapped.append(cur)
+    return wrapped or [line]
+
+
+def page_lines(lines, prompt="-- more (Enter: next page, q: stop) --"):
+    """Print long output screenful-by-screenful for no-scrollback terminals.
+
+    Phones (Pydroid 3) can't scroll up, and the typed lobby prints a fresh
+    snapshot after every command — without paging, `help` output scrolls
+    away before it can be read. Fits output to the visible terminal
+    height; short output prints at once with no prompt. `q` (or Ctrl-C /
+    EOF) stops paging and returns to the caller. Never raises.
+    """
+    try:
+        items = [str(l) for l in (lines or [])]
+    except Exception:
+        return
+    if not items:
+        return
+    try:
+        _, rows = term_size()
+        per = max(5, int(rows) - 4)
+    except Exception:
+        per = 20
+    try:
+        if len(items) <= per:
+            for line in items:
+                print(line)
+            return
+        i = 0
+        total = len(items)
+        while i < total:
+            for line in items[i:i + per]:
+                print(line)
+            i += per
+            if i >= total:
+                break
+            try:
+                raw = ask(prompt + " > ").strip().lower()
+            except Quit:
+                print()
+                break
+            except Exception:
+                break
+            if raw in ("q", "quit", "stop", "exit"):
+                break
+    except Exception:
+        pass
 
 
 def term_width(default=100):
@@ -1317,6 +1536,12 @@ class Spinner:
 
 
 def _burst_print(text, styles, hold):
+    # Transient \r lines must never wrap: a wrapped line can't be erased
+    # cleanly and leaves border/text ghosts on narrow terminals.
+    try:
+        text = _truncate_vis(text, max(20, term_width() - 4))
+    except Exception:
+        pass
     if not sys.stdout.isatty():
         print("  " + paint(text, *styles))
         return
@@ -1621,10 +1846,12 @@ class KeyReader:
 
 
 def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
-    if not supports_cursor_ui():
-        print(header)
+    if not use_cursor_ui():
+        for wrapped in wrap_prose(header):
+            print(wrapped)
         for i, opt in enumerate(options, 1):
-            print("  %d) %s" % (i, strip_ansi(opt)))
+            for wrapped in wrap_prose("  %d) %s" % (i, strip_ansi(opt))):
+                print(wrapped)
         # Mobile/typed friendliness: when the trailing option is a Back
         # entry, accept "back"/"b" as well as its number so touch-keyboard
         # users never have to guess. Never raises; EOF becomes Quit via ask.
@@ -3205,17 +3432,16 @@ def print_log(notes):
 def show_shot_review(game):
     """Full shot-by-shot review with per-turn top-3 annotations."""
     clear()
-    for line in center_block(brand_masthead("Shot review")):
-        print(line)
-    for line in center_block(big_banner("SHOT REVIEW", "cyan")):
-        print(line)
-    print()
+    out = []
+    out.extend(center_block(brand_masthead("Shot review")))
+    out.extend(center_block(big_banner("SHOT REVIEW", "cyan")))
+    out.append("")
 
     history = getattr(game, "shot_history", [])
     if not history:
-        for line in center_block(["  No shots recorded."]):
-            print(line)
-        print()
+        out.extend(center_block(["  No shots recorded."]))
+        out.append("")
+        page_lines(out)
         return
 
     for i, e in enumerate(history, 1):
@@ -3230,42 +3456,50 @@ def show_shot_review(game):
         if not e["coach_opt"] and e.get("top3"):
             top3 = ", ".join(cell_name(p) for p in e["top3"])
             suffix = "   " + paint("(top-3: %s)" % top3, "grey")
-        for line in center_block(["  %3d.  %-5s  %s%s" % (i, cell, desc, suffix)]):
-            print(line)
+        out.extend(center_block(wrap_prose("  %3d.  %-5s  %s%s" % (i, cell, desc, suffix))))
 
-    print()
-    print_coach_summary(history)
+    out.append("")
+    out.extend(coach_summary_lines(history))
+    # Paged: a 100-turn review plus the score lines after it would push
+    # the top off a phone screen with no scrollback.
+    page_lines(out)
 
 
-def print_coach_summary(history):
+def coach_summary_lines(history):
+    """End-of-game coach box as a line list (pageable, printable)."""
     total = len(history)
     if not total:
-        return
+        return []
     hits = sum(1 for e in history if e["hit"])
     opt = sum(1 for e in history if e["coach_opt"])
     off = total - opt
 
-    for line in center_block(boxed_panel(paint("COACH", "bold"), [
-        metric_row("SHOTS", str(total)) + "   " + metric_row("HITS", str(hits)) + "   " + metric_row("ACCURACY", "%d%%" % (100 * hits // total)),
+    out = []
+    out.extend(center_block(boxed_panel(paint("COACH", "bold"), [
+        metric_row("SHOTS", str(total)) + "   " + metric_row("HITS", str(hits)),
+        metric_row("ACCURACY", "%d%%" % (100 * hits // total)),
         metric_row("OPTIMAL", "%d/%d (%d%%)" % (opt, total, 100 * opt // total)),
-    ])):
-        print(line)
+    ])))
 
     if off:
-        print()
-        for line in center_block([paint("SHOTS OUTSIDE EXPERT TOP-3", "grey")]):
-            print(line)
+        out.append("")
+        out.extend(center_block([paint("SHOTS OUTSIDE EXPERT TOP-3", "grey")]))
         for i, e in enumerate(history, 1):
             if not e["coach_opt"]:
                 top3 = ", ".join(cell_name(p) for p in e["top3"])
                 desc = "HIT" if e["hit"] else "miss"
-                for line in center_block(["      Turn %2d:  %-5s  %-5s   top-3: %s"
-                      % (i, cell_name(e["pos"]), desc, top3)]):
-                    print(line)
+                out.extend(center_block(wrap_prose(
+                    "      Turn %2d:  %-5s  %-5s   top-3: %s"
+                    % (i, cell_name(e["pos"]), desc, top3))))
     else:
-        print()
-        for line in center_block([status_badge("Flawless — every shot in expert top-3", "success")]):
-            print(line)
+        out.append("")
+        out.extend(center_block([status_badge("Flawless — every shot in expert top-3", "success")]))
+    return out
+
+
+def print_coach_summary(history):
+    for line in coach_summary_lines(history):
+        print(line)
 
 
 # ----------------------------------------------------------------------------
@@ -3304,7 +3538,7 @@ class Game:
     # -- Setup ----------------------------------------------------------------
 
     def setup(self):
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._setup_typed()
 
         while True:
@@ -3419,7 +3653,7 @@ class Game:
                 continue
 
             if raw in ("help", "h", "?"):
-                print(PLACE_HELP)
+                page_lines(wrap_prose(PLACE_HELP))
             elif raw == "undo":
                 undone = board.undo()
                 print("  Removed %s." % undone if undone else "  Nothing to undo.")
@@ -3460,16 +3694,19 @@ class Game:
         s = self.stats
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
         mode_name = "Salvo" if self.mode == "salvo" else "Normal"
-        return [
-            "%s  %s  %s" % (
-                metric_row("TURN", "%02d" % self.turn),
-                metric_row("OPPONENT", self.level.upper()),
-                metric_row("MODE", mode_name.upper())),
-            "%s  %s  %s" % (
-                metric_row("SHOTS", str(s["shots"])),
-                metric_row("HITS", str(s["hits"])),
-                metric_row("ACCURACY", acc)),
-        ]
+        turn = metric_row("TURN", "%02d" % self.turn)
+        opp = metric_row("OPPONENT", self.level.upper())
+        mode = metric_row("MODE", mode_name.upper())
+        shots = metric_row("SHOTS", str(s["shots"]))
+        hits = metric_row("HITS", str(s["hits"]))
+        accr = metric_row("ACCURACY", acc)
+        if term_width() >= 58:
+            return ["%s  %s  %s" % (turn, opp, mode),
+                    "%s  %s  %s" % (shots, hits, accr)]
+        # Narrow terminal: stacked pairs keep every HUD row within 40 cols.
+        return ["%s  %s" % (turn, opp),
+                "%s  %s" % (mode, shots),
+                "%s  %s" % (hits, accr)]
 
     def _header_block(self):
         title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("TACTICAL OPERATIONS", "cyan")
@@ -3676,7 +3913,7 @@ class Game:
     def get_shot(self, notes):
         burst_banner("YOUR TURN", ("cyan", "bold"), 0.28)
 
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._get_shot_typed(notes)
 
         return self._get_shot_cursor(notes)
@@ -3687,7 +3924,7 @@ class Game:
             raw = raw0.lower()
 
             if raw in ("help", "h", "?"):
-                print(SHOT_HELP)
+                page_lines(wrap_prose(SHOT_HELP))
             elif raw == "hint":
                 self.stats["hints"] += 1
                 print("  %s" % hint_text(self.pk, rng=getattr(self.ai, "rng", random)).replace("\n", "\n  "))
@@ -3856,7 +4093,7 @@ class Game:
             notes = ["Your move. You fire first."]
 
         while True:
-            if not supports_cursor_ui():
+            if not use_cursor_ui():
                 self.show(notes)
 
             if self.mode == "salvo":
@@ -4103,7 +4340,7 @@ class CampaignGame:
             print(line)
         print()
 
-        if supports_cursor_ui():
+        if use_cursor_ui():
             for line in center_block(command_bar([("ENTER", "NEXT MISSION"), ("Q", "END CAMPAIGN")])):
                 print(line)
             with KeyReader() as kr:
@@ -4189,7 +4426,7 @@ class HotseatGame:
         ]):
             print(line)
         print()
-        if supports_cursor_ui():
+        if use_cursor_ui():
             for line in center_block(command_bar([("ENTER", "SECURE — CONTINUE"), ("Q", "ABORT")])):
                 print(line)
             with KeyReader() as kr:
@@ -4217,7 +4454,7 @@ class HotseatGame:
         # Start clean so Back-navigation re-entry never overlaps old ships.
         while board.undo():
             pass
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._setup_board_typed(seat)
 
         while True:
@@ -4319,7 +4556,7 @@ class HotseatGame:
                 method = None
                 continue
             if raw in ("help", "h", "?"):
-                print(PLACE_HELP)
+                page_lines(wrap_prose(PLACE_HELP))
                 continue
             if raw == "undo":
                 undone = board.undo()
@@ -4356,7 +4593,7 @@ class HotseatGame:
         return (0, 0)
 
     def get_shot(self, seat):
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._get_shot_typed(seat)
         return self._get_shot_cursor(seat)
 
@@ -4470,7 +4707,7 @@ class HotseatGame:
             self.handoff(seat)
             foe = self.boards[next_seat(seat)]
 
-            if not supports_cursor_ui():
+            if not use_cursor_ui():
                 print(render_boards(self.boards[seat], foe))
 
             pos = self.get_shot(seat)
@@ -4491,7 +4728,7 @@ class HotseatGame:
                     print(line)
                 return "p1" if seat == 0 else "p2"
 
-            if supports_cursor_ui():
+            if use_cursor_ui():
                 print()
                 for line in center_block(command_bar([("ENTER", "END TURN"), ("Q", "ABANDON")])):
                     print(line)
@@ -4605,6 +4842,35 @@ def lan_connect_hint(port):
     if not ips:
         return "Others connect with: request <this-phone-or-PC-IP>:%d" % int(port)
     return "Others connect with: request %s:%d" % (ips[0], int(port))
+
+
+def format_peer_lines(num, name, pref, anti, state, ip, port):
+    """Peer row(s) for typed lists: one line when wide, two slim lines when narrow.
+
+    The one-line form is ~70 columns, so narrow terminals (phones) get a
+    two-line form where the address always stays intact on its own line.
+    Pass anti="" to skip the anti-cheat field (lobby snapshot style).
+    """
+    addr = "%s:%d" % (ip, port)
+    try:
+        narrow = term_width() < 60
+    except Exception:
+        narrow = False
+    if not narrow:
+        if anti:
+            return ["%d) %-16s pref=%-6s anti=%-7s state=%s addr=%s"
+                    % (num, name, pref, anti, state, addr)]
+        return ["  %d) %s pref=%s state=%s %s" % (num, name, pref, state, addr)]
+    try:
+        name_max = max(8, term_width() - _vis_len(addr) - 12)
+    except Exception:
+        name_max = 16
+    first = "  %d) %s (%s)" % (num, _truncate_vis(name, name_max), addr)
+    if anti:
+        second = "     %s %s %s" % (pref, anti, state)
+    else:
+        second = "     %s %s" % (pref, state)
+    return [first, second]
 
 LAN_HELP = """
 LAN LOBBY COMMANDS
@@ -5561,7 +5827,7 @@ class LANGame:
             return hit, 0, None, None
 
     def setup_local_fleet(self):
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._setup_typed()
 
         while True:
@@ -5796,19 +6062,27 @@ class LANGame:
         acc = "%d%%" % (100 * s["hits"] // s["shots"]) if s["shots"] else "-"
         mode_name = "Salvo" if self.mode == "salvo" else "Normal"
         ver = "CELL" if getattr(self.conn, "cell_anticheat", False) else "HASH"
-        return [
-            "%s  %s  %s" % (
-                metric_row("TURN", "%02d" % self.turn),
-                metric_row("OPPONENT", str(self.peer_name).upper()[:16]),
-                metric_row("MODE", mode_name.upper())),
-            "%s  %s  %s" % (
-                metric_row("SHOTS", str(s["shots"])),
-                metric_row("HITS", str(s["hits"])),
-                metric_row("ACCURACY", acc)),
-            "%s  %s" % (
-                metric_row("SECURE", ver),
-                metric_row("LINK", "STABLE" if not getattr(self.conn, "closed", False) else "LOST")),
-        ]
+        turn = metric_row("TURN", "%02d" % self.turn)
+        mode = metric_row("MODE", mode_name.upper())
+        shots = metric_row("SHOTS", str(s["shots"]))
+        hits = metric_row("HITS", str(s["hits"]))
+        accr = metric_row("ACCURACY", acc)
+        secure = metric_row("SECURE", ver)
+        link = metric_row("LINK", "STABLE" if not getattr(self.conn, "closed", False) else "LOST")
+        if term_width() >= 58:
+            return ["%s  %s  %s" % (
+                        turn,
+                        metric_row("OPPONENT", str(self.peer_name).upper()[:16]),
+                        mode),
+                    "%s  %s  %s" % (shots, hits, accr),
+                    "%s  %s" % (secure, link)]
+        # Narrow terminal: stacked pairs (+ shorter peer name) stay in 40 cols.
+        return ["%s  %s" % (
+                    turn,
+                    metric_row("OPPONENT", str(self.peer_name).upper()[:12])),
+                "%s  %s" % (mode, shots),
+                "%s  %s" % (hits, accr),
+                "%s  %s" % (secure, link)]
 
     def _lan_header(self):
         title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS · %s" % str(self.peer_name).upper()[:20], "cyan")
@@ -5998,7 +6272,7 @@ class LANGame:
                     cursor = (9, cursor[1])
 
     def get_shot(self, notes, salvo=False, remaining=1, current=None):
-        if not supports_cursor_ui():
+        if not use_cursor_ui():
             return self._get_shot_typed(notes, salvo=salvo, remaining=remaining, current=current)
         return self._get_shot_cursor(notes, salvo=salvo, remaining=remaining, current=current)
 
@@ -6284,7 +6558,7 @@ class LANGame:
                 self.finish_notes = notes
                 break
 
-            if not supports_cursor_ui():
+            if not use_cursor_ui():
                 self.show(notes)
 
             if self.my_turn:
@@ -6671,8 +6945,17 @@ class LANClient:
         if not items:
             self.print_now("  No chat messages.")
             return
+        if getattr(self, "interactive_lobby", False):
+            for line in items:
+                for wrapped in wrap_prose("  " + line):
+                    self.print_now(wrapped)
+            return
+        out = []
         for line in items:
-            self.print_now("  " + line)
+            out.extend(wrap_prose("  " + line))
+        # Page (not print_now): history can be 200 lines; on a phone
+        # without scrollback an unpaged dump is unreadable.
+        page_lines(out)
 
     def handle_match_chat(self, peer_name, text):
         self.add_chat(paint("[%s] %s" % (peer_name, text), "cyan"))
@@ -7119,8 +7402,9 @@ class LANClient:
             pref = "Salvo" if p.pref == "salvo" else "Normal"
             state = "busy" if p.state != "available" else "available"
             cell = "cell" if getattr(p, "cell_anticheat", False) else "classic"
-            self.print_now("%d) %-16s pref=%-6s anti=%-7s state=%s addr=%s:%d"
-                           % (i, p.name, pref, cell, state, p.addr[0], p.addr[1]))
+            for line in format_peer_lines(i, p.name, pref, cell, state,
+                                          p.addr[0], p.addr[1]):
+                self.print_now(line)
 
     def list_requests(self):
         self._clean_requests()
@@ -7655,7 +7939,7 @@ class LANClient:
         arg = parts[1] if len(parts) > 1 else ""
 
         if cmd in ("help", "h", "?"):
-            print(LAN_HELP)
+            page_lines(wrap_prose(LAN_HELP))
 
         elif cmd == "name":
             name = arg.strip()
@@ -8178,15 +8462,18 @@ class LANClient:
         for line in center_block(brand_masthead("LAN field manual")):
             print(line)
         for line in center_block(boxed_panel(paint("LIVE LOBBY", "bold"), [
-            paint("Lobby auto-refreshes. Players and chat stay side-by-side.", "grey"),
+            paint("Live players + chat side-by-side.", "grey"),
             "",
-            paint("↑/↓ select · Enter action · 1-9 challenge · C chat · T tell", "white"),
-            paint("R requests · A accept first · G start · X cancel · S settings", "white"),
-            paint("U status · / command · E advanced · L log · Q quit", "white"),
+            paint("↑↓ select · Enter action", "white"),
+            paint("1-9 duel · C chat · T tell", "white"),
+            paint("R requests · A accept · G start", "white"),
+            paint("X cancel · S settings · U status", "white"),
+            paint("H help · L log · Q quit · / cmd", "white"),
+            paint("E advanced command line", "white"),
         ])):
             print(line)
         print()
-        for line in center_block(LAN_HELP.strip("\n").split("\n")):
+        for line in center_block([w for l in LAN_HELP.strip("\n").split("\n") for w in wrap_prose(l)]):
             print(line)
         print()
         ask("Press Enter to return > ")
@@ -8232,7 +8519,7 @@ class LANClient:
             return
 
         try:
-            if supports_cursor_ui():
+            if use_cursor_ui():
                 self._live_dashboard()
             else:
                 self._live_typed_loop()
@@ -8285,15 +8572,15 @@ class LANClient:
         rows = []
         if self.pending_match is not None:
             mode = "Salvo" if getattr(self.pending_match, "mode", "single") == "salvo" else "Normal"
-            rows.append(paint("MATCH READY with %s (%s) — press G to start!"
-                              % (self.pending_match.peer_name, mode), "green", "bold"))
+            rows.append(paint("MATCH READY: %s (%s) — press G!"
+                              % (self.pending_match.peer_name[:14], mode), "green", "bold"))
         elif self.outgoing_request is not None:
-            rows.append("Outgoing request to %s ... (press X to cancel)"
-                        % self.outgoing_request.get("peer_name", "?"))
+            rows.append("Outgoing to %s … (X cancels)"
+                        % self.outgoing_request.get("peer_name", "?")[:14])
         elif reqs:
-            names = ", ".join(r[1]["from_name"] for r in reqs[:3])
-            more = " +%d more" % (len(reqs) - 3) if len(reqs) > 3 else ""
-            rows.append(paint("Incoming (%d): %s%s — press R to review"
+            names = ", ".join(r[1]["from_name"][:10] for r in reqs[:2])
+            more = " +%d more" % (len(reqs) - 2) if len(reqs) > 2 else ""
+            rows.append(paint("Incoming (%d): %s%s — R reviews"
                               % (len(reqs), names, more), "yellow", "bold"))
         else:
             rows.append("No pending matches. Pick a player + Enter to challenge.")
@@ -8387,10 +8674,14 @@ class LANClient:
         ]
 
         # -- bottom: match bar + notices ------------------------------------
-        match_rows = self._live_match_rows(reqs)
+        # Terminal-width truncation (not fixed 70): boxes must never exceed
+        # the screen or their rounded borders wrap on narrow terminals.
+        panel_w = max(20, cols - 8)
+        match_rows = [_truncate_vis(r, panel_w)
+                      for r in self._live_match_rows(reqs)]
         match_panel = boxed_panel(paint("MATCH", "bold"), match_rows)
         notices = self._live_notices()
-        notice_panel = boxed_panel(paint("NOTICES", "bold"), [_truncate_vis(n, 70) for n in notices]) if notices else None
+        notice_panel = boxed_panel(paint("NOTICES", "bold"), [_truncate_vis(n, panel_w) for n in notices]) if notices else None
 
         frame = []
         frame.extend(center_block(mast, width=cols))
@@ -8659,32 +8950,40 @@ class LANClient:
             _ips = local_lan_ips()
         except Exception:
             _ips = []
-        print("--- you: %s | port %d | IP %s ---" % (
-            self.name, int(self.port),
-            ", ".join(_ips) if _ips else "unknown"))
+        for line in wrap_prose("--- you: %s | port %d | IP %s ---" % (
+                self.name, int(self.port),
+                ", ".join(_ips) if _ips else "unknown")):
+            print(line)
         try:
-            print("--- " + lan_connect_hint(self.port) + " ---")
+            for line in wrap_prose("--- " + lan_connect_hint(self.port) + " ---"):
+                print(line)
         except Exception:
             pass
         print("--- players (%d) ---" % len(peers))
         if not peers:
-            print("  (none yet — if broadcast is blocked, ask peer for IP and use: request <IP>[:port])")
+            for line in wrap_prose(
+                    "  (none yet — if broadcast is blocked, ask peer for IP and use: request <IP>[:port])"):
+                print(line)
         for i, p in enumerate(peers, 1):
-            print("  %d) %s pref=%s state=%s %s:%d" % (
-                i, p.name, "Salvo" if p.pref == "salvo" else "Normal",
-                p.state or "available", p.addr[0], p.addr[1]))
+            for line in format_peer_lines(
+                    i, p.name, "Salvo" if p.pref == "salvo" else "Normal",
+                    "", p.state or "available", p.addr[0], p.addr[1]):
+                print(line)
         if reqs:
             print("--- incoming (%d) ---" % len(reqs))
             for i, (_, r) in enumerate(reqs, 1):
                 print("  %d) %s pref=%s" % (i, r["from_name"], r["pref"]))
         if self.pending_match is not None:
-            print("--- MATCH READY with %s (use: start) ---" % self.pending_match.peer_name)
+            for line in wrap_prose("--- MATCH READY with %s (use: start) ---"
+                                   % self.pending_match.peer_name):
+                print(line)
         print("--- chat (last 8) ---")
         hist = list(self.chat_history)[-8:]
         if not hist:
             print("  (no messages)")
         for line in hist:
-            print("  " + strip_ansi(line))
+            for wrapped in wrap_prose("  " + strip_ansi(line)):
+                print(wrapped)
 
     def _live_typed_loop(self):
         # Non-TTY fallback: same data, typed commands, snapshot after each
@@ -9000,7 +9299,7 @@ def main():
                 "Hotseat (2 players)",
                 "LAN Matchmaking",
                 "How to play",
-                "Visual Settings",
+                "Settings",
                 "Quit",
             ]
 
@@ -9111,14 +9410,14 @@ def main():
                 continue
 
             # --- How to play ---------------------------------------------
-            if choice == 5: visual_settings_menu(); continue
+            if choice == 5: settings_menu(); continue
             if choice == 4:
-                if supports_cursor_ui():
+                if use_cursor_ui():
                     clear()
                     for line in center_block(brand_masthead("Field manual")):
                         print(line)
                     # Responsive manual: two columns on wide, stacked on narrow.
-                    manual = [l for l in HOW_TO_PLAY.strip("\n").split("\n")]
+                    manual = [w for l in HOW_TO_PLAY.strip("\n").split("\n") for w in wrap_prose(l)]
                     for line in center_block(manual):
                         print(line)
                     print()
@@ -9127,7 +9426,7 @@ def main():
                     with KeyReader() as kr:
                         kr.get_key()
                 else:
-                    print(HOW_TO_PLAY)
+                    page_lines(wrap_prose(HOW_TO_PLAY))
                 continue
 
     except Quit:

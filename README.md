@@ -276,7 +276,24 @@ help                 help
 quit                 leave LAN
 ```
 
-Interactive lobby also has menus for Players, Requests, Chat, Settings, Status, Help, and Advanced command line.
+Interactive lobby is a live screen: PLAYERS (left) and CHAT (right) stay
+side-by-side and auto-refresh about once per second — no manual refresh.
+
+```text
+Up/Down    select player      Enter      player actions
+1-9        quick challenge    C          public chat
+T          private to select  R          review requests
+A          accept first       G          start ready match
+X          cancel outgoing    S/U        settings / status
+H/?        help               L          full chat log
+/ or :     one command        E          advanced command line
+Q          quit
+```
+
+Non-TTY falls back to a typed loop that prints a players+chat snapshot
+after every command.
+
+### Lobby commands (also via `/` and `E` advanced mode)
 
 ### In-game LAN
 

@@ -688,6 +688,20 @@ def _pad_vis(s, width, align="left"):
     return " " * left + s + " " * right
 
 
+def _truncate_vis(s, width):
+    """Truncate to visible width, preserving ANSI when it fits."""
+    if width <= 0:
+        return ""
+    if _vis_len(s) <= width:
+        return s
+    plain = strip_ansi(s)
+    if len(plain) <= width:
+        return s
+    if width <= 3:
+        return plain[:width]
+    return plain[:width - 3] + "..."
+
+
 def box_top_line(inner_width, title=None, double=False):
     tl, tr, h = (DBOX_TL, DBOX_TR, DBOX_H) if double else (BOX_TL, BOX_TR, BOX_H)
     if not title:
@@ -6906,7 +6920,16 @@ class LANClient:
     def _help_menu(self):
         clear()
         print()
-        print(paint("LAN HELP", "bold"))
+        print(paint("LAN HELP — live lobby", "bold"))
+        print()
+        print("  The lobby auto-refreshes (~1s). Players (left) and chat (right)")
+        print("  stay side-by-side with no manual refresh.")
+        print()
+        print("  ↑/↓ select player · Enter action · 1-9 quick challenge")
+        print("  C public chat · T private to selected · L full chat log")
+        print("  R review requests · A accept first · G start match · X cancel")
+        print("  S settings · U status · / one command · E advanced commands")
+        print("  Q quit")
         print(LAN_HELP)
         ask("Press Enter to return > ")
 
@@ -6950,63 +6973,459 @@ class LANClient:
             self.print_now("Cannot start LAN lobby: %s" % e)
             return
 
-        self.interactive_lobby = True
-        sel_action = None
-
         try:
-            while self.running:
-                self._clean_requests()
-
-                if self.pending_match is not None and self.pending_match.closed:
-                    self.pending_match = None
-
-                header = self._lobby_header()
-                options, actions = self._lobby_options()
-
-                start_idx = actions.index(sel_action) if sel_action in actions else 0
-                idx = select_menu(header, options, start_idx=start_idx)
-                action = actions[idx]
-                sel_action = action
-
-                if action == "quit":
-                    break
-
-                elif action == "start":
-                    if self.pending_match:
-                        self.interactive_lobby = False
-                        try:
-                            self.run_pending_match()
-                        finally:
-                            self.interactive_lobby = True
-
-                elif action == "players":
-                    self._players_menu()
-
-                elif action == "requests":
-                    self._requests_menu()
-
-                elif action == "chat":
-                    self._chat_menu()
-
-                elif action == "settings":
-                    self._settings_menu()
-
-                elif action == "status":
-                    self._status_menu()
-
-                elif action == "help":
-                    self._help_menu()
-
-                elif action == "command":
-                    self._command_menu()
-
+            if supports_cursor_ui():
+                self._live_dashboard()
+            else:
+                self._live_typed_loop()
         except Quit:
             pass
-
         finally:
             self.interactive_lobby = False
             self.stop()
             time.sleep(0.1)
+
+    # -- Live lobby dashboard (auto-refresh side-by-side) -------------------
+    # Replaces the old manual "Refresh list / Refresh chat" sub-menus with a
+    # single live screen: PLAYERS on the left, CHAT on the right, both
+    # re-rendered every LIVE_REFRESH seconds (plus on every keypress), so no
+    # manual refresh is ever needed. Advanced command line is preserved via
+    # "/" (single command) and "E" (full command mode), plus the non-TTY
+    # typed loop below.
+    LIVE_REFRESH = 1.0
+    LIVE_CHAT_ROWS = 10
+    LIVE_PLAYER_ROWS = 8
+
+    def _live_term_size(self):
+        try:
+            sz = os.get_terminal_size()
+            return max(60, sz.columns), max(20, sz.lines)
+        except Exception:
+            return 80, 24
+
+    def _live_peers(self):
+        self._clean_peers()
+        with self.peer_lock:
+            return sorted(self.peers.values(),
+                          key=lambda p: (p.name.lower(), p.id))
+
+    def _live_reqs(self):
+        self._clean_requests()
+        with self.request_lock:
+            return sorted(self.incoming_requests.items(),
+                          key=lambda kv: kv[1]["from_name"].lower())
+
+    def _live_notices(self):
+        try:
+            chat_set = set(self.chat_history)
+        except Exception:
+            chat_set = set()
+        out = [n for n in list(self.notifications) if n not in chat_set]
+        return out[-3:]
+
+    def _live_match_rows(self, reqs):
+        rows = []
+        if self.pending_match is not None:
+            mode = "Salvo" if getattr(self.pending_match, "mode", "single") == "salvo" else "Normal"
+            rows.append(paint("MATCH READY with %s (%s) — press G to start!"
+                              % (self.pending_match.peer_name, mode), "green", "bold"))
+        elif self.outgoing_request is not None:
+            rows.append("Outgoing request to %s ... (press X to cancel)"
+                        % self.outgoing_request.get("peer_name", "?"))
+        elif reqs:
+            names = ", ".join(r[1]["from_name"] for r in reqs[:3])
+            more = " +%d more" % (len(reqs) - 3) if len(reqs) > 3 else ""
+            rows.append(paint("Incoming (%d): %s%s — press R to review"
+                              % (len(reqs), names, more), "yellow", "bold"))
+        else:
+            rows.append("No pending matches. Pick a player + Enter to challenge.")
+        return rows
+
+    def _live_render(self, sel_id, frame):
+        peers = self._live_peers()
+        reqs = self._live_reqs()
+
+        if self.pending_match is not None and getattr(self.pending_match, "closed", False):
+            self.pending_match = None
+
+        sel_idx = 0
+        if peers:
+            found = [i for i, p in enumerate(peers) if p.id == sel_id]
+            sel_idx = found[0] if found else 0
+            sel_idx = max(0, min(sel_idx, len(peers) - 1))
+        else:
+            sel_idx = -1
+
+        cols, _ = self._live_term_size()
+        chat_rows_n = self.LIVE_CHAT_ROWS
+        player_rows_n = self.LIVE_PLAYER_ROWS
+
+        # -- left: players -------------------------------------------------
+        player_content = []
+        if not peers:
+            player_content = [
+                "No players yet.",
+                "Waiting for beacons...",
+                "",
+                "Ask a friend to open",
+                "LAN Matchmaking too.",
+            ]
+        else:
+            for i, p in enumerate(peers[:player_rows_n]):
+                marker = paint("▶", "cyan", "bold") if i == sel_idx else " "
+                pref = "Salvo" if p.pref == "salvo" else "Normal"
+                state = p.state or "available"
+                if state == "available":
+                    state_txt = paint("avail", "green")
+                else:
+                    state_txt = paint(state[:8], "yellow")
+                prefix = _truncate_vis("%d %-14s %s " % (i + 1, p.name[:14], pref), 24)
+                player_content.append("%s %s%s" % (marker, prefix, state_txt))
+            if len(peers) > player_rows_n:
+                player_content.append("+%d more" % (len(peers) - player_rows_n))
+        while len(player_content) < 5:
+            player_content.append("")
+        left = boxed_panel(paint("PLAYERS (%d)" % len(peers), "bold"), player_content)
+
+        # -- right: chat (always tailed, auto-updated) ----------------------
+        history = list(self.chat_history)[-chat_rows_n:]
+        chat_w = max(24, cols - 46)
+        chat_content = []
+        if not history:
+            chat_content = ["No messages yet.", "Press C to say hi!"]
+        else:
+            for line in history:
+                chat_content.append(_truncate_vis(line, chat_w))
+        while len(chat_content) < chat_rows_n:
+            chat_content.insert(0, "")
+        right = boxed_panel(paint("CHAT * LIVE", "bold"), chat_content)
+
+        # -- top header ------------------------------------------------------
+        spin = "|/-\\"[frame % 4]
+        stamp = time.strftime("%H:%M:%S")
+        lock = "on" if self.lobby_key else "off"
+        header = paint("LAN LOBBY * LIVE", "bold") + "  %s %s" % (spin, stamp)
+        status = "You: %s | %s | port %d | lock %s | score %dW/%dL | peers %d" % (
+            self.name, "Salvo" if self.pref == "salvo" else "Normal",
+            self.port, lock, self.lan_score["win"], self.lan_score["loss"], len(peers))
+
+        # -- bottom: match bar + notices ------------------------------------
+        match_rows = self._live_match_rows(reqs)
+        match_panel = boxed_panel(paint("MATCH", "bold"), match_rows)
+        notices = self._live_notices()
+        notice_panel = boxed_panel(paint("NOTICES", "bold"), [_truncate_vis(n, 70) for n in notices]) if notices else None
+
+        # -- footer hints ----------------------------------------------------
+        req_badge = " (%d)" % len(reqs) if reqs else ""
+        hints = [
+            paint("↑/↓ select · Enter action · 1-9 challenge · C chat · T tell · R requests%s"
+                  % req_badge, "grey"),
+            paint("G start · X cancel · S settings · U status · H help · / cmd · E advanced · L log · Q quit",
+                  "grey"),
+        ]
+
+        clear()
+        print(header)
+        print("  " + status)
+        print()
+        if cols >= 78:
+            for line in side_by_side(left, right):
+                print(_truncate_vis(line, cols))
+        else:
+            for line in left:
+                print(line)
+            print()
+            for line in right:
+                print(line)
+        print()
+        for line in match_panel:
+            print(_truncate_vis(line, cols))
+        if notice_panel:
+            for line in notice_panel:
+                print(_truncate_vis(line, cols))
+        print()
+        for h in hints:
+            print("  " + h)
+        return peers, sel_idx
+
+    def _live_poll_key(self, kr, timeout):
+        if os.name == "nt":
+            import msvcrt
+            end = time.time() + timeout
+            while time.time() < end:
+                if not self.running:
+                    return None
+                try:
+                    if msvcrt.kbhit():
+                        return kr.get_key()
+                except Exception:
+                    return None
+                time.sleep(0.05)
+            return None
+        import select
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+        except Exception:
+            time.sleep(timeout)
+            return None
+        if r:
+            try:
+                return kr.get_key()
+            except Exception:
+                return None
+        return None
+
+    def _live_suspend(self, kr):
+        try:
+            kr.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    def _live_resume(self, kr):
+        try:
+            kr.__enter__()
+        except Exception:
+            pass
+
+    def _live_dashboard(self):
+        # Assumes sockets already started by run_lobby(); owns the live loop.
+        self.interactive_lobby = True
+        sel_id = None
+        frame = 0
+        kr = KeyReader()
+        kr.__enter__()
+        try:
+            while self.running:
+                peers, sel_idx = self._live_render(sel_id, frame)
+                frame += 1
+                if peers and 0 <= sel_idx < len(peers):
+                    sel_id = peers[sel_idx].id
+
+                key = self._live_poll_key(kr, self.LIVE_REFRESH)
+                if key is None:
+                    continue
+                if key == "CTRL_C":
+                    break
+                if key in ("Q", "q", "ESC"):
+                    break
+                if key == "UP":
+                    if peers:
+                        sel_idx = (sel_idx - 1) % len(peers)
+                        sel_id = peers[sel_idx].id
+                    continue
+                if key == "DOWN":
+                    if peers:
+                        sel_idx = (sel_idx + 1) % len(peers)
+                        sel_id = peers[sel_idx].id
+                    continue
+                if key == "ENTER":
+                    if peers and 0 <= sel_idx < len(peers):
+                        peer = peers[sel_idx]
+                        self._live_suspend(kr)
+                        try:
+                            self.interactive_lobby = True
+                            self._peer_actions(peer)
+                        finally:
+                            self.interactive_lobby = True
+                            self._live_resume(kr)
+                    elif self.pending_match is not None:
+                        self._live_suspend(kr)
+                        try:
+                            self.interactive_lobby = False
+                            self.run_pending_match()
+                        finally:
+                            self.interactive_lobby = True
+                            self._live_resume(kr)
+                    continue
+                if key and len(key) == 1 and key in "123456789":
+                    n = int(key) - 1
+                    if peers and 0 <= n < len(peers):
+                        self.send_request_to_peer(peers[n])
+                    continue
+                kl = key.lower() if len(key) == 1 else key
+                if kl == "c":
+                    self._live_suspend(kr)
+                    try:
+                        text = ask("Public chat > ")
+                    except Quit:
+                        text = ""
+                    finally:
+                        self._live_resume(kr)
+                    if text.strip():
+                        self.send_public_chat(text)
+                    continue
+                if kl == "t":
+                    if not (peers and 0 <= sel_idx < len(peers)):
+                        self.notify("No player selected.")
+                        continue
+                    peer = peers[sel_idx]
+                    self._live_suspend(kr)
+                    try:
+                        text = ask("Private to %s > " % peer.name)
+                    except Quit:
+                        text = ""
+                    finally:
+                        self._live_resume(kr)
+                    if text.strip():
+                        self.send_private_chat(peer, text)
+                    continue
+                if kl == "r":
+                    self._live_suspend(kr)
+                    try:
+                        self._requests_menu()
+                    finally:
+                        self._live_resume(kr)
+                    continue
+                if kl == "g":
+                    if self.pending_match is None:
+                        self.notify("No pending match.")
+                        continue
+                    self._live_suspend(kr)
+                    try:
+                        self.interactive_lobby = False
+                        self.run_pending_match()
+                    finally:
+                        self.interactive_lobby = True
+                        self._live_resume(kr)
+                    continue
+                if kl == "x":
+                    self.cmd_cancel()
+                    continue
+                if kl == "a":
+                    reqs = self._live_reqs()
+                    if reqs:
+                        self._live_suspend(kr)
+                        try:
+                            self.interactive_lobby = False
+                            self.accept_incoming(reqs[0][0])
+                        finally:
+                            self.interactive_lobby = True
+                            self._live_resume(kr)
+                    else:
+                        self.notify("No incoming requests.")
+                    continue
+                if kl == "s":
+                    self._live_suspend(kr)
+                    try:
+                        self._settings_menu()
+                    finally:
+                        self._live_resume(kr)
+                    continue
+                if kl == "u":
+                    self._live_suspend(kr)
+                    try:
+                        self._status_menu()
+                    finally:
+                        self._live_resume(kr)
+                    continue
+                if kl in ("h", "?"):
+                    self._live_suspend(kr)
+                    try:
+                        self._help_menu()
+                    finally:
+                        self._live_resume(kr)
+                    continue
+                if kl == "l":
+                    self._live_suspend(kr)
+                    try:
+                        clear()
+                        print(paint("CHAT HISTORY", "bold"))
+                        print()
+                        self.print_chat_history(n=200)
+                        print()
+                        ask("Press Enter to return > ")
+                    except Quit:
+                        pass
+                    finally:
+                        self._live_resume(kr)
+                    continue
+                if key in ("/", ":"):
+                    self._live_suspend(kr)
+                    try:
+                        raw = ask("LAN cmd (? help, back returns) > ")
+                    except Quit:
+                        raw = "back"
+                    if raw.strip().lower() not in ("", "back", "return"):
+                        first = raw.strip().split(None, 1)[0].lower()
+                        if first in ("start", "accept"):
+                            self.interactive_lobby = False
+                            try:
+                                self.handle_command(raw)
+                            finally:
+                                self.interactive_lobby = True
+                        else:
+                            self.handle_command(raw)
+                        if raw.strip().lower() in ("quit", "exit"):
+                            break
+                    try:
+                        self._live_resume(kr)
+                    except Exception:
+                        pass
+                    continue
+                if kl == "e":
+                    self._live_suspend(kr)
+                    try:
+                        self._command_menu()
+                    finally:
+                        self._live_resume(kr)
+                    if not self.running:
+                        break
+                    continue
+        except Quit:
+            pass
+        finally:
+            try:
+                kr.__exit__(None, None, None)
+            except Exception:
+                pass
+            self.interactive_lobby = False
+
+    def _live_side_snapshot(self):
+        peers = self._live_peers()
+        reqs = self._live_reqs()
+        print("--- players (%d) ---" % len(peers))
+        if not peers:
+            print("  (none yet)")
+        for i, p in enumerate(peers, 1):
+            print("  %d) %s pref=%s state=%s %s:%d" % (
+                i, p.name, "Salvo" if p.pref == "salvo" else "Normal",
+                p.state or "available", p.addr[0], p.addr[1]))
+        if reqs:
+            print("--- incoming (%d) ---" % len(reqs))
+            for i, (_, r) in enumerate(reqs, 1):
+                print("  %d) %s pref=%s" % (i, r["from_name"], r["pref"]))
+        if self.pending_match is not None:
+            print("--- MATCH READY with %s (use: start) ---" % self.pending_match.peer_name)
+        print("--- chat (last 8) ---")
+        hist = list(self.chat_history)[-8:]
+        if not hist:
+            print("  (no messages)")
+        for line in hist:
+            print("  " + strip_ansi(line))
+
+    def _live_typed_loop(self):
+        # Non-TTY fallback: same data, typed commands, snapshot after each
+        # command so players+chat stay visible without separate list/chat.
+        self.interactive_lobby = False
+        print("LAN lobby (typed fallback). Type help, back to leave.")
+        self._live_side_snapshot()
+        while self.running:
+            try:
+                raw = ask("LAN > ")
+            except Quit:
+                break
+            if not raw.strip():
+                self._live_side_snapshot()
+                continue
+            txt = raw.strip().lower()
+            if txt in ("quit", "exit", "back"):
+                break
+            self.handle_command(raw)
+            if not self.running:
+                break
+            if self.pending_match is not None and getattr(self.pending_match, "closed", False):
+                self.pending_match = None
+            self._live_side_snapshot()
 
 
 # ----------------------------------------------------------------------------

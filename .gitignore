@@ -1,1 +1,12 @@
+# agent scratch work (local issue tracker, not committed)
+.scratch/
 docs/superpowers/
+
+# python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# user-created save files (see README: not committed)
+*.json
+!package.json

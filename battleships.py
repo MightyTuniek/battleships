@@ -1615,6 +1615,11 @@ def side_by_side(left_lines, right_lines, gap="   "):
 
 
 def boxed_panel(title, content_lines, double=False):
+    try:
+        if is_rich_active():
+            double = True
+    except Exception:
+        pass
     inner = max((_vis_len(x) for x in content_lines), default=0)
     inner = max(inner, _vis_len(title) + 4)
     out = [box_top_line(inner, title, double)]
@@ -1624,8 +1629,27 @@ def boxed_panel(title, content_lines, double=False):
     return out
 
 
+def rich_nudge_line() -> str:
+    """Install hint shown under the masthead when Rich theming is off."""
+    return RICH_NUDGE
+
+
 def brand_masthead(context=None, width=None):
     """Modern branding: letter-spaced title, thin rule, compact subtitle."""
+    try:
+        if is_rich_active():
+            art = _THEME_CURRENT.title_art.split("\n")
+            accent = _THEME_CURRENT.palette.get("ship", "cyan")
+            lines = [paint(a, "bold", accent) for a in art if a.strip()]
+            lines.append(paint("TACTICAL OPERATIONS", accent))
+            if context:
+                lines.append(paint(str(context).upper(), "grey"))
+            w = 56 if width is None else width
+            w = max(30, min(w, term_width() - 6))
+            lines.append(rule(w))
+            return lines
+    except Exception:
+        pass
     lines = [
         paint("B A T T L E S H I P S", "bold", "white"),
         paint("TACTICAL OPERATIONS", "cyan"),
@@ -9551,6 +9575,11 @@ def main():
             profile_panel = boxed_panel(paint("PROFILE", "bold"), profile_rows)
             header_lines = []
             header_lines.extend(brand_masthead("Naval command console"))
+            try:
+                if sys.stdout.isatty() and not is_rich_active():
+                    header_lines.append(paint(rich_nudge_line(), "grey"))
+            except Exception:
+                pass
             header_lines.append("")
             header_lines.append(_pad_vis(paint("TACTICAL OPERATIONS", "cyan"), term_width(), "center") if term_width() >= 78 else paint("TACTICAL OPERATIONS", "cyan"))
             header_lines.append("")

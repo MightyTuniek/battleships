@@ -16,13 +16,14 @@ A complete Battleships game for the terminal in a single Python file. Play again
 - Normal and Salvo (one shot per afloat ship) rules
 - Probability hints, density map, coach scoring, Expert par, shot review
 - Animated terminal UI with colors, with full typed fallback for non-TTY
+- Optional visual themes (background panels, title art, icon HUD) via `pip install rich` — game is identical without it
 - Save / resume games as JSON
 - Headless AI benchmark mode
 
 ## Requirements
 
 - Python 3.8+
-- No pip packages required
+- No pip packages required (optional `rich` package unlocks visual themes: `pip install rich`)
 - Works best in a real terminal (TTY) for cursor menus, colors, and animations
 - Linux / macOS / Windows supported
 
@@ -194,12 +195,16 @@ LAN typed adds: `say <msg>`, `chat`, `surrender`.
 
 ## Settings
 
-`Main Menu → Settings` has two groups:
+`Main Menu → Settings` has three groups:
 
 - `Input`: `typed_mode (OFF)` — typed input only: no arrow-key menus or
   cursor aiming, everything becomes numbered/typed commands. Ideal for
   mobile keyboards (Pydroid 3) and touch terminals.
 - `Visuals`: `animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
+- `Theme`: `abyss | arcade | harbor` (session-only). Full background
+  panels need `pip install rich`; without it the game shows
+  `Install rich for better looks: pip install rich` and plays exactly
+  as before. Force the classic look with `--no-rich`.
 
 Disable color:
 
@@ -227,6 +232,8 @@ python3 battleships.py --help
 | Flag | Description |
 |---|---|
 | `--no-color` | Disable ANSI colors |
+| `--theme NAME` | Visual theme: `abyss` \| `arcade` \| `harbor` (unknown falls back to `abyss`) |
+| `--no-rich` | Disable Rich theming, use ANSI fallback |
 | `--board N` | Board size 6–14, skips setup menu |
 | `--fleet NAME` | `classic` \| `small` \| `armada`, skips setup menu |
 | `--contrarian` | Force contrarian enemy placement |

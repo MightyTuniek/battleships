@@ -472,9 +472,9 @@ VISUAL = dict(VISUAL_DEFAULTS)
 _VISUAL_SETTINGS = VisualSettings(flags=VISUAL)  # single owner; VISUAL is compat view
 
 VISUAL_CATEGORIES = [
-    ("Master", [
-        ("Master animations", "animations"),
-        ("EPIC MODE (all Hollywood, slower)", "epic_mode"),
+    ("Global", [
+        ("Enable animations (master switch)", "animations"),
+        ("Epic mode: all effects + slower", "epic_mode"),
     ]),
     ("Battle Effects", [
         ("Explosion / splash frames", "explosions"),
@@ -509,6 +509,154 @@ EPIC_TIMINGS = {
     False: {"hit_stop": 0.12, "sunk_stop": 0.25, "shake_frames": 3},
     True: {"hit_stop": 0.30, "sunk_stop": 0.80, "shake_frames": 6},
 }
+
+# Effects gated by the master switch: raw ON but master OFF == no visible
+# effect (every call site also checks can_animate()). Shown as BLOCKED.
+ANIM_GATED_KEYS = frozenset([
+    "explosions", "shot_trails", "screen_shake", "hit_stop",
+    "sunk_reveal", "kill_cam", "damage_fire", "victory_cinematics",
+    "turn_banners", "sonar_sweep", "streaks", "captain_taunts",
+])
+
+# Epic preset: everything Hollywood ON (readability kept ON, accessibility
+# and typed_mode left alone so Epic never enables flash/bell surprise).
+EPIC_FORCE_KEYS = [
+    "animations", "explosions", "shot_trails", "screen_shake",
+    "hit_stop", "sunk_reveal", "kill_cam", "damage_fire",
+    "victory_cinematics", "animated_water", "last_shot_highlight",
+    "fleet_status", "color_density", "turn_banners", "radar_spinner",
+    "sonar_sweep", "streaks", "captain_taunts",
+]
+
+# Calm preset: fast and quiet. Master stays ON so readability effects
+# still work; Hollywood pauses/cinematics go OFF.
+CALM_OFF_KEYS = [
+    "explosions", "shot_trails", "screen_shake", "hit_stop",
+    "kill_cam", "damage_fire", "victory_cinematics",
+    "turn_banners", "sonar_sweep", "streaks", "captain_taunts",
+]
+CALM_ON_KEYS = [
+    "animations", "sunk_reveal", "animated_water",
+    "last_shot_highlight", "fleet_status", "color_density",
+    "radar_spinner",
+]
+
+EPIC_TIMING_NOTE = "Epic: shake 3→6 frames, hit-stop 0.12→0.30s, sunk-stop 0.25→0.80s."
+
+RICH_NUDGE = "Install rich for better looks: pip install rich"
+
+try:
+    import rich  # noqa: F401  (optional: themed panels when present)
+    RICH_OK = True
+except Exception:
+    rich = None  # type: ignore[assignment]
+    RICH_OK = False
+
+_NO_RICH = False
+
+
+@dataclass
+class Theme:
+    """Visual theme: background wash, water motion, icon set, title art."""
+    name: str
+    bg: str
+    panel_style: str
+    water_chars: Tuple[str, ...]
+    icons: Dict[str, str]
+    title_art: str
+    palette: Dict[str, str]
+
+
+THEMES: Dict[str, Theme] = {
+    "abyss": Theme(
+        name="abyss",
+        bg="on #0a1931",
+        panel_style="on #0a1931",
+        water_chars=("~", "≈", "·", "~"),
+        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "■", "unknown": "·"},
+        title_art="___  ___ _____ _____ _     _____ ____  _   _ ___ ____  ____\n"
+                  "|  \\/  | |_ _|_   _| |   | ____/ ___|| | | |_ _|  _ \\/ ___|\n"
+                  "| |\\/| |  | |  | | | |   |  _| \\___ \\| |_| || || |_) \\___ \\\n"
+                  "| |  | |  | |  | | | |___| |___ ___) |  _  || ||  __/ ___) |\n"
+                  "|_|  |_| |___| |_| |_____|_____|____/|_| |_|___|_|   |____/",
+        palette={"hit": "yellow", "miss": "white", "sunk": "green", "ship": "cyan"},
+    ),
+    "arcade": Theme(
+        name="arcade",
+        bg="on #1a0b2e",
+        panel_style="on #1a0b2e",
+        water_chars=("~", "+", "*", "~"),
+        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "▲", "unknown": "·"},
+        title_art="* B*A*T*T*L*E*S*H*I*P*S *\n"
+                  "  +++ ARCADE MODE +++",
+        palette={"hit": "yellow", "miss": "white", "sunk": "green", "ship": "magenta"},
+    ),
+    "harbor": Theme(
+        name="harbor",
+        bg="on #e8f1f5",
+        panel_style="on #e8f1f5",
+        water_chars=("~", "-", ".", "~"),
+        icons={"hit": "×", "miss": "o", "sunk": "#", "ship": "■", "unknown": "."},
+        title_art="B A T T L E S H I P S\n"
+                  "~~~~ HARBOR ~~~~",
+        palette={"hit": "red", "miss": "grey", "sunk": "green", "ship": "blue"},
+    ),
+}
+
+_THEME_CURRENT: Theme = THEMES["abyss"]
+
+
+def get_theme(name: str) -> Theme:
+    """Active theme lookup; unknown names fall back to abyss."""
+    try:
+        return THEMES.get(str(name).lower(), THEMES["abyss"])
+    except Exception:
+        return THEMES["abyss"]
+
+
+def is_rich_active() -> bool:
+    """True only when Rich is usable for themed output."""
+    try:
+        if not RICH_OK or _NO_RICH:
+            return False
+        if not is_color_enabled():
+            return False
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _master_on() -> bool:
+    return bool(VISUAL.get("animations"))
+
+
+def _effective_on(key: str) -> bool:
+    """Visible state: raw flag AND master (for gated keys)."""
+    if key in ANIM_GATED_KEYS and not _master_on():
+        return False
+    return bool(VISUAL.get(key))
+
+
+def _apply_epic_preset() -> None:
+    for k in EPIC_FORCE_KEYS:
+        _VISUAL_SETTINGS[k] = True
+    _VISUAL_SETTINGS["epic_mode"] = True
+
+
+def _apply_calm_preset() -> None:
+    for k in CALM_OFF_KEYS:
+        _VISUAL_SETTINGS[k] = False
+    for k in CALM_ON_KEYS:
+        _VISUAL_SETTINGS[k] = True
+    _VISUAL_SETTINGS["epic_mode"] = False
+
+
+def _toggle_visual(key: str) -> None:
+    """Toggle one flag; enabling Epic force-enables its preset."""
+    if key == "epic_mode" and not VISUAL.get("epic_mode"):
+        _apply_epic_preset()
+        return
+    _VISUAL_SETTINGS.toggle(key)
 
 
 def vis(name: str) -> bool:
@@ -722,31 +870,99 @@ def finish_cinematic(won):
 def _settings_entry_menu(context, entries, note, sel_store, sel_key):
     """Toggle list with Back; shared by Input and Visuals sub-menus."""
     pos = sel_store.get(sel_key, 0)
+    msg = ""
     # Responsive label column: full width on wide terminals, slim on
     # narrow ones so toggle rows never overflow (badges stay visible).
     lw = max(12, min(34, term_width() - 16))
+    gated_here = [k for _, k in entries if k in ANIM_GATED_KEYS]
     while True:
+        master_off = not _master_on()
         sub_options = []
         for label, key in entries:
             if key == "epic_mode":
                 badge = status_badge("EPIC", "focus") if VISUAL.get(key) else status_badge("OFF", "disabled")
+                shown = label
+            elif key in ANIM_GATED_KEYS and master_off:
+                badge = status_badge("BLOCKED", "disabled")
+                shown = "↳ " + label
             else:
                 badge = status_badge("ON", "ok") if VISUAL.get(key) else status_badge("OFF", "disabled")
-            sub_options.append("%-*s %s" % (lw, label, badge))
+                shown = ("↳ " + label) if key in ANIM_GATED_KEYS else label
+            sub_options.append("%-*s %s" % (lw, shown, badge))
         sub_options.append("Back")
 
-        sub_header = "\n".join(
-            brand_masthead(context)
-            + [paint(note, "grey")])
+        head = brand_masthead(context) + [paint(note, "grey")]
+        if gated_here and master_off:
+            head.append(paint("Master animations is OFF — ↳ rows show BLOCKED and do nothing until re-enabled.", "grey"))
+        if gated_here and VISUAL.get("epic_mode"):
+            head.append(paint(EPIC_TIMING_NOTE, "grey"))
+        if msg:
+            head.append(paint(msg, "yellow"))
+        sub_header = "\n".join(head)
+        footer = "Epic: shake 3-6, hit 0.12-0.30s" if gated_here else ""
         sub_idx = select_menu(sub_header,
-                              sub_options, start_idx=pos)
+                              sub_options, start_idx=pos, footer=footer)
         pos = sub_idx
         sel_store[sel_key] = pos
 
         if sub_idx == len(entries):
             return
         _, key = entries[sub_idx]
-        _VISUAL_SETTINGS.toggle(key)
+        if key in ANIM_GATED_KEYS and not _master_on():
+            msg = "That effect is BLOCKED by the master switch — enable animations first."
+            continue
+        msg = ""
+        _toggle_visual(key)
+
+
+def _global_menu(sel_store):
+    """Global switches + one-shot presets. Epic ON force-enables Hollywood."""
+    pos = sel_store.get("Global", 0)
+    msg = ""
+    lw = max(12, min(34, term_width() - 16))
+    while True:
+        master_off = not _master_on()
+        rows = []
+        # Toggles (raw state; master itself is never BLOCKED).
+        if VISUAL.get("epic_mode"):
+            epic_badge = status_badge("EPIC", "focus")
+        else:
+            epic_badge = status_badge("OFF", "disabled")
+        rows.append(("Enable animations (master switch)",
+                     status_badge("ON", "ok") if VISUAL.get("animations") else status_badge("OFF", "disabled"),
+                     "animations"))
+        rows.append(("Epic mode: all effects + slower", epic_badge, "epic_mode"))
+        # One-shot presets (actions, not stored flags).
+        rows.append(("Apply EPIC preset (all on, slower)", status_badge("APPLY", "focus"), "__apply_epic__"))
+        rows.append(("Apply CALM preset (minimal, faster)", status_badge("APPLY", "focus"), "__apply_calm__"))
+
+        sub_options = ["%-*s %s" % (lw, label, badge) for label, badge, _k in rows]
+        sub_options.append("Back")
+
+        head = brand_masthead("Settings — Global")
+        head.append(paint("Master gates ↳ effects everywhere else. Epic ON turns all Hollywood ON.", "grey"))
+        head.append(paint(EPIC_TIMING_NOTE, "grey"))
+        if master_off:
+            head.append(paint("Master is OFF — Battle / Turn effects show BLOCKED.", "grey"))
+        if msg:
+            head.append(paint(msg, "yellow"))
+        sub_idx = select_menu("\n".join(head), sub_options,
+                              start_idx=pos,
+                              footer="Epic: shake 3-6, hit 0.12-0.30s")
+        pos = sub_idx
+        sel_store["Global"] = pos
+        if sub_idx == len(rows):
+            return
+        _, _, key = rows[sub_idx]
+        if key == "__apply_epic__":
+            _apply_epic_preset()
+            msg = "Epic preset applied: all effects ON, slower timings."
+        elif key == "__apply_calm__":
+            _apply_calm_preset()
+            msg = "Calm preset applied: Hollywood OFF, readability kept ON."
+        else:
+            msg = ""
+            _toggle_visual(key)
 
 
 def _visuals_menu(sel_store):
@@ -756,14 +972,20 @@ def _visuals_menu(sel_store):
     while True:
         options = []
         for title, entries in VISUAL_CATEGORIES:
-            on = sum(1 for _, key in entries if VISUAL.get(key))
+            on = sum(1 for _, key in entries if _effective_on(key))
             badge = status_badge("%d/%d ON" % (on, len(entries)), "ok" if on else "disabled")
-            marker = "★ " if title == "Master" else ""
+            marker = "★ " if title == "Global" else ""
             options.append("%-*s %s" % (tw, marker + title.upper(), badge))
         options.append("Back")
 
         header = "\n".join(brand_masthead("Settings — Visuals"))
-        idx = select_menu(header, options, start_idx=top_sel)
+        if not _master_on():
+            footer = "Master OFF: gated effects blocked"
+        elif VISUAL.get("epic_mode"):
+            footer = "Epic ON: shake 3-6, hit 0.12-0.30s"
+        else:
+            footer = ""
+        idx = select_menu(header, options, start_idx=top_sel, footer=footer)
         top_sel = idx
         sel_store["__visuals__"] = top_sel
 
@@ -771,6 +993,9 @@ def _visuals_menu(sel_store):
             return
 
         title, entries = VISUAL_CATEGORIES[idx]
+        if title == "Global":
+            _global_menu(sel_store)
+            continue
         _settings_entry_menu("Settings — %s" % title, entries,
                              "Toggles apply immediately. Animations require a TTY.",
                              sel_store, title)
@@ -784,7 +1009,7 @@ def settings_menu():
         input_on = sum(1 for _, key in INPUT_ENTRIES if VISUAL.get(key))
         visual_total = sum(len(entries) for _, entries in VISUAL_CATEGORIES)
         visual_on = sum(1 for _, entries in VISUAL_CATEGORIES
-                        for _, key in entries if VISUAL.get(key))
+                        for _, key in entries if _effective_on(key))
         options = [
             "%-*s %s" % (tw, "INPUT", status_badge(
                 "ON" if input_on else "OFF",
@@ -1155,6 +1380,22 @@ def too_small_frame(need_c, need_r, what="THIS VIEW"):
         # Box is 5 lines; rows clamp at >= 10, so this never slices in practice.
         frame = frame[:rows]
     return frame
+
+
+def frame_is_too_small(frame_lines) -> bool:
+    """True when a rendered frame is the resize warning, not game content.
+
+    Cursor loops must swallow the next keypress while this is shown:
+    the "press any key" key would otherwise leak into game dispatch
+    (ENTER placing a ship / firing a shot, Q aborting, ...). Never raises.
+    """
+    try:
+        for line in frame_lines or []:
+            if "TERMINAL TOO SMALL" in strip_ansi(line):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _center_pad(line, width):
@@ -3268,9 +3509,15 @@ def interactive_place_fleet(board):
                 need_c = max([max((_vis_len(l) for l in frame), default=cols), cols])
                 frame = too_small_frame(need_c, len(frame), "DEPLOYMENT")
             render_frame(frame)
+            was_small = frame_is_too_small(frame)
 
             key = kr.get_key()
             msg = ""
+            if was_small:
+                # Resize warning was shown: swallow the dismiss keypress so
+                # ENTER/R/Q/... can't leak into placement dispatch. Re-loop
+                # re-renders (snaps back after enlarging).
+                continue
 
             if key == "UP":
                 cursor = (max(0, cursor[0] - 1), cursor[1])
@@ -3897,16 +4144,20 @@ class Game:
     def _cursor_shot_render(self, cursor, notes, extra="", hint=None, density=None):  # type: ignore[no-untyped-def]
         # Structured blocks: _frame_lines lays them out with height budgeting
         # (side-by-side when they fit, shrinking whole boxes before dropping).
+        # Returns True when the resize warning was shown so the caller can
+        # swallow the dismiss keypress.
         footer = command_bar([
             ("↑↓←→", "MOVE"), ("ENTER", "FIRE"), ("?", "HINT"),
             ("/", "DENSITY"), ("W", "SAVE"), ("Q", "QUIT"),
         ])
-        render_frame(self._frame_lines(
+        frame = self._frame_lines(
             notes, cursor=cursor,
             hint_block=hint.split("\n") if hint is not None else None,
             density_block=density.split("\n") if density is not None else None,
             extra_line=extra or None,
-            footer=footer))
+            footer=footer)
+        render_frame(frame)
+        return frame_is_too_small(frame)
 
     # -- Shooting -------------------------------------------------------------
 
@@ -3985,9 +4236,13 @@ class Game:
         extra = ""
 
         while True:
-            self._cursor_shot_render(cursor, notes, extra, hint, density)
+            was_small = self._cursor_shot_render(cursor, notes, extra, hint, density)
             key = kr.get_key()
             extra = ""
+            if was_small:
+                # Resize warning was shown: swallow the dismiss keypress so
+                # ENTER/space can't fire a shot and Q can't quit by accident.
+                continue
 
             if key == "UP":
                 cursor = (max(0, cursor[0] - 1), cursor[1])
@@ -4649,6 +4904,7 @@ class HotseatGame:
                 need_c = max([max((_vis_len(l) for l in frame), default=cols), cols])
                 frame = too_small_frame(need_c, len(frame), "HOTSEAT")
             render_frame(frame)
+            was_small = frame_is_too_small(frame)
 
             try:
                 with KeyReader() as kr:
@@ -4657,6 +4913,10 @@ class HotseatGame:
                 return None
 
             extra = ""
+            if was_small:
+                # Resize warning was shown: swallow the dismiss keypress so
+                # ENTER/space can't fire and Q can't quit by accident.
+                continue
             if key == "UP":
                 cursor = (max(0, cursor[0] - 1), cursor[1])
             elif key == "DOWN":
@@ -9194,7 +9454,18 @@ def main():
                         help="enemy ships hide in low-probability cells")
     parser.add_argument("--campaign", action="store_true",
                         help="start campaign mode directly")
+    parser.add_argument("--theme", default=None,
+                        help="visual theme: abyss, arcade, harbor (unknown falls back to abyss)")
+    parser.add_argument("--no-rich", action="store_true",
+                        help="disable Rich theming, use ANSI fallback")
     args = parser.parse_args()
+
+    global _NO_RICH, _THEME_CURRENT
+    _NO_RICH = bool(args.no_rich)
+    if args.theme is not None:
+        _THEME_CURRENT = get_theme(args.theme)
+        if str(args.theme).lower() not in THEMES:
+            print("Unknown theme %r — using abyss." % (args.theme,))
 
     if args.bench:
         import statistics

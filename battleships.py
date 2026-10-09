@@ -776,14 +776,29 @@ def burst_banner(text, styles=("bold",), hold=0.35):
     _burst_frames([line], styles, hold)
 
 
+def _theme_icon(key: str, fallback: str) -> str:
+    """Single-width cell icon from the active theme (board geometry safe)."""
+    try:
+        return _THEME_CURRENT.icons.get(key, fallback)
+    except Exception:
+        return fallback
+
+
 def water_char(r, c):
     # Subtle animated water: never obscures ships/shots, calm between actions.
     if vis("animated_water") and USE_COLOR and sys.stdout.isatty():
-        chars = ["~", "~", "·", "~"]
+        try:
+            chars = tuple(_THEME_CURRENT.water_chars) or ("~", "~", "·", "~")
+        except Exception:
+            chars = ("~", "~", "·", "~")
         idx = (r * 7 + c * 13 + int(time.time() * 2.0)) % len(chars)
         return paint(chars[idx], "blue")
     if is_color_enabled():
-        return paint("~", "blue")
+        try:
+            calm = tuple(_THEME_CURRENT.water_chars)[:1] or ("~",)
+        except Exception:
+            calm = ("~",)
+        return paint(calm[0], "blue")
     return "~"
 
 
@@ -1001,6 +1016,32 @@ def _visuals_menu(sel_store):
                              sel_store, title)
 
 
+def _theme_menu(sel_store):
+    """Theme picker: session-only, follows the toggle-list pattern."""
+    global _THEME_CURRENT
+    pos = sel_store.get("__theme__", 0)
+    names = sorted(THEMES.keys())
+    try:
+        pos = names.index(_THEME_CURRENT.name)
+    except Exception:
+        pass
+    while True:
+        options = []
+        for name in names:
+            marker = "● " if name == _THEME_CURRENT.name else "○ "
+            badge = status_badge("ACTIVE", "focus") if name == _THEME_CURRENT.name else status_badge("USE", "disabled")
+            options.append("%s%s  %s" % (marker, name.upper(), badge))
+        options.append("Back")
+        header = "\n".join(brand_masthead("Settings — Theme"))
+        header += "\n" + paint("Session-only. Needs 'pip install rich' for full panels.", "grey")
+        idx = select_menu(header, options, start_idx=min(pos, len(options) - 1))
+        pos = idx
+        sel_store["__theme__"] = pos
+        if idx == len(names):
+            return
+        _THEME_CURRENT = get_theme(names[idx])
+
+
 def settings_menu():
     top_sel = 0
     sub_sel: Dict[str, int] = {}
@@ -1017,6 +1058,9 @@ def settings_menu():
             "%-*s %s" % (tw, "VISUALS", status_badge(
                 "%d/%d ON" % (visual_on, visual_total),
                 "ok" if visual_on else "disabled")),
+            "%-*s %s" % (tw, "THEME", status_badge(
+                _THEME_CURRENT.name.upper(),
+                "focus")),
             "Reset to defaults",
             "Back",
         ]
@@ -1025,10 +1069,10 @@ def settings_menu():
         idx = select_menu(header, options, start_idx=top_sel)
         top_sel = idx
 
-        if idx == 3:
+        if idx == 4:
             return
 
-        if idx == 2:
+        if idx == 3:
             _VISUAL_SETTINGS.reset()
             continue
 
@@ -1038,6 +1082,10 @@ def settings_menu():
                 "Takes effect immediately. Typed mode disables arrow-key "
                 "menus and cursor aiming — everything becomes typed commands.",
                 sub_sel, "__input__")
+            continue
+
+        if idx == 2:
+            _theme_menu(sub_sel)
             continue
 
         _visuals_menu(sub_sel)
@@ -3259,19 +3307,19 @@ def own_char(board, r, c, last=None):
 
     if ship and shot:
         if board.is_sunk(ship):
-            ch = paint("#", "red", "bold")
+            ch = paint(_theme_icon("sunk", "#"), "red", "bold")
         elif vis("damage_fire") and can_animate() and not board.is_sunk(ship):
             frame = int(time.time() * 4) % 2
-            ch = paint("!", "red", "bold") if frame else paint("×", "yellow", "bold")
+            ch = paint("!", "red", "bold") if frame else paint(_theme_icon("hit", "×"), "yellow", "bold")
             if last == (r, c):
                 ch = _highlight(ch)
             return ch
         else:
-            ch = paint("×", "red", "bold")
+            ch = paint(_theme_icon("hit", "×"), "red", "bold")
     elif ship:
-        ch = paint("■", "cyan", "bold")
+        ch = paint(_theme_icon("ship", "■"), "cyan", "bold")
     elif shot:
-        ch = paint("○", "white")
+        ch = paint(_theme_icon("miss", "○"), "white")
     else:
         ch = water_char(r, c)
 
@@ -3288,21 +3336,21 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
         ch = paint("◉", "cyan", "bold")
     elif (r, c) in enemy.shots:
         if not ship:
-            ch = paint("○", "white")
+            ch = paint(_theme_icon("miss", "○"), "white")
         elif enemy.is_sunk(ship):
-            ch = paint("#", "green", "bold")
+            ch = paint(_theme_icon("sunk", "#"), "green", "bold")
         elif vis("damage_fire") and can_animate():
             frame = int(time.time() * 4) % 2
-            ch = paint("!", "red", "bold") if frame else paint("×", "yellow", "bold")
+            ch = paint("!", "red", "bold") if frame else paint(_theme_icon("hit", "×"), "yellow", "bold")
             if last == (r, c):
                 ch = _highlight(ch)
             return ch
         else:
-            ch = paint("×", "yellow", "bold")
+            ch = paint(_theme_icon("hit", "×"), "yellow", "bold")
     elif reveal and ship:
-        ch = paint("■", "cyan")
+        ch = paint(_theme_icon("ship", "■"), "cyan")
     else:
-        ch = paint("·", "grey")
+        ch = paint(_theme_icon("unknown", "·"), "grey")
 
     if last == (r, c):
         ch = _highlight(ch)
@@ -3403,13 +3451,17 @@ def _strip_prefix(lines):
 
 def legend():
     sep = paint("  ·  ", "grey")
+    try:
+        water = _THEME_CURRENT.water_chars[0]
+    except Exception:
+        water = "~"
     return sep.join([
-        "%s %s" % (paint("~", "blue"), paint("water", "grey")),
-        "%s %s" % (paint("■", "cyan", "bold"), paint("your ship", "grey")),
-        "%s %s" % (paint("×", "yellow", "bold"), paint("hit", "grey")),
-        "%s %s" % (paint("○", "white"), paint("miss", "grey")),
-        "%s %s" % (paint("#", "green", "bold"), paint("sunk", "grey")),
-        "%s %s" % (paint("·", "grey"), paint("unknown", "grey")),
+        "%s %s" % (paint(water, "blue"), paint("water", "grey")),
+        "%s %s" % (paint(_theme_icon("ship", "■"), "cyan", "bold"), paint("your ship", "grey")),
+        "%s %s" % (paint(_theme_icon("hit", "×"), "yellow", "bold"), paint("hit", "grey")),
+        "%s %s" % (paint(_theme_icon("miss", "○"), "white"), paint("miss", "grey")),
+        "%s %s" % (paint(_theme_icon("sunk", "#"), "green", "bold"), paint("sunk", "grey")),
+        "%s %s" % (paint(_theme_icon("unknown", "·"), "grey"), paint("unknown", "grey")),
     ])
 
 

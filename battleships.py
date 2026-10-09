@@ -776,9 +776,33 @@ def burst_banner(text, styles=("bold",), hold=0.35):
     _burst_frames([line], styles, hold)
 
 
+def _theme_cells_safe() -> bool:
+    """True when the terminal can render theme glyphs (mirrors box fallback)."""
+    try:
+        return bool(_box_glyphs_supported())
+    except Exception:
+        return False
+
+
+_ASCII_ICON_FALLBACK = {
+    "hit": "x", "miss": "o", "sunk": "#", "ship": "S", "unknown": ".",
+}
+
+
+def _safe_cell(ch: str) -> str:
+    """cp1250-safe single cell: keeps ch when encodable, else '~'."""
+    try:
+        str(ch).encode("cp1250")
+        return str(ch)
+    except Exception:
+        return "~"
+
+
 def _theme_icon(key: str, fallback: str) -> str:
     """Single-width cell icon from the active theme (board geometry safe)."""
     try:
+        if not _theme_cells_safe():
+            return _ASCII_ICON_FALLBACK.get(key, fallback)
         return _THEME_CURRENT.icons.get(key, fallback)
     except Exception:
         return fallback
@@ -791,6 +815,11 @@ def water_char(r, c):
             chars = tuple(_THEME_CURRENT.water_chars) or ("~", "~", "·", "~")
         except Exception:
             chars = ("~", "~", "·", "~")
+        try:
+            if not _theme_cells_safe():
+                chars = tuple(_safe_cell(ch) for ch in chars) or ("~",)
+        except Exception:
+            pass
         idx = (r * 7 + c * 13 + int(time.time() * 2.0)) % len(chars)
         return paint(chars[idx], "blue")
     if is_color_enabled():
@@ -1028,7 +1057,13 @@ def _theme_menu(sel_store):
     while True:
         options = []
         for name in names:
-            marker = "● " if name == _THEME_CURRENT.name else "○ "
+            try:
+                if _theme_cells_safe():
+                    marker = "● " if name == _THEME_CURRENT.name else "○ "
+                else:
+                    marker = "* " if name == _THEME_CURRENT.name else "- "
+            except Exception:
+                marker = "* " if name == _THEME_CURRENT.name else "- "
             badge = status_badge("ACTIVE", "focus") if name == _THEME_CURRENT.name else status_badge("USE", "disabled")
             options.append("%s%s  %s" % (marker, name.upper(), badge))
         options.append("Back")

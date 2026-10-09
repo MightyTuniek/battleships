@@ -16,7 +16,7 @@ A complete Battleships game for the terminal in a single Python file. Play again
 - Normal and Salvo (one shot per afloat ship) rules
 - Probability hints, density map, coach scoring, Expert par, shot review
 - Animated terminal UI with colors, with full typed fallback for non-TTY
-- Optional visual themes (background panels, title art, icon HUD) via `pip install rich` — game is identical without it
+- Optional visual themes (full-screen restyle: title art, subtitles, panel borders, board colors, icon HUD) via `pip install rich` — classic look is the default even with rich installed; opt in via `Settings → Theme` or `--theme`
 - Save / resume games as JSON
 - Headless AI benchmark mode
 
@@ -201,10 +201,16 @@ LAN typed adds: `say <msg>`, `chat`, `surrender`.
   cursor aiming, everything becomes numbered/typed commands. Ideal for
   mobile keyboards (Pydroid 3) and touch terminals.
 - `Visuals`: `animations, explosions, shot_trails, sunk_reveal, animated_water, last_shot_highlight, fleet_status, turn_banners, radar_spinner, victory_cinematics, color_density, screen_flash (OFF), terminal_bell (OFF)`
-- `Theme`: `abyss | arcade | harbor` (session-only). Full background
-  panels need `pip install rich`; without it the game shows
-  `Install rich for better looks: pip install rich` and plays exactly
-  as before. Force the classic look with `--no-rich`.
+- `Theme`: `classic | abyss | arcade | harbor` (session-only, default
+  `classic`). Each theme restyles the whole screen: title art + subtitle,
+  single/double panel borders in theme colors, board headers, water color
+  and motion, ship/unknown colors, icon set, and fleet-panel labels
+  (e.g. abyss uses `BOAT MANIFEST` / `SONAR CONTACTS`). `classic` stays
+  active even when `rich` is installed — the menu shows
+  `Classic look — richer themes in Settings → Theme`; without `rich` it
+  shows `Install rich for better looks: pip install rich`. Themed frames
+  need `pip install rich`; water/icons still vary without it. Force the
+  classic look with `--no-rich`.
 
 Disable color:
 
@@ -232,7 +238,7 @@ python3 battleships.py --help
 | Flag | Description |
 |---|---|
 | `--no-color` | Disable ANSI colors |
-| `--theme NAME` | Visual theme: `abyss` \| `arcade` \| `harbor` (unknown falls back to `abyss`) |
+| `--theme NAME` | Visual theme: `classic` \| `abyss` \| `arcade` \| `harbor` (default `classic`; unknown falls back to `classic`) |
 | `--no-rich` | Disable Rich theming, use ANSI fallback |
 | `--board N` | Board size 6–14, skips setup menu |
 | `--fleet NAME` | `classic` \| `small` \| `armada`, skips setup menu |

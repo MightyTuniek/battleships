@@ -544,6 +544,7 @@ CALM_ON_KEYS = [
 EPIC_TIMING_NOTE = "Epic: shake 3→6 frames, hit-stop 0.12→0.30s, sunk-stop 0.25→0.80s."
 
 RICH_NUDGE = "Install rich for better looks: pip install rich"
+CLASSIC_NUDGE = "Classic look — richer themes in Settings → Theme"
 
 try:
     import rich  # noqa: F401  (optional: themed panels when present)
@@ -557,73 +558,148 @@ _NO_RICH = False
 
 @dataclass
 class Theme:
-    """Visual theme: background wash, water motion, icon set, title art."""
+    """Visual theme: title art, subtitle, frame style, board colors, icons."""
     name: str
-    bg: str
-    panel_style: str
-    water_chars: Tuple[str, ...]
-    icons: Dict[str, str]
+    subtitle: str
     title_art: str
-    palette: Dict[str, str]
+    accent: str
+    border_double: bool
+    border_color: str
+    water_chars: Tuple[str, ...]
+    water_color: str
+    ship_color: str
+    unknown_color: str
+    icons: Dict[str, str]
+    fleet_title: str
+    enemy_title: str
 
 
 THEMES: Dict[str, Theme] = {
+    "classic": Theme(
+        name="classic",
+        subtitle="TACTICAL OPERATIONS",
+        title_art="B A T T L E S H I P S",
+        accent="cyan",
+        border_double=False,
+        border_color="grey",
+        water_chars=("~", "~", "·", "~"),
+        water_color="blue",
+        ship_color="cyan",
+        unknown_color="grey",
+        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "■", "unknown": "·"},
+        fleet_title="YOUR FLEET",
+        enemy_title="ENEMY WATERS",
+    ),
     "abyss": Theme(
         name="abyss",
-        bg="on #0a1931",
-        panel_style="on #0a1931",
-        water_chars=("~", "≈", "·", "~"),
-        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "■", "unknown": "·"},
+        subtitle="ABYSSAL OPS — SILENT SERVICE",
         title_art="___  ___ _____ _____ _     _____ ____  _   _ ___ ____  ____\n"
                   "|  \\/  | |_ _|_   _| |   | ____/ ___|| | | |_ _|  _ \\/ ___|\n"
                   "| |\\/| |  | |  | | | |   |  _| \\___ \\| |_| || || |_) \\___ \\\n"
                   "| |  | |  | |  | | | |___| |___ ___) |  _  || ||  __/ ___) |\n"
                   "|_|  |_| |___| |_| |_____|_____|____/|_| |_|___|_|   |____/",
-        palette={"hit": "yellow", "miss": "white", "sunk": "green", "ship": "cyan"},
+        accent="cyan",
+        border_double=True,
+        border_color="blue",
+        water_chars=("~", "≈", "·", "~"),
+        water_color="cyan",
+        ship_color="cyan",
+        unknown_color="cyan",
+        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "■", "unknown": "·"},
+        fleet_title="BOAT MANIFEST",
+        enemy_title="SONAR CONTACTS",
     ),
     "arcade": Theme(
         name="arcade",
-        bg="on #1a0b2e",
-        panel_style="on #1a0b2e",
-        water_chars=("~", "+", "*", "~"),
-        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "▲", "unknown": "·"},
+        subtitle="INSERT COIN — NEON FLEET",
         title_art="* B*A*T*T*L*E*S*H*I*P*S *\n"
-                  "  +++ ARCADE MODE +++",
-        palette={"hit": "yellow", "miss": "white", "sunk": "green", "ship": "magenta"},
+                  "  +++ NEON FLEET +++",
+        accent="magenta",
+        border_double=True,
+        border_color="magenta",
+        water_chars=("~", "+", "*", "~"),
+        water_color="magenta",
+        ship_color="magenta",
+        unknown_color="yellow",
+        icons={"hit": "×", "miss": "○", "sunk": "#", "ship": "▲", "unknown": "·"},
+        fleet_title="YOUR SQUAD",
+        enemy_title="BOSS WATERS",
     ),
     "harbor": Theme(
         name="harbor",
-        bg="on #e8f1f5",
-        panel_style="on #e8f1f5",
-        water_chars=("~", "-", ".", "~"),
-        icons={"hit": "×", "miss": "o", "sunk": "#", "ship": "■", "unknown": "."},
+        subtitle="HARBOR PATROL — DAY WATCH",
         title_art="B A T T L E S H I P S\n"
-                  "~~~~ HARBOR ~~~~",
-        palette={"hit": "red", "miss": "grey", "sunk": "green", "ship": "blue"},
+                  "~~~~ HARBOR PATROL ~~~~",
+        accent="blue",
+        border_double=False,
+        border_color="blue",
+        water_chars=("~", "-", ".", "~"),
+        water_color="blue",
+        ship_color="blue",
+        unknown_color="grey",
+        icons={"hit": "×", "miss": "o", "sunk": "#", "ship": "■", "unknown": "."},
+        fleet_title="YOUR FLEET",
+        enemy_title="HARBOR WATERS",
     ),
 }
 
-_THEME_CURRENT: Theme = THEMES["abyss"]
+_THEME_CURRENT: Theme = THEMES["classic"]
 
 
 def get_theme(name: str) -> Theme:
-    """Active theme lookup; unknown names fall back to abyss."""
+    """Active theme lookup; unknown names fall back to classic."""
     try:
-        return THEMES.get(str(name).lower(), THEMES["abyss"])
+        return THEMES.get(str(name).lower(), THEMES["classic"])
     except Exception:
-        return THEMES["abyss"]
+        return THEMES["classic"]
 
 
 def is_rich_active() -> bool:
-    """True only when Rich is usable for themed output."""
+    """True only when a non-classic theme is opted in and Rich can render."""
     try:
         if not RICH_OK or _NO_RICH:
+            return False
+        if _THEME_CURRENT.name == "classic":
             return False
         if not is_color_enabled():
             return False
         return bool(sys.stdout.isatty())
     except Exception:
         return False
+
+
+def theme_nudge_line() -> str:
+    """Disclaimer under the masthead: install hint or opt-in hint, else ''."""
+    try:
+        if _THEME_CURRENT.name != "classic":
+            return ""
+        if _NO_RICH:
+            return ""
+        if not RICH_OK:
+            return RICH_NUDGE
+        return CLASSIC_NUDGE
+    except Exception:
+        return ""
+
+
+def _theme_accent(default: str = "cyan") -> str:
+    """Accent color: theme accent when themed, else the classic default."""
+    try:
+        if is_rich_active():
+            return _THEME_CURRENT.accent
+    except Exception:
+        pass
+    return default
+
+
+def _theme_title(text: str) -> str:
+    """Panel title in the theme accent when themed, else classic bold."""
+    try:
+        if is_rich_active():
+            return paint(str(text), "bold", _THEME_CURRENT.accent)
+    except Exception:
+        pass
+    return paint(str(text), "bold")
 
 
 def _master_on() -> bool:
@@ -810,6 +886,10 @@ def _theme_icon(key: str, fallback: str) -> str:
 
 def water_char(r, c):
     # Subtle animated water: never obscures ships/shots, calm between actions.
+    try:
+        wcol = _THEME_CURRENT.water_color
+    except Exception:
+        wcol = "blue"
     if vis("animated_water") and USE_COLOR and sys.stdout.isatty():
         try:
             chars = tuple(_THEME_CURRENT.water_chars) or ("~", "~", "·", "~")
@@ -821,13 +901,13 @@ def water_char(r, c):
         except Exception:
             pass
         idx = (r * 7 + c * 13 + int(time.time() * 2.0)) % len(chars)
-        return paint(chars[idx], "blue")
+        return paint(chars[idx], wcol)
     if is_color_enabled():
         try:
             calm = tuple(_THEME_CURRENT.water_chars)[:1] or ("~",)
         except Exception:
             calm = ("~",)
-        return paint(calm[0], "blue")
+        return paint(calm[0], wcol)
     return "~"
 
 
@@ -846,7 +926,7 @@ def _board_header():
     gap = _cell_gap()
     letters = gap.join(COLS)
     if is_color_enabled():
-        letters = gap.join(paint(ch, "bold", "cyan") for ch in COLS)
+        letters = gap.join(paint(ch, "bold", _theme_accent("cyan")) for ch in COLS)
     return "    " + letters
 
 
@@ -1068,7 +1148,7 @@ def _theme_menu(sel_store):
             options.append("%s%s  %s" % (marker, name.upper(), badge))
         options.append("Back")
         header = "\n".join(brand_masthead("Settings — Theme"))
-        header += "\n" + paint("Session-only. Needs 'pip install rich' for full panels.", "grey")
+        header += "\n" + paint("Session-only. Classic is the default; themed frames need 'pip install rich'.", "grey")
         idx = select_menu(header, options, start_idx=min(pos, len(options) - 1))
         pos = idx
         sel_store["__theme__"] = pos
@@ -1510,7 +1590,7 @@ def rule(width=None, char="─", style=("grey",)):
 def section_header(title, subtitle=None):
     """Compact uppercase section title with thin accent rule."""
     title = str(title).upper()
-    lines = [paint(title, "bold", "cyan")]
+    lines = [paint(title, "bold", _theme_accent("cyan"))]
     if subtitle:
         lines.append(paint(str(subtitle), "grey"))
     return lines
@@ -1569,8 +1649,9 @@ def command_bar(items, width=None):
     if width is None:
         width = term_width() - 4
     parts = []
+    accent = _theme_accent("cyan")
     for key, desc in items:
-        parts.append("%s %s" % (paint("[%s]" % key, "cyan", "bold"), paint(desc, "grey")))
+        parts.append("%s %s" % (paint("[%s]" % key, accent, "bold"), paint(desc, "grey")))
     # Greedy wrap without splitting a command.
     lines, cur = [], ""
     for p in parts:
@@ -1661,28 +1742,36 @@ def enemy_status_rows(enemy=None, knowledge=None):
     return [paint("NO CONTACTS", "grey")]
 
 
-def box_top_line(inner_width, title=None, double=False):
+def _frame_paint(run: str, frame=None) -> str:
+    if frame and is_color_enabled() and run:
+        return paint(run, frame)
+    return run
+
+
+def box_top_line(inner_width, title=None, double=False, frame=None):
     tl, tr, _bl, _br, h, _v = _box_chars(double)
     if not title:
-        return tl + h * (inner_width + 2) + tr
+        return _frame_paint(tl + h * (inner_width + 2) + tr, frame)
     t = " " + title + " "
     tv = _vis_len(t)
     remaining = inner_width + 2 - tv
     if remaining < 0:
-        return tl + t + tr
+        return _frame_paint(tl, frame) + t + _frame_paint(tr, frame)
     left = remaining // 2
     right = remaining - left
-    return tl + h * left + t + h * right + tr
+    return (_frame_paint(tl + h * left, frame) + t
+            + _frame_paint(h * right + tr, frame))
 
 
-def box_bottom_line(inner_width, double=False):
+def box_bottom_line(inner_width, double=False, frame=None):
     _tl, _tr, bl, br, h, _v = _box_chars(double)
-    return bl + h * (inner_width + 2) + br
+    return _frame_paint(bl + h * (inner_width + 2) + br, frame)
 
 
-def box_content_line(content, inner_width, double=False):
+def box_content_line(content, inner_width, double=False, frame=None):
     _tl, _tr, _bl, _br, _h, v = _box_chars(double)
-    return v + " " + _pad_vis(content, inner_width) + " " + v
+    return (_frame_paint(v, frame) + " " + _pad_vis(content, inner_width)
+            + " " + _frame_paint(v, frame))
 
 
 def side_by_side(left_lines, right_lines, gap="   "):
@@ -1698,17 +1787,19 @@ def side_by_side(left_lines, right_lines, gap="   "):
 
 
 def boxed_panel(title, content_lines, double=False):
+    frame = None
     try:
         if is_rich_active():
-            double = True
+            double = _THEME_CURRENT.border_double
+            frame = _THEME_CURRENT.border_color
     except Exception:
         pass
     inner = max((_vis_len(x) for x in content_lines), default=0)
     inner = max(inner, _vis_len(title) + 4)
-    out = [box_top_line(inner, title, double)]
+    out = [box_top_line(inner, title, double, frame)]
     for line in content_lines:
-        out.append(box_content_line(line, inner, double))
-    out.append(box_bottom_line(inner, double))
+        out.append(box_content_line(line, inner, double, frame))
+    out.append(box_bottom_line(inner, double, frame))
     return out
 
 
@@ -1722,14 +1813,14 @@ def brand_masthead(context=None, width=None):
     try:
         if is_rich_active():
             art = _THEME_CURRENT.title_art.split("\n")
-            accent = _THEME_CURRENT.palette.get("ship", "cyan")
+            accent = _THEME_CURRENT.accent
             lines = [paint(a, "bold", accent) for a in art if a.strip()]
-            lines.append(paint("TACTICAL OPERATIONS", accent))
+            lines.append(paint(_THEME_CURRENT.subtitle, accent))
             if context:
                 lines.append(paint(str(context).upper(), "grey"))
             w = 56 if width is None else width
             w = max(30, min(w, term_width() - 6))
-            lines.append(rule(w))
+            lines.append(rule(w, style=(accent,)))
             return lines
     except Exception:
         pass
@@ -1765,28 +1856,34 @@ def big_banner(text, style="bold"):
 
 def tactical_panel(title, content_lines):
     """Single major tactical boundary with thin rule header (not a box per sentence)."""
-    head = paint(str(title).upper(), "bold", "cyan")
+    accent = _theme_accent("cyan")
+    head = paint(str(title).upper(), "bold", accent)
     body = list(content_lines) or [paint("—", "grey")]
     inner = max([_vis_len(head)] + [_vis_len(x) for x in body])
     inner = min(inner, term_width() - 8)
-    out = [head, rule(inner)]
+    out = [head, rule(inner, style=(accent,))]
     out.extend(body)
     return out
 
 
 def fleet_panel(board, current_name=None, title="FLEET"):
     rows = []
+    accent = _theme_accent("cyan")
+    try:
+        ship_col = _THEME_CURRENT.ship_color if is_rich_active() else "cyan"
+    except Exception:
+        ship_col = "cyan"
     name_w = max([len(n) for n, _ in FLEET] + [8])
     max_len = max((n for _, n in FLEET), default=5)
     for name, length in FLEET:
         if name == current_name:
-            marker = paint("▶", "cyan", "bold")
+            marker = paint("▶", accent, "bold")
         elif name in board.ship_cells:
             marker = paint("✓", "green", "bold")
         else:
             marker = paint("○", "grey")
         if name in board.ship_cells:
-            sil = paint("█" * length, "cyan")
+            sil = paint("█" * length, ship_col)
         else:
             sil = paint("░" * length, "grey")
         sil_pad = " " * max(0, max_len - length)
@@ -1798,7 +1895,7 @@ def fleet_panel(board, current_name=None, title="FLEET"):
             state = status_badge("QUEUED", "disabled")
         rows.append("%s %s  %s%s  %s" % (
             marker, paint(name.upper().ljust(name_w), "white"), sil, sil_pad, state))
-    return boxed_panel(paint(str(title).upper(), "bold"), rows)
+    return boxed_panel(_theme_title(str(title).upper()), rows)
 
 
 class Spinner:
@@ -3352,7 +3449,11 @@ def own_char(board, r, c, last=None):
         else:
             ch = paint(_theme_icon("hit", "×"), "red", "bold")
     elif ship:
-        ch = paint(_theme_icon("ship", "■"), "cyan", "bold")
+        try:
+            scol = _THEME_CURRENT.ship_color
+        except Exception:
+            scol = "cyan"
+        ch = paint(_theme_icon("ship", "■"), scol, "bold")
     elif shot:
         ch = paint(_theme_icon("miss", "○"), "white")
     else:
@@ -3383,9 +3484,17 @@ def track_char(enemy, r, c, reveal, last=None, reveal_cells=None):
         else:
             ch = paint(_theme_icon("hit", "×"), "yellow", "bold")
     elif reveal and ship:
-        ch = paint(_theme_icon("ship", "■"), "cyan")
+        try:
+            scol = _THEME_CURRENT.ship_color
+        except Exception:
+            scol = "cyan"
+        ch = paint(_theme_icon("ship", "■"), scol)
     else:
-        ch = paint(_theme_icon("unknown", "·"), "grey")
+        try:
+            ucol = _THEME_CURRENT.unknown_color
+        except Exception:
+            ucol = "grey"
+        ch = paint(_theme_icon("unknown", "·"), ucol)
 
     if last == (r, c):
         ch = _highlight(ch)
@@ -3438,8 +3547,8 @@ def render_boards(player, enemy, reveal=False, last_player=None, last_ai=None, c
     left_rows = [_board_header()] + [_own_row(player, r, last_ai) for r in range(SIZE)]
     right_rows = [_board_header()] + [_track_row(enemy, r, reveal, last_player, cursor, reveal_cells) for r in range(SIZE)]
 
-    left_box = boxed_panel(paint("YOUR FLEET", "bold"), left_rows)
-    right_box = boxed_panel(paint("ENEMY WATERS", "bold"), right_rows)
+    left_box = boxed_panel(_theme_title(_THEME_CURRENT.fleet_title), left_rows)
+    right_box = boxed_panel(_theme_title(_THEME_CURRENT.enemy_title), right_rows)
 
     if _boards_fit_side_by_side():
         lines = side_by_side(left_box, right_box, gap="    ")
@@ -3476,7 +3585,7 @@ def render_own(board, cursor=None, ghost=None, ghost_valid=True, ghost_cursor=No
                 row = "%s  " % _row_label(r) + gap.join(cells)
         rows.append(row)
 
-    boxed = boxed_panel(paint("YOUR FLEET", "bold"), rows)
+    boxed = boxed_panel(_theme_title(_THEME_CURRENT.fleet_title), rows)
     return "\n".join(center_block(["  " + line for line in boxed]))
 
 
@@ -3490,13 +3599,19 @@ def legend():
         water = _THEME_CURRENT.water_chars[0]
     except Exception:
         water = "~"
+    try:
+        wcol = _THEME_CURRENT.water_color
+        scol = _THEME_CURRENT.ship_color
+        ucol = _THEME_CURRENT.unknown_color
+    except Exception:
+        wcol, scol, ucol = "blue", "cyan", "grey"
     return sep.join([
-        "%s %s" % (paint(water, "blue"), paint("water", "grey")),
-        "%s %s" % (paint(_theme_icon("ship", "■"), "cyan", "bold"), paint("your ship", "grey")),
+        "%s %s" % (paint(water, wcol), paint("water", "grey")),
+        "%s %s" % (paint(_theme_icon("ship", "■"), scol, "bold"), paint("your ship", "grey")),
         "%s %s" % (paint(_theme_icon("hit", "×"), "yellow", "bold"), paint("hit", "grey")),
         "%s %s" % (paint(_theme_icon("miss", "○"), "white"), paint("miss", "grey")),
         "%s %s" % (paint(_theme_icon("sunk", "#"), "green", "bold"), paint("sunk", "grey")),
-        "%s %s" % (paint(_theme_icon("unknown", "·"), "grey"), paint("unknown", "grey")),
+        "%s %s" % (paint(_theme_icon("unknown", "·"), ucol), paint("unknown", "grey")),
     ])
 
 
@@ -5714,16 +5829,20 @@ def verify_cell_final(commitments, reveal):
 def remote_char(k, r, c, last=None, extra_sunk=None):
     pos = (r, c)
 
+    try:
+        ucol = _THEME_CURRENT.unknown_color
+    except Exception:
+        ucol = "grey"
     if extra_sunk is not None and pos in extra_sunk:
-        ch = paint("#", "green", "bold")
+        ch = paint(_theme_icon("sunk", "#"), "green", "bold")
     elif pos in k.miss:
-        ch = paint("○", "white")
+        ch = paint(_theme_icon("miss", "○"), "white")
     elif pos in k.sunk:
-        ch = paint("#", "green", "bold")
+        ch = paint(_theme_icon("sunk", "#"), "green", "bold")
     elif pos in k.hit:
-        ch = paint("×", "yellow", "bold")
+        ch = paint(_theme_icon("hit", "×"), "yellow", "bold")
     else:
-        ch = paint("·", "grey")
+        ch = paint(_theme_icon("unknown", "·"), ucol)
 
     if last == pos:
         ch = _highlight(ch)
@@ -5748,8 +5867,8 @@ def render_lan_boards(player, k, last_player=None, last_opp=None,
             cells.append(ch)
         right_rows.append("%s  " % _row_label(r) + gap.join(cells))
 
-    left_box = boxed_panel(paint("YOUR FLEET", "bold"), left_rows)
-    right_box = boxed_panel(paint("ENEMY WATERS", "bold"), right_rows)
+    left_box = boxed_panel(_theme_title(_THEME_CURRENT.fleet_title), left_rows)
+    right_box = boxed_panel(_theme_title(_THEME_CURRENT.enemy_title), right_rows)
     if _boards_fit_side_by_side():
         lines = side_by_side(left_box, right_box, gap="    ")
     else:
@@ -9566,7 +9685,7 @@ def main():
     parser.add_argument("--campaign", action="store_true",
                         help="start campaign mode directly")
     parser.add_argument("--theme", default=None,
-                        help="visual theme: abyss, arcade, harbor (unknown falls back to abyss)")
+                        help="visual theme: classic, abyss, arcade, harbor (default classic; unknown falls back to classic)")
     parser.add_argument("--no-rich", action="store_true",
                         help="disable Rich theming, use ANSI fallback")
     args = parser.parse_args()
@@ -9576,7 +9695,7 @@ def main():
     if args.theme is not None:
         _THEME_CURRENT = get_theme(args.theme)
         if str(args.theme).lower() not in THEMES:
-            print("Unknown theme %r — using abyss." % (args.theme,))
+            print("Unknown theme %r — using classic." % (args.theme,))
 
     if args.bench:
         import statistics
@@ -9658,17 +9777,19 @@ def main():
                 "%s  %s" % (paint("PRESET".ljust(9), "grey"), paint(preset_name.upper(), "cyan")),
                 "%s  %s" % (paint("FLEET".ljust(9), "grey"), paint("%d SHIPS" % len(FLEET), "white")),
             ]
-            session_panel = boxed_panel(paint("SESSION", "bold"), session_rows)
-            profile_panel = boxed_panel(paint("PROFILE", "bold"), profile_rows)
+            session_panel = boxed_panel(_theme_title("SESSION"), session_rows)
+            profile_panel = boxed_panel(_theme_title("PROFILE"), profile_rows)
             header_lines = []
             header_lines.extend(brand_masthead("Naval command console"))
             try:
-                if sys.stdout.isatty() and not is_rich_active():
-                    header_lines.append(paint(rich_nudge_line(), "grey"))
+                if sys.stdout.isatty():
+                    nudge = theme_nudge_line()
+                    if nudge:
+                        header_lines.append(paint(nudge, "grey"))
             except Exception:
                 pass
             header_lines.append("")
-            header_lines.append(_pad_vis(paint("TACTICAL OPERATIONS", "cyan"), term_width(), "center") if term_width() >= 78 else paint("TACTICAL OPERATIONS", "cyan"))
+            header_lines.append(_pad_vis(paint("TACTICAL OPERATIONS", _theme_accent("cyan")), term_width(), "center") if term_width() >= 78 else paint("TACTICAL OPERATIONS", _theme_accent("cyan")))
             header_lines.append("")
             if term_width() >= 78:
                 header_lines.extend(side_by_side(session_panel, profile_panel, gap="    "))

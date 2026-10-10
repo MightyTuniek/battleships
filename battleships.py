@@ -33,6 +33,12 @@ import base64
 import zlib
 import ipaddress
 import collections
+import atexit
+import signal
+import urllib.request
+import urllib.parse
+import urllib.error
+import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass, field
 from typing import (
@@ -10661,6 +10667,304 @@ def punch_connect(sock, candidates, send_key, recv_key, local_nonce,
             "a VPN, a port forward or UPnP direct mode.",
             reason="TIMEOUT")
     return peer_addr, {"got_punch": got_punch, "got_ack": got_ack}
+
+
+# --- Online UPnP client (spec section 9; best effort, never raises) ---
+UPNP_ST_WANIP = "urn:schemas-upnp-org:service:WANIPConnection:1"
+UPNP_ST_WANPPP = "urn:schemas-upnp-org:service:WANPPPConnection:1"
+UPNP_DESC = "battleships"
+_UPNP_CGNAT_NETS = tuple(ipaddress.ip_network(n) for n in
+                         ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                          "100.64.0.0/10"))
+_UPNP_REGISTRY = []
+_UPNP_PREV_HANDLERS = {}
+_UPNP_HANDLERS_DONE = False
+
+
+def upnp_is_cgnat(ip):
+    """True when the router's external IP is unroutable (mapping useless)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _UPNP_CGNAT_NETS)
+
+
+def upnp_discover(ssdp_addr=None, wait=None):
+    """M-SEARCH for WANIP/WANPPP services; LOCATION urls (deduped).
+
+    ssdp_addr is injectable so tests use loopback unicast (multicast is
+    unreliable in CI). Returns [] on any failure, never raises.
+    """
+    ssdp_addr = SSDP_ADDR if ssdp_addr is None else ssdp_addr
+    wait = SSDP_WAIT_S if wait is None else wait
+    found = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            sock.sendto(("M-SEARCH * HTTP/1.1\r\n"
+                         "HOST: %s:%d\r\n"
+                         "MAN: \"ns=01\"\r\nMX: 2\r\nST: %s\r\n\r\n"
+                         % (ssdp_addr[0], ssdp_addr[1], UPNP_ST_WANIP)
+                         ).encode("latin-1"), ssdp_addr)
+            sock.sendto(("M-SEARCH * HTTP/1.1\r\n"
+                         "HOST: %s:%d\r\n"
+                         "MAN: \"ns=01\"\r\nMX: 2\r\nST: %s\r\n\r\n"
+                         % (ssdp_addr[0], ssdp_addr[1], UPNP_ST_WANPPP)
+                         ).encode("latin-1"), ssdp_addr)
+        except OSError:
+            return []
+        deadline = time.monotonic() + max(0.05, wait)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                sock.settimeout(left)
+                data, _ = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                break
+            except OSError:
+                break
+            try:
+                text = data.decode("latin-1")
+            except ValueError:
+                continue
+            for line in text.split("\r\n"):
+                if line.upper().startswith("LOCATION:"):
+                    loc = line.split(":", 1)[1].strip()
+                    if loc and loc not in found:
+                        found.append(loc)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return found
+
+
+def _upnp_services(root):
+    """(serviceType, controlURL) pairs found under any namespace."""
+    out = []
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] != "service":
+            continue
+        stype = curl = None
+        for child in list(elem):
+            name = child.tag.split("}")[-1]
+            if name == "serviceType":
+                stype = (child.text or "").strip()
+            elif name == "controlURL":
+                curl = (child.text or "").strip()
+        if stype and curl:
+            out.append((stype, curl))
+    return out
+
+
+def upnp_describe(location, timeout=5):
+    """(control_url, service_type) or None. Malformed XML -> None."""
+    try:
+        with urllib.request.urlopen(location, timeout=timeout) as resp:
+            raw = resp.read(65536)
+    except Exception:
+        return None
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+    cands = [(st, urllib.parse.urljoin(location, curl))
+             for st, curl in _upnp_services(root)
+             if st in (UPNP_ST_WANIP, UPNP_ST_WANPPP)]
+    if not cands:
+        return None
+    cands.sort(key=lambda kv: 0 if kv[0] == UPNP_ST_WANIP else 1)
+    service, control_url = cands[0][0], cands[0][1]
+    return control_url, service
+
+
+def upnp_soap(control_url, service, action, args, timeout=5):
+    """(ok, items). SOAP faults, HTTP errors and timeouts -> (False, {})."""
+    import xml.sax.saxutils as _sax
+    inner = "".join("<%s>%s</%s>" % (k, _sax.escape(str(v)), k)
+                    for k, v in args.items())
+    envelope = ("<?xml version=\"1.0\"?>"
+                "<s:Envelope xmlns:s="
+                "\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                "s:encodingStyle="
+                "\"http://schemas.xmlsoap.org/soap/encoding/\">"
+                "<s:Body><u:%s xmlns:u=\"%s\">%s</u:%s></s:Body></s:Envelope>"
+                % (action, service, inner, action))
+    req = urllib.request.Request(
+        control_url, data=envelope.encode("utf-8"),
+        headers={"Content-Type": "text/xml",
+                 "SOAPAction": "\"%s#%s\"" % (service, action)})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(65536)
+    except Exception:
+        return False, {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return False, {}
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] == "Fault":
+            return False, {}
+    items = {}
+    for elem in root.iter():
+        name = elem.tag.split("}")[-1]
+        if name.endswith("Response"):
+            for child in list(elem):
+                items[child.tag.split("}")[-1]] = (child.text or "").strip()
+    return True, items
+
+
+def upnp_external_ip(control_url, service, timeout=5):
+    ok, items = upnp_soap(control_url, service, "GetExternalIPAddress", {},
+                          timeout=timeout)
+    if not ok:
+        return None
+    ip = items.get("NewExternalIPAddress")
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return ip
+
+
+def upnp_add_mapping(control_url, service, external_port, internal_port,
+                     internal_client, timeout=5):
+    ok, _items = upnp_soap(control_url, service, "AddPortMapping", {
+        "NewRemoteHost": "",
+        "NewExternalPort": int(external_port),
+        "NewProtocol": "TCP",
+        "NewInternalPort": int(internal_port),
+        "NewInternalClient": internal_client,
+        "NewEnabled": 1,
+        "NewPortMappingDescription": UPNP_DESC,
+        "NewLeaseDuration": UPNP_LEASE_S,
+    }, timeout=timeout)
+    return ok
+
+
+def upnp_delete_mapping(control_url, service, external_port, timeout=5):
+    ok, _items = upnp_soap(control_url, service, "DeletePortMapping", {
+        "NewRemoteHost": "",
+        "NewExternalPort": int(external_port),
+        "NewProtocol": "TCP",
+    }, timeout=timeout)
+    return ok
+
+
+def _upnp_signal_handler(signum, frame):
+    _upnp_cleanup_all()
+    prev = _UPNP_PREV_HANDLERS.get(signum)
+    try:
+        signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    if callable(prev):
+        return prev(signum, frame)
+    if signum == getattr(signal, "SIGINT", None):
+        raise KeyboardInterrupt
+    try:
+        os.kill(os.getpid(), signum)
+    except Exception:
+        raise SystemExit(128 + int(signum))
+
+
+def _upnp_install_handlers():
+    global _UPNP_HANDLERS_DONE
+    for signame in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, signame, None)
+        if signum is None:
+            continue
+        try:
+            if signal.getsignal(signum) is _upnp_signal_handler:
+                continue
+            _UPNP_PREV_HANDLERS[signum] = signal.getsignal(signum)
+            signal.signal(signum, _upnp_signal_handler)
+        except (OSError, ValueError):
+            pass
+    _UPNP_HANDLERS_DONE = True
+
+
+def _upnp_register_cleanup(info):
+    _UPNP_REGISTRY.append(info)
+    try:
+        atexit.register(_upnp_cleanup_all)
+    except Exception:
+        pass
+    _upnp_install_handlers()
+
+
+def _upnp_cleanup_all():
+    for info in list(_UPNP_REGISTRY):
+        try:
+            upnp_delete_mapping(info["control_url"], info["service"],
+                                info["external_port"], timeout=3)
+        except Exception:
+            pass
+
+
+def upnp_unmap(info):
+    """Delete one mapping now; best effort. Returns the SOAP result."""
+    try:
+        ok = upnp_delete_mapping(info["control_url"], info["service"],
+                                 info["external_port"], timeout=5)
+    except Exception:
+        return False
+    try:
+        _UPNP_REGISTRY.remove(info)
+    except ValueError:
+        pass
+    return ok
+
+
+def upnp_map(external_port, internal_port=None, internal_client=None,
+             ssdp_addr=None, wait=None):
+    """Full flow: discover -> describe -> external ip -> CGNAT check ->
+    AddPortMapping + cleanup registration. Dict, never raises."""
+    info = {"available": False, "external_ip": None,
+            "external_port": external_port,
+            "internal_client": internal_client or online_local_ip(),
+            "internal_port": internal_port or external_port,
+            "control_url": None, "service": None,
+            "cgnat": False, "reason": ""}
+    try:
+        locs = upnp_discover(ssdp_addr=ssdp_addr, wait=wait)
+        if not locs:
+            info["reason"] = "no UPnP gateway found"
+            return info
+        described = None
+        for loc in locs:
+            described = upnp_describe(loc)
+            if described is not None:
+                break
+        if described is None:
+            info["reason"] = "gateway description unreadable"
+            return info
+        control_url, service = described
+        info["control_url"], info["service"] = control_url, service
+        ext = upnp_external_ip(control_url, service)
+        if ext is None:
+            info["reason"] = "external address unknown"
+            return info
+        info["external_ip"] = ext
+        if upnp_is_cgnat(ext):
+            info["cgnat"] = True
+            info["reason"] = ("CGNAT (%s): a port mapping would be "
+                              "useless; use hole punching or a VPN" % ext)
+            return info
+        if not upnp_add_mapping(control_url, service, external_port,
+                                info["internal_port"], info["internal_client"]):
+            info["reason"] = "AddPortMapping refused"
+            return info
+        info["available"] = True
+        _upnp_register_cleanup(info)
+        return info
+    except Exception:
+        return info
 
 
 # --- Online STUN client (spec section 8.1; one socket for everything) ---

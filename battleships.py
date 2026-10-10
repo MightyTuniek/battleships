@@ -10372,20 +10372,6 @@ class UdpTransport(Transport):
             except Exception:
                 pass
 
-    def _die(self):
-        with self._lock:
-            self._closed = True
-            try:
-                self._inbox.put(None)
-            except Exception:
-                pass
-            sock, self._sock = self._sock, None
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
     def _pump_locked(self):
         while self._out and len(self._unacked) < RUDP_WINDOW:
             seq, ptype, idx, cnt, payload = self._out.popleft()

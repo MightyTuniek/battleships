@@ -3818,53 +3818,146 @@ def interactive_place_fleet(board):
 # Guide text
 # ----------------------------------------------------------------------------
 
-HOW_TO_PLAY = """
-FIELD MANUAL
-RULES
-  Each side hides ships on a grid. Ship count and board size vary by setup.
-  Ships lie in straight horizontal/vertical lines. They never overlap.
-  Take turns firing at one square. You fire first.
-  Squares are named column letter + row number: A1 (top-left).
-  HIT, MISS or SUNK is reported. A ship sinks when all squares are hit.
-  First to sink the other fleet wins.
+HOW_TO_SECTIONS = [
+    ("RULES", [
+        "Each side hides ships on a grid. Ship count and board size vary by setup.",
+        "Ships lie in straight horizontal/vertical lines. They never overlap.",
+        "Take turns firing at one square. You fire first.",
+        "Squares are named column letter + row number: A1 (top-left).",
+        "HIT, MISS or SUNK is reported. A ship sinks when all squares are hit.",
+        "First to sink the other fleet wins.",
+    ]),
+    ("SETUP NAVIGATION", [
+        "Every setup step offers Back: board, opponent, mode, doctrine,",
+        "fleet method, placement. Back returns one step; backing out of",
+        "the first step returns to the main menu (hotseat: previous",
+        "player; LAN: lobby).",
+        "Typed fallback: type 'back' or its number.",
+    ]),
+    ("BOARD", [
+        "~ water   ■ your ship   × hit",
+        "○ miss   # sunk   · unknown",
+        "Left: YOUR FLEET. Right: ENEMY WATERS.",
+        "Cursor shows current target.",
+    ]),
+    ("CONTROLS - SHOOTING", [
+        "Arrows / WASD  move cursor",
+        "Enter / Space  fire",
+        "A-N            jump to column",
+        "1-9, 0         jump to row",
+        "?              tactical advisory",
+        "/              density map",
+        "W              save game",
+        "Q / Esc        abandon",
+        "Typed: B7 + Enter, hint, map, board, save, quit.",
+    ]),
+    ("PLACEMENT", [
+        "Arrows         move cursor",
+        "R              rotate",
+        "Enter          place ship",
+        "Z / Backspace  undo",
+        "B              back one step",
+        "Q / Esc        abandon setup",
+        "Typed: A1 H / A1 V, undo, random, back, quit.",
+    ]),
+    ("TACTICAL TOOLS", [
+        "? hint: top-3 expert cells with scores.",
+        "/ map: 0-9 density heatmap.",
+        "Coach grades every shot against expert top-3.",
+        "Shot review + Expert par available after victory.",
+    ]),
+    ("SAVE / LOAD", [
+        "In game: W or save <file>.",
+        "Resume: python3 battleships.py --load save.json",
+        "Saves preserve boards, turn, stats and RNG state.",
+    ]),
+    ("LAN", [
+        "10x10 classic.",
+        "Commands: list, requests, request, accept, reject,",
+        "cancel, pref, name, password, anticheat, status,",
+        "say, tell, chat, start, help, quit.",
+        "In game: T talk, L chat history, Q surrender.",
+        "Verified vs forfeit wins.",
+    ]),
+]
 
-SETUP NAVIGATION
-  Every setup step offers ← Back: board → opponent → mode → doctrine
-  → fleet method → placement. Back returns one step; backing out of the
-  first step returns to the main menu (hotseat: previous player; LAN:
-  lobby). Typed fallback: type 'back' or its number.
 
-BOARD
-  ~ water    ■ your ship    × hit    ○ miss    # sunk    · unknown
-  Left: YOUR FLEET. Right: ENEMY WATERS. Cursor shows current target.
+def _how_to_guide_lines():
+    """Plain-text guide (titles + bodies) for typed terminals / tests."""
+    out = []
+    for title, lines in HOW_TO_SECTIONS:
+        out.append(title)
+        out.extend(lines)
+        out.append("")
+    return out
 
-CONTROLS — SHOOTING
-  Arrows / WASD    move cursor          Enter / Space   fire
-  A-N              jump to column       1-9, 0          jump to row
-  ?                tactical advisory    /               density map
-  W                save game            Q / Esc         abandon
-  Typed fallback: B7 + Enter, hint, map, board, save NAME, quit.
 
-PLACEMENT
-  Arrows           move cursor          R               rotate
-  Enter            place ship           Z / Backspace   undo
-  B                back one step        Q / Esc         abandon setup
-  Typed: A1 H / A1 V, undo, random, back, quit.
+HOW_TO_PLAY = "\n".join(_how_to_guide_lines())
 
-TACTICAL TOOLS
-  ? hint: top-3 expert cells with scores.  / map: 0-9 density heatmap.
-  Coach grades every shot against expert top-3. Shot review + Expert par
-  available after victory.
 
-SAVE / LOAD
-  In game: W or save <file>. Resume: python3 battleships.py --load save.json
-  Saves preserve boards, turn, stats and RNG state.
+def show_how_to_play():
+    """Boxed, paged field manual (both UI modes).
 
-LAN
-  10x10 classic. Commands: list, requests, request, accept, reject, cancel,
-  pref, name, password, anticheat, status, say, tell, chat, start, help, quit.
-  In game: T talk, L chat history, Q surrender. Verified vs forfeit wins.
-"""
+    Cursor UI: masthead + two boxed sections per page, ANY-KEY paging.
+    Typed fallback: the same text through page_lines. Never raises.
+    """
+    try:
+        if use_cursor_ui():
+            try:
+                clear()
+            except Exception:
+                pass
+            pages = [HOW_TO_SECTIONS[i:i + 2]
+                     for i in range(0, len(HOW_TO_SECTIONS), 2)]
+            try:
+                for num, page in enumerate(pages):
+                    for line in center_block(
+                            brand_masthead("Field manual")):
+                        print(line)
+                    print()
+                    for title, lines in page:
+                        try:
+                            wrapped = [w for l in lines
+                                       for w in wrap_prose(l)]
+                        except Exception:
+                            wrapped = list(lines)
+                        for line in center_block(
+                                boxed_panel(title, wrapped, double=True)):
+                            print(line)
+                        print()
+                    last = num == len(pages) - 1
+                    for line in center_block(command_bar(
+                            [("ANY KEY", "return" if last else "next page")])):
+                        print(line)
+                    try:
+                        with KeyReader() as kr:
+                            kr.get_key()
+                    except Quit:
+                        return
+                    except Exception:
+                        try:
+                            ask("Enter to continue > ")
+                        except Quit:
+                            return
+                        return
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+                return
+            except Quit:
+                return
+            except Exception:
+                pass
+        page_lines(_how_to_guide_lines())
+    except Quit:
+        return
+    except Exception:
+        try:
+            for line in _how_to_guide_lines():
+                print(line)
+        except Exception:
+            pass
 
 
 SHOT_HELP = """
@@ -13789,21 +13882,7 @@ def main():
             # --- How to play ---------------------------------------------
             if choice == 3: settings_menu(); continue
             if choice == 2:
-                if use_cursor_ui():
-                    clear()
-                    for line in center_block(brand_masthead("Field manual")):
-                        print(line)
-                    # Responsive manual: two columns on wide, stacked on narrow.
-                    manual = [w for l in HOW_TO_PLAY.strip("\n").split("\n") for w in wrap_prose(l)]
-                    for line in center_block(manual):
-                        print(line)
-                    print()
-                    for line in center_block(command_bar([("ANY KEY", "RETURN")])):
-                        print(line)
-                    with KeyReader() as kr:
-                        kr.get_key()
-                else:
-                    page_lines(wrap_prose(HOW_TO_PLAY))
+                show_how_to_play()
                 continue
 
     except Quit:

@@ -10051,7 +10051,7 @@ ONLINE_REASON_MESSAGES = {
     "TIMEOUT": "Timeout — packets are being dropped by a NAT or firewall; try a VPN or hole punch.",
     "BAD_CODE": "Wrong code — check the invite and try again.",
     "VERSION": "Version mismatch — both players must run the same game version.",
-    "RULES_MISMATCH": "Rules mismatch — board size / fleet / mode differ.",
+    "RULES_MISMATCH": "Rules mismatch — board size / fleet / mode / anti-cheat differ.",
     "PEER_LEFT": "Opponent left the game.",
     "LINK_LOST": "Connection lost — attempting to reconnect.",
     "PROTOCOL_ERROR": "Protocol error — connection closed.",
@@ -13064,7 +13064,7 @@ def online_join_error_text(exc):
         return message_for("VERSION")
     if isinstance(exc, RulesMismatch):
         return (message_for("RULES_MISMATCH")
-                + " Both sides must pick the same board, fleet and mode.")
+                + " Both sides must pick the same board, fleet, mode and anti-cheat.")
     if isinstance(exc, HandshakeFailed):
         reason = getattr(exc, "reason", "")
         if reason:
@@ -13190,6 +13190,10 @@ def run_online_host(args):
         session, info = _online_accept_session(listener, cfg)
     except HandshakeFailed as exc:
         print("Host failed: %s" % message_for(getattr(exc, "reason", "")))
+        listener.close()
+        return
+    except (RulesMismatch, VersionMismatch) as exc:
+        print("Host failed: %s" % online_join_error_text(exc))
         listener.close()
         return
     except Quit:
@@ -13349,6 +13353,9 @@ def _online_host_direct(cfg, score, rules):
         except HandshakeFailed as exc:
             print("Host failed: %s"
                   % message_for(getattr(exc, "reason", "")))
+            return
+        except (RulesMismatch, VersionMismatch) as exc:
+            print("Host failed: %s" % online_join_error_text(exc))
             return
         print("Connected to %s (session %s)."
               % (sanitize_name(info.get("peer_name", "?")),

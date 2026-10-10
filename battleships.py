@@ -12211,17 +12211,188 @@ ONLINE_ERROR_HINTS = {
     "BAD_CODE": "Bad proof: wrong code.",
 }
 
-ONLINE_HOWTO = (
-    "Online play is peer-to-peer between two copies of this game (no "
-    "server). Three ways to connect. DIRECT CODE: host and guest on one "
-    "VPN, or the host has a port forward or UPnP router; the host shows "
-    "an invite code and the guest pastes it. HOLE PUNCH: both behind "
-    "home routers; the host shows an offer, the guest answers, both "
-    "punch through. MANUAL: host:port plus the secret line, for IPv6, "
-    "DNS names or odd setups. Both sides must use the same board, fleet "
-    "and mode, and the same anti-cheat setting. Symmetric or mobile "
-    "hotspot NAT cannot be punched: use a VPN. Bad codes burn the invite."
-)
+ONLINE_GUIDE_SECTIONS = [
+    ("WHAT THIS IS", [
+        "Peer-to-peer internet play. No server, no account, no install:",
+        "two copies of this game talk directly to each other.",
+        "Single file, zero dependencies, standard library only.",
+        "Direct flows use TCP. Hole punch uses UDP (RUDP-lite): one",
+        "socket carries STUN, punching and game traffic.",
+        "Same rules and anti-cheat as LAN: mismatches forfeit.",
+    ]),
+    ("BEFORE YOU START (BOTH PLAYERS)", [
+        "1. Run the SAME game version (mismatch refuses to connect).",
+        "2. Pick the SAME board, fleet, mode and anti-cheat setting.",
+        "3. Decide who HOSTS (shares first) and who JOINS.",
+        "4. Have a chat/call ready: you read codes to each other.",
+        "5. Terminal at least 40 columns wide; codes are long.",
+    ]),
+    ("FLOW 1 - DIRECT CODE (EASIEST WHEN IT APPLIES)", [
+        "Use when: same VPN, or the host has a port forward / UPnP.",
+        "HOST: Online Match > Host > Host direct code (TCP).",
+        "  The game tries UPnP unless Settings > UPnP is OFF.",
+        "  Read the invite code + manual host:port line to the guest.",
+        "GUEST: Online Match > Join > Paste invite code. Play.",
+        "VPN tip: join the VPN first (Tailscale, ZeroTier, WireGuard)",
+        "and use the VPN address. It always works. Say it out loud:",
+        "'are you on the VPN address?' before anything else.",
+    ]),
+    ("FLOW 2 - HOLE PUNCH (BOTH BEHIND HOME ROUTERS)", [
+        "Use when: no VPN, no port forward. Works on most home NAT.",
+        "HOST: Host > Host hole-punch offer. Note the STUN line:",
+        "  punchable = offer will likely work; anything else read on.",
+        "  Read the OFFER code to the guest.",
+        "GUEST: Join > Paste the offer. The game STUNs your NAT,",
+        "  shows YOUR ANSWER code: read it back to the host.",
+        "HOST: paste the answer when asked. Both sides punch",
+        "  (authenticated PUNCH / PUNCH-ACK, ~15 s window).",
+        "GUEST: press Enter only when the host HAS your answer,",
+        "  then both punch. Names + rules verify, game starts.",
+    ]),
+    ("FLOW 3 - MANUAL (IPV6, DNS, ODD SETUPS)", [
+        "Use when: IPv6, DNS name, or codes will not scan/read.",
+        "HOST: host direct as in Flow 1, but read the MANUAL line:",
+        "  host:port PLUS the secret line (two parts, both needed).",
+        "GUEST: Join > Manual address. Type host:port, then secret.",
+        "  Accepts 203.0.113.9:51234 and [2001:db8::1]:51234.",
+    ]),
+    ("REACHABILITY CHECK (HOST SEES THIS FIRST)", [
+        "The host menu probes UPnP + STUN in parallel and prints:",
+        "  UPnP: found (external IP) = direct codes should work.",
+        "  UPnP: CGNAT = mapping useless; punch or VPN instead.",
+        "  STUN: punchable at ip:port = offers should work.",
+        "  STUN: anything else = read the reason; try VPN/manual.",
+        "Then pick the offered flow. Manual is always offered.",
+    ]),
+    ("SETTINGS & FLAGS (MENU = CLI, NOTHING CLI-ONLY)", [
+        "Online > Settings mirrors every --online flag:",
+        "  Name (20 chars) | Port (0 = random) | Bind address",
+        "  Resume window s | Mode single/salvo | Anti-cheat hash/cell",
+        "  Net debug (redacted logs) | STUN servers (repeatable)",
+        "  UPnP ON/OFF.",
+        "CLI shortcuts: --online host | --online join CODE, --port,",
+        "--bind, --stun HOST:PORT, --no-upnp, --resume-timeout,",
+        "--net-debug, --name. Menu does everything CLI does.",
+    ]),
+    ("CODES, SECURITY, RESUME", [
+        "Codes BURN after first use (or 3 bad tries): ask for a fresh",
+        "one, never retry a dead code. 0/1/8 typos forgiven via crc.",
+        "Offers carry no names: the READY exchange swaps real names",
+        "and checks rules, mirroring TCP READY.",
+        "Auth is HMAC (SHA256); there is NO encryption and NO server.",
+        "Keep codes private: anyone holding one can take the seat.",
+        "Dropped link? TCP auto-reconnects inside the resume window",
+        "(default 120 s). UDP needs a manual redial. Clean exit says",
+        "'Opponent left'; a dead link says 'Connection lost'.",
+    ]),
+    ("ERROR MESSAGES (WHAT THEY MEAN, WHAT TO DO)", [
+        "Connection refused: host not listening / firewall. Check",
+        "  address, port, VPN membership.",
+        "Timeout: NAT/firewall drops packets. Try VPN or punch.",
+        "Wrong code: check the invite, get a fresh one if burned.",
+        "Version mismatch: both update to the same game version.",
+        "Rules mismatch: align board / fleet / mode / anti-cheat.",
+        "Opponent left: clean exit. Connection lost: dropped link.",
+        "Punch timeout, no two-way path: symmetric or hotspot NAT.",
+        "  Fix: VPN, port forward, or UPnP direct mode.",
+        "Answer code at join: give it to the HOST, not the join box.",
+    ]),
+    ("WHICH NAT ARE YOU BEHIND?", [
+        "Home router (full cone): direct + punch both work.",
+        "Symmetric / phone hotspot: punching FAILS by design.",
+        "  Don't retry: switch to VPN or port forward.",
+        "CGNAT (carrier-grade NAT): UPnP mapping is useless even",
+        "  when the router says yes. Punch or VPN instead.",
+    ]),
+    ("TROUBLESHOOTING CHECKLIST", [
+        "1. Same version? Same board/fleet/mode/anti-cheat?",
+        "2. Fresh code? (old ones burn). Read slowly, 0/1/8 forgive.",
+        "3. On the VPN address if using a VPN?",
+        "4. Firewall open for TCP (direct) / UDP (punch)?",
+        "5. Hotspot or symmetric NAT? Stop punching, use VPN.",
+        "6. CGNAT? Ignore UPnP success, punch or VPN.",
+        "7. STUN blocked? Try another --stun server.",
+        "8. Still stuck? Manual host:port + secret line.",
+    ]),
+]
+
+
+def _online_guide_lines():
+    """Plain-text guide (titles + bodies) for typed terminals / tests."""
+    out = []
+    for title, lines in ONLINE_GUIDE_SECTIONS:
+        out.append(title)
+        out.extend(lines)
+        out.append("")
+    return out
+
+
+ONLINE_HOWTO = "\n".join(_online_guide_lines())
+
+
+def show_online_guide():
+    """Boxed, paged field manual for online play (both UI modes).
+
+    Cursor UI: masthead + two boxed sections per page, ANY-KEY paging.
+    Typed fallback: the same text through page_lines. Never raises.
+    """
+    try:
+        if use_cursor_ui():
+            try:
+                clear()
+            except Exception:
+                pass
+            pages = [ONLINE_GUIDE_SECTIONS[i:i + 2]
+                     for i in range(0, len(ONLINE_GUIDE_SECTIONS), 2)]
+            try:
+                for num, page in enumerate(pages):
+                    for line in center_block(
+                            brand_masthead("Online field manual")):
+                        print(line)
+                    print()
+                    for title, lines in page:
+                        try:
+                            wrapped = [w for l in lines
+                                       for w in wrap_prose(l)]
+                        except Exception:
+                            wrapped = list(lines)
+                        for line in center_block(
+                                boxed_panel(title, wrapped, double=True)):
+                            print(line)
+                        print()
+                    last = num == len(pages) - 1
+                    for line in center_block(command_bar(
+                            [("ANY KEY", "return" if last else "next page")])):
+                        print(line)
+                    try:
+                        with KeyReader() as kr:
+                            kr.get_key()
+                    except Quit:
+                        return
+                    except Exception:
+                        try:
+                            ask("Enter to continue > ")
+                        except Quit:
+                            return
+                        return
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+                return
+            except Quit:
+                return
+            except Exception:
+                pass
+        page_lines(_online_guide_lines())
+    except Quit:
+        return
+    except Exception:
+        try:
+            for line in _online_guide_lines():
+                print(line)
+        except Exception:
+            pass
 
 
 class OnlineConfig:
@@ -12253,9 +12424,9 @@ class OnlineConfig:
                                 else "HASH"),
             "Net debug: %s" % ("ON" if self.net_debug else "OFF"),
             "STUN: %s" % (", ".join(self.stun) if self.stun
-                          else "(none; hole-punch follow-up)"),
+                          else "(default servers)"),
             "UPnP: %s" % ("OFF" if self.no_upnp
-                          else "ON (hole-punch follow-up)"),
+                          else "ON (auto-map)"),
         ]
 
 
@@ -12932,7 +13103,7 @@ def online_menu(cfg, score=None):
     """Online submenu: host / join / settings / how-it-works."""
     while True:
         header = "\n".join(
-            brand_masthead("Online — direct TCP play") +
+            brand_masthead("Online — internet play") +
             [paint("No server. Host shares a code, guest pastes it.", "grey"),
              ""] + cfg.describe())
         opts = [
@@ -12955,12 +13126,7 @@ def online_menu(cfg, score=None):
         elif idx == 2:
             online_settings_menu(cfg)
         elif idx == 3:
-            for line in wrap_prose(ONLINE_HOWTO):
-                print(line)
-            try:
-                ask("Enter to continue > ")
-            except Quit:
-                return
+            show_online_guide()
 
 
 def main():

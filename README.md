@@ -330,41 +330,70 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 ## Online play
 
 Peer-to-peer internet play with no server: `Main menu → Online Match → Host / Join`.
-Everything the `--online` CLI flags do is also in `Online → Settings`, so nothing
-is CLI-only. Three flows:
+Single file, zero dependencies, standard library only. Direct flows use TCP; hole
+punch uses UDP (RUDP-lite) with one socket carrying STUN, punching and game traffic.
+In-game, `Online Match → How online play works` shows this same guide as boxed
+windows (two sections per page). Everything the `--online` CLI flags do is also in
+`Online → Settings`, so nothing is CLI-only.
 
-1. **Direct code (VPN or port forward).** Same VPN (Tailscale, ZeroTier, WireGuard)
-   always works — use the VPN address. Otherwise the host forwards a TCP port (or
-   relies on UPnP, attempted automatically unless `--no-upnp`) and shares the
-   invite code; the guest pastes it.
-2. **UPnP direct.** Behind a typical home router the host maps the port automatically
-   (lease 3600 s, removed on exit). Behind CGNAT (carrier-grade NAT) the mapping is
-   useless and the menu says so — use hole punch or a VPN instead.
-3. **Hole punch.** Both behind ordinary home NAT: the host shares an offer code,
-   the guest answers, both punch through (STUN-learned endpoints, authenticated
-   PUNCH/PUNCH_ACK, then the normal game). Works on most home routers
-   (endpoint-independent mapping). Fails on symmetric NAT and many mobile hotspots.
+### Before you start (both players)
 
-Manual form for IPv6, DNS names or odd setups: host shows `host:port` plus the
-secret line; the guest enters both via `Join → Manual address`.
+1. Run the **same game version** — a mismatch refuses to connect.
+2. Pick the **same board, fleet, mode and anti-cheat setting**.
+3. Decide who **hosts** (shares first) and who **joins**.
+4. Have a chat/call ready — you read codes to each other.
+5. Keep the terminal at least 40 columns wide; codes are long.
 
-Both sides must pick the same board, fleet, mode and anti-cheat setting, or the
-match refuses with a rules-mismatch message. One socket carries STUN, punching
-and game traffic. Invite codes burn after first use (or three failures).
+### Flow 1 — Direct code (easiest when it applies)
 
-Error messages:
+Use when: same VPN, or the host has a port forward / UPnP router.
 
-- `Connection refused` — the host is not listening, or a firewall is rejecting.
-- `Timeout` — packets are being dropped by a NAT or firewall; try a VPN or hole punch.
-- `Wrong code` — check the invite and try again.
-- `Version mismatch` — both players must run the same game version.
-- `Rules mismatch` — board size / fleet / mode differ.
-- `Opponent left` / `Connection lost` — clean exit vs dropped link (reconnects
-  automatically inside the resume window).
-- Hole punch timing out with no two-way path usually means symmetric NAT: the
-  menu says so — use a VPN, a port forward, or UPnP direct mode.
+- **Host:** `Online Match → Host → Host direct code (TCP)`. The game tries UPnP
+  automatically unless `Settings → UPnP` is OFF (lease 3600 s, removed on exit).
+  Read the invite code — plus the manual `host:port` line — to the guest.
+- **Guest:** `Online Match → Join → Paste invite code`. Play.
+- **VPN tip:** join the VPN first (Tailscale, ZeroTier, WireGuard) and use the VPN
+  address. It always works. Confirm out loud — "are you on the VPN address?" —
+  before debugging anything else.
 
-CLI shortcuts (same options live in the menu):
+### Flow 2 — Hole punch (both behind home routers)
+
+Use when: no VPN, no port forward. Works on most home routers
+(endpoint-independent mapping). Fails on symmetric NAT and many mobile hotspots.
+
+- **Host:** `Host → Host hole-punch offer`. Read the STUN line: `punchable` means
+  the offer will likely work; anything else, read the reason. Share the **offer**.
+- **Guest:** `Join → Paste the offer`. The game STUNs your NAT and shows **your
+  answer code** — read it back to the host.
+- **Host:** paste the answer when asked. Both sides punch through (authenticated
+  `PUNCH` / `PUNCH-ACK`, ~15 s window).
+- **Guest:** press Enter only **when the host has your answer**, then both punch.
+  Names and rules verify (UDP READY, mirroring TCP READY) and the game starts.
+
+### Flow 3 — Manual (IPv6, DNS names, odd setups)
+
+- **Host:** host direct as in Flow 1, but read the **manual line**: `host:port`
+  **plus** the secret line (two parts, both needed).
+- **Guest:** `Join → Manual address`. Type `host:port`, then the secret.
+  Accepts `203.0.113.9:51234` and `[2001:db8::1]:51234`.
+
+### Reachability check (the host sees this first)
+
+The host menu probes UPnP + STUN in parallel and prints one line:
+
+- `UPnP: found (external IP)` — direct codes should work.
+- `UPnP: CGNAT` — the mapping is useless even when the router agrees; punch or VPN.
+- `STUN: punchable at ip:port` — offers should work.
+- `STUN: anything else` — read the reason; try VPN/manual.
+
+Then pick the offered flow. Manual is always offered.
+
+### Settings & flags (menu = CLI, nothing CLI-only)
+
+`Online → Settings` mirrors every flag: name (20 chars), port (`0` = random),
+bind address, resume window (s), mode single/salvo, anti-cheat hash/cell, net
+debug (redacted logs), STUN servers (repeatable, default public Google servers),
+UPnP ON/OFF.
 
 ```bash
 python3 battleships.py --online host
@@ -383,6 +412,38 @@ python3 battleships.py --online host --port 51234 --name Ada --stun stun.example
 | `--net-debug` | Verbose redacted network logs |
 | `--name NAME` | Display name (max 20 chars) |
 
+### Codes, security, resume
+
+- Codes **burn** after first use (or three bad tries) — ask for a fresh one, never
+  retry a dead code. `0`/`1`/`8` typos are forgiven via CRC check.
+- Offers carry no names; the READY exchange swaps real names and checks rules.
+- Auth is HMAC (SHA256). There is **no encryption** and **no server** — keep codes
+  private, since anyone holding one can take the seat.
+- Dropped link? TCP auto-reconnects inside the resume window (default 120 s); UDP
+  needs a manual redial. A clean exit reports `Opponent left`; a dead link reports
+  `Connection lost` and reconnects automatically inside the window.
+
+### Error messages
+
+- `Connection refused` — the host is not listening, or a firewall is rejecting.
+  Check address, port and VPN membership.
+- `Timeout` — packets are being dropped by a NAT or firewall; try a VPN or hole punch.
+- `Wrong code` — check the invite and try again (get a fresh one if burned).
+- `Version mismatch` — both players must run the same game version.
+- `Rules mismatch` — board size / fleet / mode differ (align anti-cheat too).
+- `Opponent left` / `Connection lost` — clean exit vs dropped link (reconnects
+  automatically inside the resume window).
+- Punch timing out with no two-way path usually means symmetric NAT — use a VPN,
+  a port forward, or UPnP direct mode.
+- Pasting an answer code into join? Give it to the **host**, not the join box.
+
+### Which NAT are you behind?
+
+- **Home router (full cone)** — direct + punch both work.
+- **Symmetric / phone hotspot** — punching fails by design. Don't retry: use VPN.
+- **CGNAT (carrier-grade NAT)** — UPnP mapping is useless even on success; the menu
+  says so. Punch or VPN instead.
+
 ## Troubleshooting
 
 - Bad colors → `--no-color` or `NO_COLOR=1`.
@@ -390,6 +451,7 @@ python3 battleships.py --online host --port 51234 --name Ada --stun stun.example
 - Narrow terminal (phone) → long help/chat/review texts wrap to fit and HUD rows stack; boxes and addresses stay intact. Minimum usable width is 40 columns.
 - `ship length X doesn't fit` → board too small for fleet, increase `--board` or use smaller `--fleet`.
 - No LAN peers → same subnet, UDP broadcast allowed, same port range + password, firewall open for UDP+TCP.
+- Online stuck → full checklist is `Online Match → How online play works` (§ Troubleshooting checklist). Short version: same version/rules? fresh code? VPN address? hotspot/symmetric NAT (use VPN)? CGNAT (ignore UPnP, punch/VPN)?
 - `No valid reply` → peer busy, wrong IP:port, or password mismatch.
 - Nightmare slow → expected (Monte Carlo). Use Expert for fast strong play.
 

@@ -10355,6 +10355,174 @@ def stun_check(sock, servers, timeout=None, retries=None):
         "hole punching will not work, use a VPN, a port forward or UPnP")
 
 
+# --- Online offer/answer codes (spec section 8.2; manual signaling) ---
+FLAG_OFFER_LAN = 0x02
+
+
+def _normalize_code(text):
+    return (text or "").upper().replace("-", "").replace(" ", "").translate(
+        str.maketrans("018", "OIB"))
+
+
+def _signal_b32e(raw):
+    pad = (-len(raw)) % 5
+    s = base64.b32encode(raw + b"\x00" * pad).decode()
+    return "-".join(s[i:i + 4] for i in range(0, len(s), 4))
+
+
+def _signal_b32d(text, ok_lens):
+    s = _normalize_code(text)
+    try:
+        raw = base64.b32decode(s)
+    except Exception as exc:
+        raise BadInvite("bad code: %s" % exc)
+    if len(raw) not in ok_lens:
+        raise BadInvite("bad code length")
+    return raw
+
+
+def _pack_endpoint(ip, port):
+    try:
+        packed_ip = ipaddress.IPv4Address(ip).packed
+    except Exception as exc:
+        raise BadInvite("bad ip: %s" % exc)
+    if not 0 <= port <= 65535:
+        raise BadInvite("bad port")
+    return struct.pack(">4sH", packed_ip, port)
+
+
+def _unpack_endpoint(buf):
+    ip_packed, (port,) = buf[:4], struct.unpack(">H", buf[4:6])
+    return str(ipaddress.IPv4Address(ip_packed)), port
+
+
+def encode_offer(pub, secret, lan=None, nonce_h=None):
+    """Host offer code + dict. pub/lan are (ip, port); secret is 10 bytes."""
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    if nonce_h is None:
+        nonce_h = new_nonce(NONCE_BYTES_UDP)
+    if len(nonce_h) != NONCE_BYTES_UDP:
+        raise BadInvite("bad nonce length")
+    flags = FLAG_PUNCH
+    body = struct.pack(">BB", PROTOCOL_VERSION, flags | (
+        FLAG_OFFER_LAN if lan else 0)) + _pack_endpoint(*pub)
+    if lan:
+        body += _pack_endpoint(*lan)
+    body += nonce_h + secret
+    raw = body + struct.pack(">H", zlib.crc32(body) & 0xFFFF)
+    offer = {"v": PROTOCOL_VERSION, "flags": flags | (
+        FLAG_OFFER_LAN if lan else 0), "pub": (pub[0], pub[1]),
+        "lan": (lan[0], lan[1]) if lan else None,
+        "nonce_h": nonce_h, "secret": secret, "raw": raw}
+    return _signal_b32e(raw), offer
+
+
+def decode_offer(text):
+    raw = _signal_b32d(text, (30, 35))
+    body = raw[:26] if len(raw) == 30 else raw[:32]
+    (crc,) = struct.unpack(">H", raw[len(body):len(body) + 2])
+    if zlib.crc32(body) & 0xFFFF != crc:
+        raise BadInvite("bad code")
+    ver, flags = struct.unpack(">BB", body[:2])
+    if ver != PROTOCOL_VERSION:
+        raise VersionMismatch("protocol version %d" % ver)
+    if not flags & FLAG_PUNCH:
+        raise BadInvite("not a punch offer")
+    off = 2
+    pub = _unpack_endpoint(body[off:off + 6])
+    off += 6
+    lan = None
+    if flags & FLAG_OFFER_LAN:
+        lan = _unpack_endpoint(body[off:off + 6])
+        off += 6
+    nonce_h = body[off:off + NONCE_BYTES_UDP]
+    off += NONCE_BYTES_UDP
+    secret = body[off:off + SECRET_BYTES]
+    if len(nonce_h) != NONCE_BYTES_UDP or len(secret) != SECRET_BYTES:
+        raise BadInvite("bad code")
+    return {"v": ver, "flags": flags, "pub": pub, "lan": lan,
+            "nonce_h": nonce_h, "secret": secret,
+            "raw": body + struct.pack(">H", crc)}
+
+
+def _answer_tag(secret, offer_raw, answer_body):
+    return hmac.new(secret, offer_raw + answer_body,
+                    hashlib.sha256).digest()[:8]
+
+
+def encode_answer(offer, pub, secret, lan=None, nonce_g=None):
+    """Guest answer code + dict. offer is a code string or decoded dict."""
+    if isinstance(offer, str):
+        offer = decode_offer(offer)
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    if not hmac.compare_digest(bytes(offer["secret"]), bytes(secret)):
+        raise BadInvite("wrong secret for this offer")
+    if nonce_g is None:
+        nonce_g = new_nonce(NONCE_BYTES_UDP)
+    if len(nonce_g) != NONCE_BYTES_UDP:
+        raise BadInvite("bad nonce length")
+    flags = FLAG_PUNCH | (FLAG_OFFER_LAN if lan else 0)
+    answer_body = struct.pack(">BB", PROTOCOL_VERSION, flags)
+    answer_body += _pack_endpoint(*pub)
+    if lan:
+        answer_body += _pack_endpoint(*lan)
+    answer_body += nonce_g
+    tag = _answer_tag(secret, offer["raw"], answer_body)
+    raw = answer_body + tag + struct.pack(
+        ">H", zlib.crc32(answer_body + tag) & 0xFFFF)
+    answer = {"v": PROTOCOL_VERSION, "flags": flags,
+              "pub": (pub[0], pub[1]),
+              "lan": (lan[0], lan[1]) if lan else None,
+              "nonce_g": nonce_g, "tag": tag}
+    return _signal_b32e(raw), answer
+
+
+def decode_answer(text):
+    raw = _signal_b32d(text, (30, 35))
+    body = raw[:24] if len(raw) == 30 else raw[:30]
+    tag = body[-8:]
+    answer_body = body[:-8]
+    (crc,) = struct.unpack(">H", raw[len(body):len(body) + 2])
+    if zlib.crc32(body) & 0xFFFF != crc:
+        raise BadInvite("bad code")
+    ver, flags = struct.unpack(">BB", answer_body[:2])
+    if ver != PROTOCOL_VERSION:
+        raise VersionMismatch("protocol version %d" % ver)
+    if not flags & FLAG_PUNCH:
+        raise BadInvite("not a punch answer")
+    off = 2
+    pub = _unpack_endpoint(answer_body[off:off + 6])
+    off += 6
+    lan = None
+    if flags & FLAG_OFFER_LAN:
+        lan = _unpack_endpoint(answer_body[off:off + 6])
+        off += 6
+    nonce_g = answer_body[off:off + NONCE_BYTES_UDP]
+    if len(nonce_g) != NONCE_BYTES_UDP:
+        raise BadInvite("bad code")
+    return {"v": ver, "flags": flags, "pub": pub, "lan": lan,
+            "nonce_g": nonce_g, "tag": tag, "body": answer_body}
+
+
+def verify_answer_tag(offer, answer, secret):
+    """True iff the answer tag authenticates (compare_digest)."""
+    if isinstance(offer, str):
+        offer = decode_offer(offer)
+    if isinstance(answer, str):
+        answer = decode_answer(answer)
+    if len(secret) != SECRET_BYTES:
+        return False
+    expected = _answer_tag(secret, offer["raw"], answer["body"])
+    return hmac.compare_digest(expected, bytes(answer["tag"]))
+
+
+def punch_keys(secret, nonce_h, nonce_g):
+    """Both sides derive k_hg/k_gh/k_resume immediately (T2 schedule)."""
+    return derive_keys(secret, bytes(nonce_h), bytes(nonce_g))
+
+
 # --- Online handshake (spec section 6) ---
 def online_b64e(b):
     return base64.b64encode(b).decode()

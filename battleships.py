@@ -10222,6 +10222,349 @@ def recv_exact(sock, n, timeout):
     return bytes(out)
 
 
+# --- Online RUDP-lite + UDP transport (spec section 8.4) ---
+RUDP_TYPE_PUNCH = 1
+RUDP_TYPE_PUNCH_ACK = 2
+RUDP_TYPE_DATA = 3
+RUDP_TYPE_ACK = 4
+RUDP_TYPE_FIN = 5
+_RUDP_HEADER = struct.Struct(">BBIIBB")
+_RUDP_SEQ_MASK = 0xFFFFFFFF
+
+
+def _rudp_le(a, b):
+    """a <= b in u32 sequence space (wraps safely)."""
+    return ((b - a) & _RUDP_SEQ_MASK) <= 0x7FFFFFFF
+
+
+def _rudp_packet(ptype, seq, ack, frag_idx, frag_cnt, payload, key):
+    header = _RUDP_HEADER.pack(RUDP_MAGIC, ptype, seq & _RUDP_SEQ_MASK,
+                              ack & _RUDP_SEQ_MASK, frag_idx, frag_cnt)
+    return header + payload + mac16(key, header + payload)
+
+
+def _rudp_parse(datagram, key):
+    """(ptype, seq, ack, frag_idx, frag_cnt, payload) or None when the
+    datagram is unauthenticated. Unauthenticated input is dropped
+    silently with no reply (no amplification)."""
+    if len(datagram) < _RUDP_HEADER.size + MAC_BYTES:
+        return None
+    header, payload_mac = datagram[:_RUDP_HEADER.size], datagram[_RUDP_HEADER.size:]
+    try:
+        magic, ptype, seq, ack, frag_idx, frag_cnt = _RUDP_HEADER.unpack(header)
+    except struct.error:
+        return None
+    if magic != RUDP_MAGIC:
+        return None
+    if ptype not in (RUDP_TYPE_PUNCH, RUDP_TYPE_PUNCH_ACK, RUDP_TYPE_DATA,
+                     RUDP_TYPE_ACK, RUDP_TYPE_FIN):
+        return None
+    payload, tag = payload_mac[:-MAC_BYTES], payload_mac[-MAC_BYTES:]
+    if len(payload) > RUDP_MAX_PAYLOAD:
+        return None
+    if not hmac.compare_digest(mac16(key, header + payload), tag):
+        return None
+    return ptype, seq, ack, frag_idx, frag_cnt, payload
+
+
+class UdpTransport(Transport):
+    """Reliable ordered authenticated stream over one UDP socket.
+
+    Same blocking surface as TcpTransport (send/recv/close/peer), so the
+    session layer is untouched. RUDP-lite: per-fragment sequences,
+    cumulative acks, 16-packet window, delayed ack, RFC 6298-style RTO,
+    32-packet reorder buffer, FIN close, dead-after-silence.
+    """
+
+    def __init__(self, sock, peer_addr, send_key, recv_key):
+        self._sock = sock
+        self._peer_addr = peer_addr
+        self._send_key = bytes(send_key)
+        self._recv_key = bytes(recv_key)
+        self._lock = threading.Lock()
+        self._next_seq = 0
+        self._unacked = {}
+        self._out = collections.deque()
+        self._inbox = queue.Queue()
+        self._recv_next = 0
+        self._recv_buf = {}
+        self._group_cnt = 0
+        self._group_parts = {}
+        self._need_ack = False
+        self._ack_due = 0.0
+        self._srtt = RUDP_RTO_INITIAL_S
+        self._rttvar = RUDP_RTO_INITIAL_S / 2
+        self._rto = RUDP_RTO_INITIAL_S
+        self._last_switch = 0.0
+        self._last_ack = None
+        self._dup_acks = 0
+        self._closed = False
+        self._closing = False
+        self._close_at = None
+        self._fin_seq = None
+        self._peer_done = False
+        try:
+            sock.settimeout(0.5)
+        except OSError:
+            pass
+        self._rx_thread = threading.Thread(target=self._recv_loop,
+                                           daemon=True)
+        self._rx_thread.start()
+        self._tm_thread = threading.Thread(target=self._timer_loop,
+                                           daemon=True)
+        self._tm_thread.start()
+
+    @property
+    def peer(self):
+        with self._lock:
+            return self._peer_addr
+
+    @property
+    def _recv_high(self):
+        return (self._recv_next - 1) & _RUDP_SEQ_MASK
+
+    def send(self, frame):
+        if len(frame) > RUDP_MAX_FRAGMENTS * RUDP_MAX_PAYLOAD:
+            raise ProtocolError("frame needs too many fragments")
+        frags = [frame[i:i + RUDP_MAX_PAYLOAD]
+                 for i in range(0, max(1, len(frame)), RUDP_MAX_PAYLOAD)]
+        if not frags:
+            frags = [b""]
+        with self._lock:
+            if self._closed:
+                raise TransportClosed("closed")
+            cnt = len(frags)
+            for idx, payload in enumerate(frags):
+                seq = self._next_seq
+                self._next_seq = (self._next_seq + 1) & _RUDP_SEQ_MASK
+                self._out.append((seq, RUDP_TYPE_DATA, idx, cnt, payload))
+            self._pump_locked()
+
+    def recv(self, timeout=None):
+        try:
+            msg = self._inbox.get(timeout=timeout)
+        except Exception:
+            raise TransportClosed("closed")
+        if msg is None:
+            raise TransportClosed("closed")
+        return msg
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closing = True
+            self._close_at = time.monotonic() + 1.0
+            seq = self._next_seq
+            self._next_seq = (self._next_seq + 1) & _RUDP_SEQ_MASK
+            self._fin_seq = seq
+            self._out.append((seq, RUDP_TYPE_FIN, 0, 1, b""))
+            self._pump_locked()
+            self._closed = True
+            try:
+                self._inbox.put(None)
+            except Exception:
+                pass
+
+    def _die(self):
+        with self._lock:
+            self._closed = True
+            try:
+                self._inbox.put(None)
+            except Exception:
+                pass
+            sock, self._sock = self._sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _pump_locked(self):
+        while self._out and len(self._unacked) < RUDP_WINDOW:
+            seq, ptype, idx, cnt, payload = self._out.popleft()
+            datagram = _rudp_packet(ptype, seq, self._recv_high, idx, cnt,
+                                    payload, self._send_key)
+            try:
+                self._sock.sendto(datagram, self._peer_addr)
+            except OSError:
+                self._out.appendleft((seq, ptype, idx, cnt, payload))
+                return
+            now = time.monotonic()
+            self._unacked[seq] = [datagram, now, now, self._rto, False]
+            self._need_ack = False
+
+    def _on_ack_locked(self, ack):
+        if self._last_ack is None or (_rudp_le(self._last_ack, ack)
+                                      and self._last_ack != ack):
+            self._last_ack = ack
+            self._dup_acks = 0
+        elif ack == self._last_ack and self._unacked:
+            self._dup_acks += 1
+            if self._dup_acks == 3:
+                # Fast retransmit: resend the lowest unacked now instead
+                # of waiting out the RTO (wire format unchanged).
+                low = min(self._unacked)
+                entry = self._unacked[low]
+                try:
+                    self._sock.sendto(entry[0], self._peer_addr)
+                except OSError:
+                    pass
+                else:
+                    entry[2] = time.monotonic()
+                    entry[4] = True
+                self._dup_acks = 0
+        newly = [s for s in self._unacked if _rudp_le(s, ack)]
+        if not newly:
+            return
+        now = time.monotonic()
+        fresh = [s for s in newly if not self._unacked[s][4]]
+        sample = now - self._unacked[fresh[-1]][1] if fresh else None
+        for s in newly:
+            del self._unacked[s]
+        if fresh:
+            # Karn: only packets sent once give RTT samples; the latest
+            # fresh ack is the most current signal.
+            if sample is not None and sample > 0:
+                self._rttvar = (0.75 * self._rttvar
+                                + 0.25 * abs(self._srtt - sample))
+                self._srtt = 0.875 * self._srtt + 0.125 * sample
+                floor = RUDP_ACK_DELAY_S
+                self._rto = min(max(self._srtt + 4 * self._rttvar, floor),
+                                RUDP_RTO_MAX_S)
+        self._pump_locked()
+
+    def _recv_loop(self):
+        while True:
+            try:
+                sock = self._sock
+                if sock is None:
+                    return
+                data, src = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            parsed = _rudp_parse(data, self._recv_key)
+            if parsed is None:
+                continue
+            ptype, seq, ack, frag_idx, frag_cnt, payload = parsed
+            with self._lock:
+                if self._closed and not self._closing:
+                    return
+                if src != self._peer_addr:
+                    now = time.monotonic()
+                    if now - self._last_switch >= ADDR_MIGRATE_MIN_S:
+                        self._peer_addr = src
+                        self._last_switch = now
+                self._on_ack_locked(ack)
+                if ptype in (RUDP_TYPE_PUNCH, RUDP_TYPE_PUNCH_ACK):
+                    continue
+                if ptype == RUDP_TYPE_ACK:
+                    continue
+                if self._peer_done:
+                    continue
+                if ptype == RUDP_TYPE_FIN:
+                    self._recv_buf[seq] = ("FIN", 0, payload)
+                elif ptype == RUDP_TYPE_DATA:
+                    delivered = seq != self._recv_next and _rudp_le(
+                        seq, (self._recv_next - 1) & _RUDP_SEQ_MASK)
+                    if not delivered and seq not in self._recv_buf:
+                        if len(self._recv_buf) < RUDP_REORDER_BUFFER \
+                                or seq == self._recv_next:
+                            self._recv_buf[seq] = (frag_idx, frag_cnt,
+                                                   payload)
+                        # else: reorder buffer full; drop, peer retransmits
+                    # else: duplicate; ack again below
+                else:
+                    continue
+                self._need_ack = True
+                self._ack_due = time.monotonic() + RUDP_ACK_DELAY_S
+                self._deliver_locked()
+
+    def _deliver_locked(self):
+        while self._recv_next in self._recv_buf:
+            entry = self._recv_buf.pop(self._recv_next)
+            if entry[0] == "FIN":
+                self._recv_next = (self._recv_next + 1) & _RUDP_SEQ_MASK
+                self._peer_done = True
+                try:
+                    self._inbox.put(None)
+                except Exception:
+                    pass
+                return
+            frag_idx, frag_cnt, payload = entry
+            if frag_idx == 0 or frag_cnt != self._group_cnt:
+                # New message (or resync after a violation): restart group.
+                self._group_cnt = frag_cnt
+                self._group_parts = {}
+            self._group_parts[frag_idx] = payload
+            self._recv_next = (self._recv_next + 1) & _RUDP_SEQ_MASK
+            if len(self._group_parts) == self._group_cnt and set(
+                    self._group_parts) == set(range(self._group_cnt)):
+                msg = b"".join(self._group_parts[i]
+                               for i in range(self._group_cnt))
+                self._group_parts = {}
+                try:
+                    self._inbox.put(msg)
+                except Exception:
+                    pass
+
+    def _timer_loop(self):
+        while True:
+            time.sleep(0.01)
+            with self._lock:
+                if self._sock is None:
+                    return
+                now = time.monotonic()
+                for seq in list(self._unacked):
+                    _dg, first, last, prto, _rex = self._unacked[seq]
+                    if now - last >= prto:
+                        try:
+                            self._sock.sendto(_dg, self._peer_addr)
+                        except OSError:
+                            pass
+                        else:
+                            self._unacked[seq][2] = now
+                            self._unacked[seq][3] = min(prto * 2,
+                                                        RUDP_RTO_MAX_S)
+                            self._unacked[seq][4] = True
+                if self._unacked:
+                    oldest = min(v[1] for v in self._unacked.values())
+                    if now - oldest > RUDP_DEAD_AFTER_S:
+                        self._closed = True
+                        try:
+                            self._inbox.put(None)
+                        except Exception:
+                            pass
+                        sock, self._sock = self._sock, None
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        return
+                if self._need_ack and now >= self._ack_due:
+                    try:
+                        self._sock.sendto(
+                            _rudp_packet(RUDP_TYPE_ACK, 0, self._recv_high,
+                                         0, 1, b"", self._send_key),
+                            self._peer_addr)
+                    except OSError:
+                        pass
+                    else:
+                        self._need_ack = False
+                self._pump_locked()
+                if self._closing and (self._fin_seq not in self._unacked
+                                      or (self._close_at is not None
+                                          and now >= self._close_at)):
+                    sock, self._sock = self._sock, None
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return
+
+
 # --- Online STUN client (spec section 8.1; one socket for everything) ---
 STUN_COOKIE = 0x2112A442
 STUN_BINDING_REQUEST = 0x0001

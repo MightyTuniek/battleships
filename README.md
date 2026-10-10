@@ -330,6 +330,11 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 ## Online play
 
 Peer-to-peer internet play with no server: `Main menu → Online Match → Host / Join`.
+New here? `Online Match → Play online (guided setup)` asks two plain questions,
+probes your network once, and jumps into the right flow; `VPN setup help` walks
+through Tailscale (any VPN works — ZeroTier, WireGuard, Hamachi and others are
+fine). Power users keep the raw host/join/settings flows under
+`Advanced Networking`.
 Single file, zero dependencies, standard library only. Direct flows use TCP; hole
 punch uses UDP (RUDP-lite) with one socket carrying STUN, punching and game traffic.
 In-game, `Online Match → How online play works` shows this same guide as boxed

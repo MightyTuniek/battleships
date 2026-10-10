@@ -12229,20 +12229,24 @@ ONLINE_GUIDE_SECTIONS = [
     ]),
     ("FLOW 1 - DIRECT CODE (EASIEST WHEN IT APPLIES)", [
         "Use when: same VPN, or the host has a port forward / UPnP.",
-        "HOST: Online Match > Host > Host direct code (TCP).",
-        "  The game tries UPnP unless Settings > UPnP is OFF.",
+        "HOST: guided setup > Host > same network — or Advanced",
+        "  Networking > Host > Host direct code (TCP).",
+        "  The game tries UPnP unless Advanced > Settings > UPnP is OFF.",
         "  Read the invite code + manual host:port line to the guest.",
-        "GUEST: Online Match > Join > Paste invite code. Play.",
+        "GUEST: guided setup > Join > invite code — or Advanced >",
+        "  Networking > Join > Paste invite code. Play.",
         "VPN tip: join the VPN first (Tailscale, ZeroTier, WireGuard)",
         "and use the VPN address. It always works. Say it out loud:",
         "'are you on the VPN address?' before anything else.",
     ]),
     ("FLOW 2 - HOLE PUNCH (BOTH BEHIND HOME ROUTERS)", [
         "Use when: no VPN, no port forward. Works on most home NAT.",
-        "HOST: Host > Host hole-punch offer. Note the STUN line:",
+        "HOST: guided setup > Host > different networks — or Advanced",
+        "  Networking > Host > Host hole-punch offer. Note the STUN line:",
         "  punchable = offer will likely work; anything else read on.",
         "  Read the OFFER code to the guest.",
-        "GUEST: Join > Paste the offer. The game STUNs your NAT,",
+        "GUEST: guided setup > Join > offer code — or Advanced > Join.",
+        "  The game STUNs your NAT,",
         "  shows YOUR ANSWER code: read it back to the host.",
         "HOST: paste the answer when asked. Both sides punch",
         "  (authenticated PUNCH / PUNCH-ACK, ~15 s window).",
@@ -12253,11 +12257,12 @@ ONLINE_GUIDE_SECTIONS = [
         "Use when: IPv6, DNS name, or codes will not scan/read.",
         "HOST: host direct as in Flow 1, but read the MANUAL line:",
         "  host:port PLUS the secret line (two parts, both needed).",
-        "GUEST: Join > Manual address. Type host:port, then secret.",
+        "GUEST: guided setup > Join > address + secret — or Advanced",
+        "  Networking > Join > Manual address. Type host:port, then secret.",
         "  Accepts 203.0.113.9:51234 and [2001:db8::1]:51234.",
     ]),
     ("REACHABILITY CHECK (HOST SEES THIS FIRST)", [
-        "The host menu probes UPnP + STUN in parallel and prints:",
+        "Guided setup probes UPnP + STUN in parallel and prints:",
         "  UPnP: found (external IP) = direct codes should work.",
         "  UPnP: CGNAT = mapping useless; punch or VPN instead.",
         "  STUN: punchable at ip:port = offers should work.",
@@ -12265,7 +12270,7 @@ ONLINE_GUIDE_SECTIONS = [
         "Then pick the offered flow. Manual is always offered.",
     ]),
     ("SETTINGS & FLAGS (MENU = CLI, NOTHING CLI-ONLY)", [
-        "Online > Settings mirrors every --online flag:",
+        "Advanced Networking > Settings mirrors every --online flag:",
         "  Name (20 chars) | Port (0 = random) | Bind address",
         "  Resume window s | Mode single/salvo | Anti-cheat hash/cell",
         "  Net debug (redacted logs) | STUN servers (repeatable)",
@@ -12328,6 +12333,287 @@ def _online_guide_lines():
 
 
 ONLINE_HOWTO = "\n".join(_online_guide_lines())
+
+
+ONLINE_VPN_SECTIONS = [
+    ("WHAT A VPN DOES", [
+        "A VPN puts both players on one private network, as if you",
+        "shared Wi-Fi. Firewalls and home NAT stop mattering: the",
+        "host's VPN address takes direct codes every time.",
+        "Any VPN works, free or paid. Pick ONE below; both install it,",
+        "both join the same network, then use the VPN address in Flow 1.",
+    ]),
+    ("OPTION 1 - TAILSCALE (STEP BY STEP)", [
+        "1. Install Tailscale on both computers (tailscale.com/download).",
+        "2. Both open it and LOG IN with the same kind of account.",
+        "3. Each copies their Tailscale IP (100.x.y.z, shown in the app).",
+        "4. Host: start guided setup > Host > same network, and read",
+        "   the invite code as usual.",
+        "5. Guest: join with the code. If asked for an address, use",
+        "   the HOST's 100.x.y.z address, not the home Wi-Fi one.",
+        "Stuck on login? One admin account can invite the other by email.",
+    ]),
+    ("OPTION 2 - ANY OTHER VPN", [
+        "ZeroTier, WireGuard, Hamachi, Radmin, a work VPN: all fine.",
+        "Steps are always the same:",
+        "1. Both install the same VPN and join the same network/name.",
+        "2. Both confirm they see each other (peer list / ping).",
+        "3. Play Flow 1 with the HOST's VPN address.",
+        "If it has a choice of virtual addresses, prefer IPv4.",
+    ]),
+    ("BACK IN THE GAME", [
+        "With the VPN connected: Online Match > Play online (guided",
+        "setup) > Host or Join > same network. Direct code, done.",
+        "No VPN? Guided setup probes your routers and offers hole",
+        "punch or the manual line instead.",
+    ]),
+]
+
+
+def _online_vpn_lines():
+    """Plain-text VPN help for typed terminals / tests."""
+    out = []
+    for title, lines in ONLINE_VPN_SECTIONS:
+        out.append(title)
+        out.extend(lines)
+        out.append("")
+    return out
+
+
+def show_online_vpn_help():
+    """Boxed, paged VPN setup help (both UI modes). Never raises."""
+    try:
+        if use_cursor_ui():
+            try:
+                clear()
+            except Exception:
+                pass
+            pages = [ONLINE_VPN_SECTIONS[i:i + 2]
+                     for i in range(0, len(ONLINE_VPN_SECTIONS), 2)]
+            try:
+                for num, page in enumerate(pages):
+                    for line in center_block(
+                            brand_masthead("Online VPN setup")):
+                        print(line)
+                    print()
+                    for title, lines in page:
+                        try:
+                            wrapped = [w for l in lines
+                                       for w in wrap_prose(l)]
+                        except Exception:
+                            wrapped = list(lines)
+                        for line in center_block(
+                                boxed_panel(title, wrapped, double=True)):
+                            print(line)
+                        print()
+                    last = num == len(pages) - 1
+                    for line in center_block(command_bar(
+                            [("ANY KEY", "return" if last else "next page")])):
+                        print(line)
+                    try:
+                        with KeyReader() as kr:
+                            kr.get_key()
+                    except Quit:
+                        return
+                    except Exception:
+                        try:
+                            ask("Enter to continue > ")
+                        except Quit:
+                            return
+                        return
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+                return
+            except Quit:
+                return
+            except Exception:
+                pass
+        page_lines(_online_vpn_lines())
+    except Quit:
+        return
+    except Exception:
+        try:
+            for line in _online_vpn_lines():
+                print(line)
+        except Exception:
+            pass
+
+
+def online_quiz_recommend(role, same_network=None, given=None, reach=None):
+    """Pure quiz recommendation for the guided setup (no I/O, testable).
+
+    role "host": same_network True skips the probe (direct). Otherwise
+    `reach` (an online_reachability dict) picks: UPnP-ok -> direct,
+    punchable -> punch, else -> vpn (manual always exists as fallback).
+    role "join": `given` is what the host shared: invite/offer/manual.
+    Returns (flow, explanation); flow is direct/punch/vpn/manual/ask.
+    """
+    if role == "join":
+        if given == "invite":
+            return ("direct", "Invite code: joining direct.")
+        if given == "offer":
+            return ("punch", "Offer code: answering the punch.")
+        if given == "manual":
+            return ("manual", "Address + secret: manual join.")
+        return ("ask", "Pick what the host gave you.")
+    if role != "host":
+        return ("ask", "Pick host or join first.")
+    if same_network:
+        return ("direct",
+                "Same VPN / Wi-Fi / forward: direct code is the simple path.")
+    try:
+        up = (reach or {}).get("upnp", {})
+        st = (reach or {}).get("stun", {})
+        upnp_ok = bool(up.get("found") and not up.get("cgnat"))
+        if upnp_ok:
+            return ("direct",
+                    "Your router takes a direct code (UPnP mapped it).")
+        if st.get("punchable"):
+            return ("punch",
+                    "Both behind home routers: hole punch should work.")
+        if up.get("found") and up.get("cgnat"):
+            return ("vpn",
+                    "Carrier-grade NAT: UPnP is useless and punching is "
+                    "unlikely. VPN is the reliable fix; manual works "
+                    "with a forward.")
+        return ("vpn",
+                "No verified path (phone hotspots and symmetric NAT "
+                "cause this). VPN is the reliable fix; manual works "
+                "with a forward.")
+    except Exception:
+        return ("vpn",
+                "Probe unreadable: VPN is the safest bet; manual works "
+                "with a forward.")
+
+
+def _online_guided_host(cfg, score, rules):
+    """Host side of the wizard: one plain question, probe, dispatch."""
+    while True:
+        header = "\n".join(brand_masthead("Guided setup — hosting"))
+        try:
+            idx = select_menu(header, [
+                "Same VPN / Wi-Fi / forwarded port (we play direct)",
+                "Different networks / not sure (check my routers)",
+                BACK_LABEL,
+            ])
+        except Quit:
+            return
+        if idx == 2:
+            return
+        if idx == 0:
+            _online_host_direct(cfg, score, rules)
+            return
+        print("Checking reachability (UPnP + STUN, a couple of seconds)...")
+        try:
+            reach = online_reachability(stun_servers=cfg.stun or None)
+        except Quit:
+            return
+        except Exception:
+            reach = None
+        if reach is not None:
+            up = reach["upnp"]
+            st = reach["stun"]
+            print("UPnP: %s. STUN: %s."
+                  % (("found (%s)" % up["external_ip"]) if up["found"]
+                     else up["reason"] or "unavailable",
+                     ("punchable at %s:%d" % st["mapped"]) if st["punchable"]
+                     else st["reason"]))
+        flow, note = online_quiz_recommend("host", False, None, reach)
+        print(note)
+        if flow == "direct":
+            _online_host_direct(cfg, score, rules)
+            return
+        if flow == "punch":
+            _online_host_punch(cfg, score, rules)
+            return
+        try:
+            pick = select_menu("\n".join(
+                brand_masthead("Guided setup — no direct path")), [
+                "See VPN setup help",
+                "Host manual line instead (needs a forward)",
+                BACK_LABEL,
+            ])
+        except Quit:
+            return
+        if pick == 2:
+            return
+        if pick == 0:
+            show_online_vpn_help()
+        else:
+            _online_host_direct(cfg, score, rules)
+            return
+
+
+def _online_guided_join(cfg, score, rules):
+    """Join side of the wizard: what did the host give you? Dispatch."""
+    header = "\n".join(brand_masthead("Guided setup — joining"))
+    try:
+        idx = select_menu(header, [
+            "Invite code (direct play)",
+            "Offer code (hole punch)",
+            "Address + secret (manual)",
+            BACK_LABEL,
+        ])
+    except Quit:
+        return
+    if idx == 3:
+        return
+    if idx == 2:
+        _online_join_manual(cfg, score, rules)
+        return
+    try:
+        code = ask("Invite / offer code > ")
+    except Quit:
+        return
+    if not code.strip():
+        return
+    try:
+        kind = online_code_kind(code.strip())
+    except BadInvite:
+        print(message_for("BAD_CODE"))
+        return
+    if kind == "answer":
+        print("That is an answer code: give it to the host, not to join.")
+        return
+    if kind != ("direct" if idx == 0 else "punch"):
+        print("That looks like %s code; using the right flow for it."
+              % kind)
+    if kind == "direct":
+        _online_join_direct(cfg, score, rules, code)
+    else:
+        _online_join_punch(cfg, score, rules, code)
+
+
+def online_guided_setup(cfg, score=None):
+    """Friendly wizard: setup -> host/join -> plain questions -> flow.
+
+    Auto-detection probes ONLY here (never on menu open). Existing
+    _online_host_*/_online_join_* flows are reused untouched.
+    """
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    header = "\n".join(brand_masthead("Play online — guided setup"))
+    try:
+        idx = select_menu(header, [
+            "Host a match (friends join me)",
+            "Join a match (a friend hosts)",
+            BACK_LABEL,
+        ])
+    except Quit:
+        return
+    if idx == 2:
+        return
+    if idx == 0:
+        _online_guided_host(cfg, score, rules)
+    else:
+        _online_guided_join(cfg, score, rules)
 
 
 def show_online_guide():
@@ -13099,18 +13385,17 @@ def online_join_menu(cfg, score=None):
         _online_join_punch(cfg, score, rules, code)
 
 
-def online_menu(cfg, score=None):
-    """Online submenu: host / join / settings / how-it-works."""
+def online_advanced_menu(cfg, score=None):
+    """Raw flows + settings, exactly as the old Online menu (power users)."""
     while True:
         header = "\n".join(
-            brand_masthead("Online — internet play") +
-            [paint("No server. Host shares a code, guest pastes it.", "grey"),
+            brand_masthead("Online — advanced networking") +
+            [paint("Raw flows and settings. Nothing is CLI-only.", "grey"),
              ""] + cfg.describe())
         opts = [
             "Host a match (show invite code)",
             "Join with invite code",
             "Settings (name, port, bind, resume, debug, STUN, UPnP)",
-            "How online play works",
             BACK_LABEL,
         ]
         try:
@@ -13125,6 +13410,34 @@ def online_menu(cfg, score=None):
             online_join_menu(cfg, score)
         elif idx == 2:
             online_settings_menu(cfg)
+
+
+def online_menu(cfg, score=None):
+    """Friendly entry: guided setup, VPN help, advanced, guide."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online — internet play") +
+            [paint("No server. Guided setup picks the right method for you.",
+                   "grey")])
+        opts = [
+            "Play online — guided setup (recommended)",
+            "VPN setup help",
+            "Advanced Networking (host / join / settings)",
+            "How online play works",
+            BACK_LABEL,
+        ]
+        try:
+            idx = select_menu(header, opts)
+        except Quit:
+            return
+        if idx == len(opts) - 1:
+            return
+        if idx == 0:
+            online_guided_setup(cfg, score)
+        elif idx == 1:
+            show_online_vpn_help()
+        elif idx == 2:
+            online_advanced_menu(cfg, score)
         elif idx == 3:
             show_online_guide()
 

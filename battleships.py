@@ -13599,6 +13599,8 @@ def main():
             return
 
         menu_sel = 0
+        single_sel = 0
+        multi_sel = 0
         while True:
             preset_name = next((name for name, s, fn in SETUP_PRESETS
                                 if s == SIZE and FLEET_PRESETS[fn] == FLEET), "custom")
@@ -13634,15 +13636,12 @@ def main():
                 header_lines.append("")
                 header_lines.extend(profile_panel)
             header_lines.append("")
-            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–8", "QUICK"), ("Q", "QUIT")]))
+            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–5", "QUICK"), ("Q", "QUIT")]))
             header = "\n".join(header_lines)
 
             menu_opts = [
-                "New game (vs computer)",
-                "Campaign (Easy → Nightmare)",
-                "Hotseat (2 players)",
-                "LAN Matchmaking",
-                "Online Match",
+                "Singleplayer",
+                "Multiplayer",
                 "How to play",
                 "Settings",
                 "Quit",
@@ -13652,11 +13651,39 @@ def main():
             if choice != -1:
                 menu_sel = choice
 
-            if choice == -1 or choice == 7:
+            if choice == -1 or choice == 4:
                 break
 
-            # --- New game -------------------------------------------------
+            # --- Singleplayer (AI + Campaign) -------------------------------
             if choice == 0:
+                sp_opts = [
+                    "Play vs AI",
+                    "Campaign (Easy → Nightmare)",
+                    "Back",
+                ]
+                sp = select_menu(header, sp_opts, start_idx=single_sel)
+                if sp != -1:
+                    single_sel = sp
+                if sp == -1 or sp == 2:
+                    continue
+
+                # --- Campaign -------------------------------------------
+                if sp == 1:
+                    wiz = _campaign_wizard(args)
+                    if wiz == BACK:
+                        continue
+                    mode, contrarian = wiz
+
+                    camp = CampaignGame(mode=mode, contrarian=contrarian)
+                    result = camp.run()
+                    if result in score:
+                        score[result] += 1
+                    print()
+                    print("Session score: you %d - %d computer" % (score["win"], score["loss"]))
+                    continue
+
+                # --- New game (vs AI) -----------------------------------
+                # sp == 0: fall through to the vs-AI wizard below.
                 need_setup = args.board is None and args.fleet is None
                 step = 0 if need_setup else 1
                 level_info = None
@@ -13722,46 +13749,46 @@ def main():
                         break
                 continue
 
-            # --- Campaign -------------------------------------------------
+            # --- Multiplayer (hotseat + LAN + online) ------------------------
             if choice == 1:
-                wiz = _campaign_wizard(args)
-                if wiz == BACK:
+                mp_opts = [
+                    "Hotseat (2 players)",
+                    "LAN Matchmaking",
+                    "Online Match",
+                    "Back",
+                ]
+                mp = select_menu(header, mp_opts, start_idx=multi_sel)
+                if mp != -1:
+                    multi_sel = mp
+                if mp == -1 or mp == 3:
                     continue
-                mode, contrarian = wiz
 
-                camp = CampaignGame(mode=mode, contrarian=contrarian)
-                result = camp.run()
-                if result in score:
-                    score[result] += 1
-                print()
-                print("Session score: you %d - %d computer" % (score["win"], score["loss"]))
-                continue
+                # --- Hotseat --------------------------------------------
+                if mp == 0:
+                    configure_board(10, "classic")
+                    HotseatGame().run()
+                    continue
 
-            # --- Hotseat --------------------------------------------------
-            if choice == 2:
-                configure_board(10, "classic")
-                HotseatGame().run()
-                continue
+                # --- LAN --------------------------------------------------
+                if mp == 1:
+                    configure_board(10, "classic")
+                    client = LANClient(port=args.lan_port)
+                    if args.lan_password:
+                        client.set_password(args.lan_password)
+                    client.run_lobby()
+                    for k, v in client.lan_score.items():
+                        lan_score[k] += v
+                    continue
 
-            # --- LAN ------------------------------------------------------
-            if choice == 3:
-                configure_board(10, "classic")
-                client = LANClient(port=args.lan_port)
-                if args.lan_password:
-                    client.set_password(args.lan_password)
-                client.run_lobby()
-                for k, v in client.lan_score.items():
-                    lan_score[k] += v
-                continue
-
-            # --- Online ---------------------------------------------------
-            if choice == 4:
-                online_menu(online_cfg, lan_score)
+                # --- Online -----------------------------------------------
+                if mp == 2:
+                    online_menu(online_cfg, lan_score)
+                    continue
                 continue
 
             # --- How to play ---------------------------------------------
-            if choice == 6: settings_menu(); continue
-            if choice == 5:
+            if choice == 3: settings_menu(); continue
+            if choice == 2:
                 if use_cursor_ui():
                     clear()
                     for line in center_block(brand_masthead("Field manual")):

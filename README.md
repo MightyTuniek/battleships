@@ -57,14 +57,11 @@ python3 battleships.py
 
 Main menu:
 
-1. `New game (vs computer)`
-2. `Campaign (Easy → Nightmare)`
-3. `Hotseat (2 players)`
-4. `LAN Matchmaking`
-5. `Online Match`
-6. `How to play`
-7. `Settings`
-8. `Quit`
+1. `Singleplayer` → `Play vs AI` | `Campaign (Easy → Nightmare)`
+2. `Multiplayer` → `Hotseat (2 players)` | `LAN Matchmaking` | `Online Match`
+3. `How to play`
+4. `Settings`
+5. `Quit`
 
 You fire first in solo games. First to sink the entire enemy fleet wins.
 
@@ -329,7 +326,7 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 
 ## Online play
 
-Peer-to-peer internet play with no server: `Main menu → Online Match → Host / Join`.
+Peer-to-peer internet play with no server: `Main menu → Multiplayer → Online Match → Host / Join`.
 New here? `Online Match → Play online (guided setup)` asks two plain questions,
 probes your network once, and jumps into the right flow; `VPN setup help` walks
 through Tailscale (any VPN works — ZeroTier, WireGuard, Hamachi and others are

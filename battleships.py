@@ -28,7 +28,17 @@ import hashlib
 import hmac
 import queue
 import secrets
+import struct
+import base64
+import zlib
+import ipaddress
 import collections
+import atexit
+import signal
+import urllib.request
+import urllib.parse
+import urllib.error
+import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass, field
 from typing import (
@@ -9661,6 +9671,3777 @@ def _campaign_wizard(args):
                 return (mode, bool(res))
 
 
+# ----------------------------------------------------------------------------
+# Online P2P mode (stdlib only, single-file).
+#
+# Adaptation note: the P2P spec was written around a net/ package with
+# asyncio. This repo is a single-file, synchronous (threads + blocking
+# sockets) game, and the game MUST stay single file — so the whole online
+# stack lives in this section, using blocking sockets + threads behind the
+# same Transport/Session seams. LAN mode above is untouched.
+# ----------------------------------------------------------------------------
+
+# --- Online constants (spec section 3.1; no magic numbers elsewhere) ---
+PROTOCOL_VERSION = 1
+SECRET_BYTES = 10
+MAC_BYTES = 16
+NONCE_BYTES_TCP = 16
+NONCE_BYTES_UDP = 8
+MAX_HANDSHAKE_BYTES = 1024
+MAX_FRAME_BYTES = 65536
+HANDSHAKE_TIMEOUT_S = 10
+FRAME_READ_TIMEOUT_S = 10
+HANDSHAKE_FAIL_LIMIT = 3
+FAIL_DELAY_RANGE_S = (0.2, 0.5)
+PING_INTERVAL_S = 5
+DEAD_AFTER_S = 20
+RESUME_WINDOW_S = 120
+OUTBOUND_BUFFER_MAX = 1000
+STUN_TIMEOUT_S = 1.5
+STUN_RETRIES = 2
+STUN_DEFAULT_PORT = 3478
+DEFAULT_STUN_SERVERS = (
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun2.l.google.com:19302",
+    "stun3.l.google.com:19302",
+)
+PUNCH_INTERVAL_S = 0.25
+PUNCH_WINDOW_S = 15
+ADDR_MIGRATE_MIN_S = 5
+RUDP_MAGIC = 0xB5
+RUDP_MAX_PAYLOAD = 1100
+RUDP_MAX_FRAGMENTS = 64
+RUDP_WINDOW = 16
+RUDP_REORDER_BUFFER = 32
+RUDP_ACK_DELAY_S = 0.02
+RUDP_RTO_INITIAL_S = 0.4
+RUDP_RTO_MAX_S = 4
+RUDP_DEAD_AFTER_S = 30
+SSDP_ADDR = ("239.255.255.250", 1900)
+SSDP_WAIT_S = 2
+UPNP_LEASE_S = 3600
+NAME_MAX_CHARS = 20
+CHAT_MAX_CHARS = 200
+CHAT_RATE_PER_S = 5
+
+
+# --- Online errors (each carries a UI reason code) ---
+class NetError(Exception):
+    def __init__(self, msg="", reason="PROTOCOL_ERROR"):
+        super().__init__(msg or reason)
+        self.reason = reason
+
+
+class TransportClosed(NetError):
+    def __init__(self, msg="", reason="LINK_LOST"):
+        super().__init__(msg, reason)
+
+
+class SessionLost(NetError):
+    def __init__(self, msg="", reason="LINK_LOST"):
+        super().__init__(msg, reason)
+
+
+class HandshakeFailed(NetError):
+    def __init__(self, msg="", reason="BAD_CODE"):
+        super().__init__(msg, reason)
+
+
+class BadInvite(NetError):
+    def __init__(self, msg="", reason="BAD_CODE"):
+        super().__init__(msg, reason)
+
+
+class ProtocolError(NetError):
+    def __init__(self, msg="", reason="PROTOCOL_ERROR"):
+        super().__init__(msg, reason)
+
+
+class RulesMismatch(NetError):
+    def __init__(self, msg="", reason="RULES_MISMATCH"):
+        super().__init__(msg, reason)
+
+
+class VersionMismatch(NetError):
+    def __init__(self, msg="", reason="VERSION"):
+        super().__init__(msg, reason)
+
+
+ONLINE_REASONS = (
+    "TIMEOUT",
+    "BAD_CODE",
+    "VERSION",
+    "RULES_MISMATCH",
+    "PEER_LEFT",
+    "LINK_LOST",
+    "PROTOCOL_ERROR",
+)
+
+ONLINE_REASON_MESSAGES = {
+    "TIMEOUT": "Timeout — packets are being dropped by a NAT or firewall; try a VPN or hole punch.",
+    "BAD_CODE": "Wrong code — check the invite and try again.",
+    "VERSION": "Version mismatch — both players must run the same game version.",
+    "RULES_MISMATCH": "Rules mismatch — board size / fleet / mode differ.",
+    "PEER_LEFT": "Opponent left the game.",
+    "LINK_LOST": "Connection lost — attempting to reconnect.",
+    "PROTOCOL_ERROR": "Protocol error — connection closed.",
+    "REFUSED": "Connection refused — the host is not listening, or a firewall is rejecting.",
+}
+
+
+def message_for(reason):
+    return ONLINE_REASON_MESSAGES.get(reason, ONLINE_REASON_MESSAGES["PROTOCOL_ERROR"])
+
+
+# --- Online crypto (spec section 5; authentication + integrity, no cipher) ---
+def mac16(key, data):
+    return hmac.new(key, data, hashlib.sha256).digest()[:MAC_BYTES]
+
+
+def verify_mac16(key, data, tag):
+    if len(tag) != MAC_BYTES:
+        return False
+    return hmac.compare_digest(mac16(key, data), tag)
+
+
+def hkdf(secret, salt, info):
+    prk = hmac.new(salt, secret, hashlib.sha256).digest()
+    return hmac.new(prk, info + bytes([1]), hashlib.sha256).digest()
+
+
+def derive_keys(secret, nonce_h, nonce_g):
+    salt = nonce_h + nonce_g
+    k_hg = hkdf(secret, salt, b"bs1 host->guest")
+    k_gh = hkdf(secret, salt, b"bs1 guest->host")
+    k_resume = hkdf(secret, salt, b"bs1 resume")
+    return k_hg, k_gh, k_resume
+
+
+def proof_h(secret, nonce_g, nonce_h):
+    return hmac.new(secret, b"H" + nonce_g + nonce_h, hashlib.sha256).digest()
+
+
+def proof_g(secret, nonce_h, nonce_g):
+    return hmac.new(secret, b"G" + nonce_h + nonce_g, hashlib.sha256).digest()
+
+
+def new_secret():
+    return secrets.token_bytes(SECRET_BYTES)
+
+
+def new_nonce(n):
+    return secrets.token_bytes(n)
+
+
+# --- Online invite codes (spec section 4; 20 bytes -> 32 base32 chars) ---
+FLAG_DIRECT = 0
+FLAG_PUNCH = 1
+
+
+def encode_invite(ip, port, secret, flags=0):
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    try:
+        packed_ip = ipaddress.IPv4Address(ip).packed
+    except Exception as exc:
+        raise BadInvite("bad ip: %s" % exc)
+    if not 0 <= port <= 65535:
+        raise BadInvite("bad port")
+    body = struct.pack(">BB4sH10s", PROTOCOL_VERSION, flags & 0xFF,
+                       packed_ip, port, secret)
+    raw = body + struct.pack(">H", zlib.crc32(body) & 0xFFFF)
+    s = base64.b32encode(raw).decode()
+    return "-".join(s[i:i + 4] for i in range(0, 32, 4))
+
+
+def decode_invite(text):
+    s = text.upper().replace("-", "").replace(" ", "")
+    s = s.translate(str.maketrans("018", "OIB"))
+    try:
+        raw = base64.b32decode(s)
+    except Exception as exc:
+        raise BadInvite("bad code: %s" % exc)
+    if len(raw) != 20:
+        raise BadInvite("bad code length")
+    body, (crc,) = raw[:-2], struct.unpack(">H", raw[-2:])
+    if zlib.crc32(body) & 0xFFFF != crc:
+        raise BadInvite("bad code")
+    try:
+        ver, flags, ip_packed, port, secret = struct.unpack(">BB4sH10s", body)
+    except struct.error as exc:
+        raise BadInvite("bad code: %s" % exc)
+    if ver != PROTOCOL_VERSION:
+        raise VersionMismatch("protocol version %d" % ver)
+    return ver, flags, str(ipaddress.IPv4Address(ip_packed)), port, secret
+
+
+def encode_secret_line(secret):
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    return base64.b32encode(secret).decode()
+
+
+def decode_secret_line(text):
+    s = text.upper().replace("-", "").replace(" ", "")
+    s = s.translate(str.maketrans("018", "OIB"))
+    try:
+        raw = base64.b32decode(s)
+    except Exception as exc:
+        raise BadInvite("bad secret: %s" % exc)
+    if len(raw) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    return raw
+
+
+# --- Online framing (spec section 6): u32 BE len | body | mac16 ---
+def seal(key, counter, body):
+    if len(body) > MAX_FRAME_BYTES:
+        raise ProtocolError("frame too large")
+    tag = mac16(key, struct.pack(">Q", counter) + body)
+    return struct.pack(">I", len(body)) + body + tag
+
+
+def open_frame(key, counter, packet):
+    if len(packet) < 4 + MAC_BYTES:
+        raise ProtocolError("short frame")
+    (n,) = struct.unpack(">I", packet[:4])
+    if n > MAX_FRAME_BYTES:
+        raise ProtocolError("frame too large")
+    if len(packet) != 4 + n + MAC_BYTES:
+        raise ProtocolError("frame length mismatch")
+    body = packet[4:4 + n]
+    tag = packet[4 + n:]
+    if not verify_mac16(key, struct.pack(">Q", counter) + body, tag):
+        raise ProtocolError("bad mac")
+    return body
+
+
+class FrameDecoder:
+    """Incremental decoder; feed arbitrary chunks, get verified bodies."""
+
+    def __init__(self, key):
+        self._key = key
+        self._buf = bytearray()
+        self._counter = 0
+
+    @property
+    def counter(self):
+        return self._counter
+
+    def feed(self, data):
+        self._buf += data
+        out = []
+        while True:
+            if len(self._buf) < 4:
+                break
+            (n,) = struct.unpack(">I", bytes(self._buf[:4]))
+            if n > MAX_FRAME_BYTES:
+                raise ProtocolError("frame too large")
+            need = 4 + n + MAC_BYTES
+            if len(self._buf) < need:
+                break
+            packet = bytes(self._buf[:need])
+            del self._buf[:need]
+            out.append(open_frame(self._key, self._counter, packet))
+            self._counter += 1
+        return out
+
+
+# --- Online transport seams (spec section 3; blocking — repo is sync) ---
+class Transport:
+    """Reliable, ordered, authenticated stream of byte frames (blocking)."""
+
+    def send(self, frame):
+        raise NotImplementedError
+
+    def recv(self):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+    @property
+    def peer(self):
+        raise NotImplementedError
+
+
+class LanTransport(Transport):
+    """Behavior-preserving adapter over the LAN wire recipe.
+
+    Uses the exact byte recipe as send_json_obj/sign_obj above: canonical
+    JSON (sort_keys, compact separators) + "\\n", optional HMAC-hex "mac".
+    LAN mode itself is untouched; this only gives online code a seam.
+    """
+
+    def __init__(self, sock, key=None):
+        self._sock = sock
+        self._key = key
+        self._send_lock = threading.Lock()
+        self._inbox = queue.Queue()
+        self._closed = False
+        self._reader = None
+        try:
+            peer = sock.getpeername()
+        except Exception:
+            try:
+                peer = sock.getsockname()
+            except Exception:
+                peer = ("?", 0)
+        self._peer = peer
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    @property
+    def peer(self):
+        return self._peer
+
+    @staticmethod
+    def encode_frame(obj, key=None):
+        body = dict(obj)
+        body.pop("mac", None)
+        if key is not None:
+            payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
+            body["mac"] = hmac.new(key, payload.encode("utf-8"),
+                                   hashlib.sha256).hexdigest()
+        return (json.dumps(body, sort_keys=True,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+
+    @staticmethod
+    def decode_frame(line, key=None):
+        try:
+            text = line.decode("utf-8")
+        except Exception:
+            return None
+        try:
+            obj = json.loads(text.strip())
+        except ValueError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if key is not None:
+            mac = obj.pop("mac", None)
+            payload = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+            expected = hmac.new(key, payload.encode("utf-8"),
+                                hashlib.sha256).hexdigest()
+            if mac is None or not hmac.compare_digest(expected, str(mac)):
+                return None
+        return obj
+
+    def send(self, frame):
+        if self._closed:
+            raise TransportClosed("closed")
+        with self._send_lock:
+            self._sock.sendall(frame)
+
+    def send_obj(self, obj):
+        self.send(self.encode_frame(obj, self._key))
+
+    def _read_loop(self):
+        try:
+            self._sock.settimeout(2.0)
+        except OSError:
+            pass
+        try:
+            f = self._sock.makefile("r", encoding="utf-8")
+        except OSError:
+            self._finish()
+            return
+        self._reader = f
+        while not self._closed:
+            try:
+                line = f.readline(65536)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                break
+            if not line:
+                break
+            if not line.endswith("\n"):
+                break
+            obj = self.decode_frame(line.encode("utf-8"), self._key)
+            if obj is None:
+                continue
+            raw = json.dumps(obj, sort_keys=True,
+                             separators=(",", ":")).encode()
+            try:
+                self._inbox.put(raw)
+            except Exception:
+                pass
+        self._finish()
+
+    def _finish(self):
+        self._closed = True
+        try:
+            if self._reader is not None:
+                self._reader.close()
+        except Exception:
+            pass
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        try:
+            self._inbox.put(b"")
+        except Exception:
+            pass
+
+    def recv(self):
+        data = self._inbox.get()
+        if data == b"":
+            raise TransportClosed("closed")
+        return data
+
+    def close(self):
+        # Never touch the makefile here: closing it from another thread
+        # while the reader is blocked inside readline deadlocks on
+        # Windows. Shutdown wakes the reader; it closes its own file.
+        self._closed = True
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class TcpTransport(Transport):
+    """Sealed-frame stream over TCP (spec section 6). Single writer lock."""
+
+    def __init__(self, sock, send_key, recv_key):
+        self._sock = sock
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+        self._send_key = send_key
+        self._send_counter = 0
+        self._send_lock = threading.Lock()
+        self._decoder = FrameDecoder(recv_key)
+        self._inbox = queue.Queue()
+        self._closed = False
+        self._close_lock = threading.Lock()
+        try:
+            self._peer = sock.getpeername()
+        except OSError:
+            self._peer = ("?", 0)
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    @property
+    def peer(self):
+        return self._peer
+
+    def send(self, frame):
+        if len(frame) > MAX_FRAME_BYTES:
+            raise ProtocolError("frame too large")
+        with self._send_lock:
+            if self._closed:
+                raise TransportClosed("closed")
+            packet = seal(self._send_key, self._send_counter, frame)
+            self._send_counter += 1
+            try:
+                self._sock.sendall(packet)
+            except OSError as exc:
+                self._mark_closed()
+                raise TransportClosed(str(exc))
+
+    def recv(self, timeout=None):
+        try:
+            frame = self._inbox.get(timeout=timeout)
+        except Exception:
+            raise TransportClosed("closed")
+        if frame is None:
+            raise TransportClosed("closed")
+        return frame
+
+    def close(self):
+        self._mark_closed()
+
+    def _mark_closed(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        try:
+            self._inbox.put(None)
+        except Exception:
+            pass
+
+    def _read_loop(self):
+        try:
+            self._sock.settimeout(FRAME_READ_TIMEOUT_S)
+        except OSError:
+            pass
+        while not self._closed:
+            try:
+                chunk = self._sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            try:
+                for body in self._decoder.feed(chunk):
+                    try:
+                        self._inbox.put(body)
+                    except Exception:
+                        pass
+            except ProtocolError:
+                break
+        self._mark_closed()
+
+
+def recv_exact(sock, n, timeout):
+    if n > MAX_FRAME_BYTES + MAC_BYTES + 4:
+        raise ProtocolError("frame too large")
+    sock.settimeout(timeout)
+    out = bytearray()
+    start = time.time()
+    while len(out) < n:
+        if time.time() - start >= timeout:
+            raise TransportClosed("timeout")
+        try:
+            chunk = sock.recv(n - len(out))
+        except OSError as exc:
+            raise TransportClosed(str(exc))
+        if not chunk:
+            raise TransportClosed("eof")
+        out += chunk
+    return bytes(out)
+
+
+# --- Online RUDP-lite + UDP transport (spec section 8.4) ---
+RUDP_TYPE_PUNCH = 1
+RUDP_TYPE_PUNCH_ACK = 2
+RUDP_TYPE_DATA = 3
+RUDP_TYPE_ACK = 4
+RUDP_TYPE_FIN = 5
+_RUDP_HEADER = struct.Struct(">BBIIBB")
+_RUDP_SEQ_MASK = 0xFFFFFFFF
+
+
+def _rudp_le(a, b):
+    """a <= b in u32 sequence space (wraps safely)."""
+    return ((b - a) & _RUDP_SEQ_MASK) <= 0x7FFFFFFF
+
+
+def _rudp_packet(ptype, seq, ack, frag_idx, frag_cnt, payload, key):
+    header = _RUDP_HEADER.pack(RUDP_MAGIC, ptype, seq & _RUDP_SEQ_MASK,
+                              ack & _RUDP_SEQ_MASK, frag_idx, frag_cnt)
+    return header + payload + mac16(key, header + payload)
+
+
+def _rudp_parse(datagram, key):
+    """(ptype, seq, ack, frag_idx, frag_cnt, payload) or None when the
+    datagram is unauthenticated. Unauthenticated input is dropped
+    silently with no reply (no amplification)."""
+    if len(datagram) < _RUDP_HEADER.size + MAC_BYTES:
+        return None
+    header, payload_mac = datagram[:_RUDP_HEADER.size], datagram[_RUDP_HEADER.size:]
+    try:
+        magic, ptype, seq, ack, frag_idx, frag_cnt = _RUDP_HEADER.unpack(header)
+    except struct.error:
+        return None
+    if magic != RUDP_MAGIC:
+        return None
+    if ptype not in (RUDP_TYPE_PUNCH, RUDP_TYPE_PUNCH_ACK, RUDP_TYPE_DATA,
+                     RUDP_TYPE_ACK, RUDP_TYPE_FIN):
+        return None
+    payload, tag = payload_mac[:-MAC_BYTES], payload_mac[-MAC_BYTES:]
+    if len(payload) > RUDP_MAX_PAYLOAD:
+        return None
+    if not hmac.compare_digest(mac16(key, header + payload), tag):
+        return None
+    return ptype, seq, ack, frag_idx, frag_cnt, payload
+
+
+class UdpTransport(Transport):
+    """Reliable ordered authenticated stream over one UDP socket.
+
+    Same blocking surface as TcpTransport (send/recv/close/peer), so the
+    session layer is untouched. RUDP-lite: per-fragment sequences,
+    cumulative acks, 16-packet window, delayed ack, RFC 6298-style RTO,
+    32-packet reorder buffer, FIN close, dead-after-silence.
+    """
+
+    def __init__(self, sock, peer_addr, send_key, recv_key):
+        self._sock = sock
+        self._peer_addr = peer_addr
+        self._send_key = bytes(send_key)
+        self._recv_key = bytes(recv_key)
+        self._lock = threading.Lock()
+        self._next_seq = 0
+        self._unacked = {}
+        self._out = collections.deque()
+        self._inbox = queue.Queue()
+        self._recv_next = 0
+        self._recv_buf = {}
+        self._group_cnt = 0
+        self._group_parts = {}
+        self._need_ack = False
+        self._ack_due = 0.0
+        self._srtt = RUDP_RTO_INITIAL_S
+        self._rttvar = RUDP_RTO_INITIAL_S / 2
+        self._rto = RUDP_RTO_INITIAL_S
+        self._last_switch = 0.0
+        self._last_ack = None
+        self._dup_acks = 0
+        self._closed = False
+        self._closing = False
+        self._close_at = None
+        self._fin_seq = None
+        self._peer_done = False
+        try:
+            sock.settimeout(0.5)
+        except OSError:
+            pass
+        self._rx_thread = threading.Thread(target=self._recv_loop,
+                                           daemon=True)
+        self._rx_thread.start()
+        self._tm_thread = threading.Thread(target=self._timer_loop,
+                                           daemon=True)
+        self._tm_thread.start()
+
+    @property
+    def peer(self):
+        with self._lock:
+            return self._peer_addr
+
+    @property
+    def _recv_high(self):
+        return (self._recv_next - 1) & _RUDP_SEQ_MASK
+
+    def send(self, frame):
+        if len(frame) > RUDP_MAX_FRAGMENTS * RUDP_MAX_PAYLOAD:
+            raise ProtocolError("frame needs too many fragments")
+        frags = [frame[i:i + RUDP_MAX_PAYLOAD]
+                 for i in range(0, max(1, len(frame)), RUDP_MAX_PAYLOAD)]
+        if not frags:
+            frags = [b""]
+        with self._lock:
+            if self._closed:
+                raise TransportClosed("closed")
+            cnt = len(frags)
+            for idx, payload in enumerate(frags):
+                seq = self._next_seq
+                self._next_seq = (self._next_seq + 1) & _RUDP_SEQ_MASK
+                self._out.append((seq, RUDP_TYPE_DATA, idx, cnt, payload))
+            self._pump_locked()
+
+    def recv(self, timeout=None):
+        try:
+            msg = self._inbox.get(timeout=timeout)
+        except Exception:
+            raise TransportClosed("closed")
+        if msg is None:
+            raise TransportClosed("closed")
+        return msg
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closing = True
+            self._close_at = time.monotonic() + 1.0
+            seq = self._next_seq
+            self._next_seq = (self._next_seq + 1) & _RUDP_SEQ_MASK
+            self._fin_seq = seq
+            self._out.append((seq, RUDP_TYPE_FIN, 0, 1, b""))
+            self._pump_locked()
+            self._closed = True
+            try:
+                self._inbox.put(None)
+            except Exception:
+                pass
+
+    def _pump_locked(self):
+        while self._out and len(self._unacked) < RUDP_WINDOW:
+            seq, ptype, idx, cnt, payload = self._out.popleft()
+            datagram = _rudp_packet(ptype, seq, self._recv_high, idx, cnt,
+                                    payload, self._send_key)
+            try:
+                self._sock.sendto(datagram, self._peer_addr)
+            except OSError:
+                self._out.appendleft((seq, ptype, idx, cnt, payload))
+                return
+            now = time.monotonic()
+            self._unacked[seq] = [datagram, now, now, self._rto, False]
+            self._need_ack = False
+
+    def _on_ack_locked(self, ack):
+        if self._last_ack is None or (_rudp_le(self._last_ack, ack)
+                                      and self._last_ack != ack):
+            self._last_ack = ack
+            self._dup_acks = 0
+        elif ack == self._last_ack and self._unacked:
+            self._dup_acks += 1
+            if self._dup_acks == 3:
+                # Fast retransmit: resend the lowest unacked now instead
+                # of waiting out the RTO (wire format unchanged).
+                low = min(self._unacked)
+                entry = self._unacked[low]
+                try:
+                    self._sock.sendto(entry[0], self._peer_addr)
+                except OSError:
+                    pass
+                else:
+                    entry[2] = time.monotonic()
+                    entry[4] = True
+                self._dup_acks = 0
+        newly = [s for s in self._unacked if _rudp_le(s, ack)]
+        if not newly:
+            return
+        now = time.monotonic()
+        fresh = [s for s in newly if not self._unacked[s][4]]
+        sample = now - self._unacked[fresh[-1]][1] if fresh else None
+        for s in newly:
+            del self._unacked[s]
+        if fresh:
+            # Karn: only packets sent once give RTT samples; the latest
+            # fresh ack is the most current signal.
+            if sample is not None and sample > 0:
+                self._rttvar = (0.75 * self._rttvar
+                                + 0.25 * abs(self._srtt - sample))
+                self._srtt = 0.875 * self._srtt + 0.125 * sample
+                floor = RUDP_ACK_DELAY_S
+                self._rto = min(max(self._srtt + 4 * self._rttvar, floor),
+                                RUDP_RTO_MAX_S)
+        self._pump_locked()
+
+    def _recv_loop(self):
+        while True:
+            try:
+                sock = self._sock
+                if sock is None:
+                    return
+                data, src = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            parsed = _rudp_parse(data, self._recv_key)
+            if parsed is None:
+                continue
+            ptype, seq, ack, frag_idx, frag_cnt, payload = parsed
+            with self._lock:
+                if self._closed and not self._closing:
+                    return
+                if src != self._peer_addr:
+                    now = time.monotonic()
+                    if now - self._last_switch >= ADDR_MIGRATE_MIN_S:
+                        self._peer_addr = src
+                        self._last_switch = now
+                self._on_ack_locked(ack)
+                if ptype in (RUDP_TYPE_PUNCH, RUDP_TYPE_PUNCH_ACK):
+                    continue
+                if ptype == RUDP_TYPE_ACK:
+                    continue
+                if self._peer_done:
+                    continue
+                if ptype == RUDP_TYPE_FIN:
+                    self._recv_buf[seq] = ("FIN", 0, payload)
+                elif ptype == RUDP_TYPE_DATA:
+                    delivered = seq != self._recv_next and _rudp_le(
+                        seq, (self._recv_next - 1) & _RUDP_SEQ_MASK)
+                    if not delivered and seq not in self._recv_buf:
+                        if len(self._recv_buf) < RUDP_REORDER_BUFFER \
+                                or seq == self._recv_next:
+                            self._recv_buf[seq] = (frag_idx, frag_cnt,
+                                                   payload)
+                        # else: reorder buffer full; drop, peer retransmits
+                    # else: duplicate; ack again below
+                else:
+                    continue
+                self._need_ack = True
+                self._ack_due = time.monotonic() + RUDP_ACK_DELAY_S
+                self._deliver_locked()
+
+    def _deliver_locked(self):
+        while self._recv_next in self._recv_buf:
+            entry = self._recv_buf.pop(self._recv_next)
+            if entry[0] == "FIN":
+                self._recv_next = (self._recv_next + 1) & _RUDP_SEQ_MASK
+                self._peer_done = True
+                try:
+                    self._inbox.put(None)
+                except Exception:
+                    pass
+                return
+            frag_idx, frag_cnt, payload = entry
+            if frag_idx == 0 or frag_cnt != self._group_cnt:
+                # New message (or resync after a violation): restart group.
+                self._group_cnt = frag_cnt
+                self._group_parts = {}
+            self._group_parts[frag_idx] = payload
+            self._recv_next = (self._recv_next + 1) & _RUDP_SEQ_MASK
+            if len(self._group_parts) == self._group_cnt and set(
+                    self._group_parts) == set(range(self._group_cnt)):
+                msg = b"".join(self._group_parts[i]
+                               for i in range(self._group_cnt))
+                self._group_parts = {}
+                try:
+                    self._inbox.put(msg)
+                except Exception:
+                    pass
+
+    def _timer_loop(self):
+        while True:
+            time.sleep(0.01)
+            with self._lock:
+                if self._sock is None:
+                    return
+                now = time.monotonic()
+                for seq in list(self._unacked):
+                    _dg, first, last, prto, _rex = self._unacked[seq]
+                    if now - last >= prto:
+                        try:
+                            self._sock.sendto(_dg, self._peer_addr)
+                        except OSError:
+                            pass
+                        else:
+                            self._unacked[seq][2] = now
+                            self._unacked[seq][3] = min(prto * 2,
+                                                        RUDP_RTO_MAX_S)
+                            self._unacked[seq][4] = True
+                if self._unacked:
+                    oldest = min(v[1] for v in self._unacked.values())
+                    if now - oldest > RUDP_DEAD_AFTER_S:
+                        self._closed = True
+                        try:
+                            self._inbox.put(None)
+                        except Exception:
+                            pass
+                        sock, self._sock = self._sock, None
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        return
+                if self._need_ack and now >= self._ack_due:
+                    try:
+                        self._sock.sendto(
+                            _rudp_packet(RUDP_TYPE_ACK, 0, self._recv_high,
+                                         0, 1, b"", self._send_key),
+                            self._peer_addr)
+                    except OSError:
+                        pass
+                    else:
+                        self._need_ack = False
+                self._pump_locked()
+                if self._closing and (self._fin_seq not in self._unacked
+                                      or (self._close_at is not None
+                                          and now >= self._close_at)):
+                    sock, self._sock = self._sock, None
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    return
+
+
+# --- Online hole punch (spec section 8.3) ---
+def punch_candidates(peer):
+    """Candidate endpoints from a decoded offer/answer dict.
+
+    Public endpoint first, LAN candidate second (lock-on may pick LAN).
+    """
+    cands = [(peer["pub"][0], peer["pub"][1])]
+    if peer.get("lan") is not None:
+        cands.append((peer["lan"][0], peer["lan"][1]))
+    return cands
+
+
+def punch_session_id(secret, nonce_h, nonce_g):
+    """Session id shared without exchange: both sides know all inputs."""
+    return hashlib.sha256(bytes(secret) + b"|udp-session|"
+                          + bytes(nonce_h) + b"|"
+                          + bytes(nonce_g)).hexdigest()[:16]
+
+
+def punch_connect(sock, candidates, send_key, recv_key, local_nonce,
+                  peer_nonce=None, window=None, interval=None):
+    """PUNCH every interval to each candidate until valid packets flow both
+    ways, then return (peer_addr, info). Locks onto the authenticated
+    source address. Raises HandshakeFailed on expiry (reason TIMEOUT)."""
+    window = PUNCH_WINDOW_S if window is None else window
+    interval = PUNCH_INTERVAL_S if interval is None else interval
+    try:
+        old_timeout = sock.gettimeout()
+    except OSError:
+        raise HandshakeFailed("punch socket gone", reason="TIMEOUT")
+    try:
+        sock.settimeout(interval)
+    except OSError:
+        raise HandshakeFailed("punch socket gone", reason="TIMEOUT")
+    punch_pkt = _rudp_packet(RUDP_TYPE_PUNCH, 0, 0, 0, 1,
+                             bytes(local_nonce), bytes(send_key))
+    ack_pkt = _rudp_packet(RUDP_TYPE_PUNCH_ACK, 0, 0, 0, 1,
+                           bytes(local_nonce), bytes(send_key))
+    got_punch, got_ack, peer_addr = False, False, None
+    deadline = time.monotonic() + window
+    last_send = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if got_punch and got_ack:
+                break
+            if now >= deadline:
+                break
+            if now - last_send >= interval:
+                for cand in candidates:
+                    try:
+                        sock.sendto(punch_pkt, (cand[0], cand[1]))
+                    except OSError:
+                        pass
+                last_send = now
+            try:
+                data, src = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError as exc:
+                raise HandshakeFailed("punch io error: %s" % exc,
+                                      reason="TIMEOUT")
+            parsed = _rudp_parse(data, bytes(recv_key))
+            if parsed is None:
+                continue
+            ptype, _s, _a, _fi, _fc, payload = parsed
+            if ptype == RUDP_TYPE_PUNCH:
+                if peer_nonce is not None and bytes(payload) != bytes(
+                        peer_nonce):
+                    continue
+                if peer_addr is None:
+                    peer_addr = src
+                got_punch = True
+                try:
+                    sock.sendto(ack_pkt, src)
+                except OSError:
+                    pass
+            elif ptype == RUDP_TYPE_PUNCH_ACK:
+                if peer_nonce is not None and bytes(payload) != bytes(
+                        peer_nonce):
+                    continue
+                if peer_addr is None:
+                    peer_addr = src
+                got_ack = True
+    finally:
+        try:
+            sock.settimeout(old_timeout)
+        except OSError:
+            pass
+    if not (got_punch and got_ack):
+        raise HandshakeFailed(
+            "hole punch timed out with no two-way path; likely symmetric "
+            "NAT or a carrier-grade NAT. Punching will not work here: use "
+            "a VPN, a port forward or UPnP direct mode.",
+            reason="TIMEOUT")
+    return peer_addr, {"got_punch": got_punch, "got_ack": got_ack}
+
+
+# --- Online reachability + UDP ready (spec sections 8.3, 10) ---
+def online_code_kind(code):
+    """'direct' | 'offer' | 'answer' by trial decode; BadInvite otherwise."""
+    try:
+        decode_invite(code)
+        return "direct"
+    except VersionMismatch:
+        return "direct"
+    except BadInvite:
+        pass
+    try:
+        decode_offer(code)
+        return "offer"
+    except VersionMismatch:
+        return "offer"
+    except BadInvite:
+        pass
+    try:
+        decode_answer(code)
+        return "answer"
+    except VersionMismatch:
+        return "answer"
+    except BadInvite:
+        pass
+    raise BadInvite("unrecognized code")
+
+
+def plan_host_options(upnp_available=False, stun_punchable=False,
+                      user_direct=False):
+    """Pure planner (spec section 10): which host flows to offer.
+
+    Returns {flow: (offered, note)}. Manual is always available.
+    """
+    direct = bool(upnp_available or user_direct)
+    if upnp_available:
+        direct_note = "UPnP mapped a public port: direct code works."
+    elif user_direct:
+        direct_note = "VPN / forwarded port: direct code works."
+    else:
+        direct_note = ("no direct path (no UPnP, no VPN/forward): "
+                       "try hole punch or manual.")
+    if stun_punchable:
+        punch_note = "NAT looks punchable: offer hole punch."
+    else:
+        punch_note = ("NAT not verified punchable: offers may fail; "
+                      "prefer VPN or manual.")
+    return {
+        "direct": (direct, direct_note),
+        "punch": (bool(stun_punchable), punch_note),
+        "manual": (True, "host:port + secret line for IPv6/DNS/odd setups."),
+    }
+
+
+def upnp_probe(ssdp_addr=None, wait=None):
+    """Capability check without side effects (no mapping is created)."""
+    info = {"found": False, "external_ip": None, "cgnat": False, "reason": ""}
+    try:
+        locs = upnp_discover(ssdp_addr=ssdp_addr, wait=wait)
+    except Exception:
+        return info
+    if not locs:
+        info["reason"] = "no UPnP gateway found"
+        return info
+    described = None
+    for loc in locs:
+        try:
+            described = upnp_describe(loc)
+        except Exception:
+            described = None
+        if described is not None:
+            break
+    if described is None:
+        info["reason"] = "gateway description unreadable"
+        return info
+    try:
+        ext = upnp_external_ip(described[0], described[1])
+    except Exception:
+        ext = None
+    if ext is None:
+        info["reason"] = "external address unknown"
+        return info
+    info["found"] = True
+    info["external_ip"] = ext
+    info["cgnat"] = upnp_is_cgnat(ext)
+    info["reason"] = ("CGNAT: mapping useless, use punch or VPN"
+                      if info["cgnat"] else "gateway ok")
+    return info
+
+
+def online_reachability(stun_servers=None, ssdp_addr=None, upnp_wait=None,
+                        stun_timeout=None, stun_retries=None):
+    """UPnP probe + STUN check in parallel threads (spec section 10).
+
+    Returns {"upnp": {...}, "stun": {"mapped"|None, "punchable", "reason"}}.
+    Uses defaults (DEFAULT_STUN_SERVERS / standard waits) unless told.
+    """
+    servers = list(stun_servers) if stun_servers else list(
+        DEFAULT_STUN_SERVERS)
+    if stun_retries is None:
+        stun_retries = STUN_RETRIES
+    out = {"upnp": {"found": False, "external_ip": None, "cgnat": False,
+                    "reason": "not run"},
+           "stun": {"mapped": None, "punchable": False,
+                    "reason": "not run"}}
+
+    def run_upnp():
+        try:
+            out["upnp"] = upnp_probe(ssdp_addr=ssdp_addr, wait=upnp_wait)
+        except Exception:
+            pass
+
+    def run_stun():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            try:
+                sock.bind(("0.0.0.0", 0))
+            except OSError:
+                out["stun"] = {"mapped": None, "punchable": False,
+                               "reason": "stun socket failed"}
+                return
+            mapped, punchable, reason = stun_check(
+                sock, servers, timeout=stun_timeout, retries=stun_retries)
+            out["stun"] = {"mapped": mapped, "punchable": punchable,
+                           "reason": reason}
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=run_upnp, daemon=True),
+               threading.Thread(target=run_stun, daemon=True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
+                       timeout=None):
+    """Name/rules READY over a punched transport (mirrors TCP READY).
+
+    Host sends READY {session_id, name, rules_hash} first; guest answers
+    {name, rules_hash} and adopts the session id. Rules mismatch raises
+    RulesMismatch. Returns the peer name.
+    """
+    timeout = HANDSHAKE_TIMEOUT_S if timeout is None else timeout
+    if is_host:
+        transport.send(json.dumps(
+            {"t": "udp-ready", "session_id": session_id, "name": name,
+             "rules_hash": rules_hash}, sort_keys=True,
+            separators=(",", ":")).encode())
+        raw = transport.recv(timeout=timeout)
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+        if not isinstance(obj, dict) or obj.get("t") != "udp-ready":
+            raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+        if obj.get("rules_hash") != rules_hash:
+            raise RulesMismatch("rules differ")
+        return sanitize_name(str(obj.get("name", "?")))
+    raw = transport.recv(timeout=timeout)
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+    if not isinstance(obj, dict) or obj.get("t") != "udp-ready":
+        raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+    # Reply first so both sides always reach a verdict (otherwise the host
+    # would hang on a mismatch instead of reporting RULES_MISMATCH too).
+    transport.send(json.dumps(
+        {"t": "udp-ready", "name": name, "rules_hash": rules_hash},
+        sort_keys=True, separators=(",", ":")).encode())
+    if obj.get("rules_hash") != rules_hash:
+        raise RulesMismatch("rules differ")
+    session_id = str(obj.get("session_id", session_id))
+    return sanitize_name(str(obj.get("name", "?")))
+
+
+# --- Online UPnP client (spec section 9; best effort, never raises) ---
+UPNP_ST_WANIP = "urn:schemas-upnp-org:service:WANIPConnection:1"
+UPNP_ST_WANPPP = "urn:schemas-upnp-org:service:WANPPPConnection:1"
+UPNP_DESC = "battleships"
+_UPNP_CGNAT_NETS = tuple(ipaddress.ip_network(n) for n in
+                         ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                          "100.64.0.0/10"))
+_UPNP_REGISTRY = []
+_UPNP_PREV_HANDLERS = {}
+_UPNP_HANDLERS_DONE = False
+
+
+def upnp_is_cgnat(ip):
+    """True when the router's external IP is unroutable (mapping useless)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _UPNP_CGNAT_NETS)
+
+
+def upnp_discover(ssdp_addr=None, wait=None):
+    """M-SEARCH for WANIP/WANPPP services; LOCATION urls (deduped).
+
+    ssdp_addr is injectable so tests use loopback unicast (multicast is
+    unreliable in CI). Returns [] on any failure, never raises.
+    """
+    ssdp_addr = SSDP_ADDR if ssdp_addr is None else ssdp_addr
+    wait = SSDP_WAIT_S if wait is None else wait
+    found = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            sock.sendto(("M-SEARCH * HTTP/1.1\r\n"
+                         "HOST: %s:%d\r\n"
+                         "MAN: \"ns=01\"\r\nMX: 2\r\nST: %s\r\n\r\n"
+                         % (ssdp_addr[0], ssdp_addr[1], UPNP_ST_WANIP)
+                         ).encode("latin-1"), ssdp_addr)
+            sock.sendto(("M-SEARCH * HTTP/1.1\r\n"
+                         "HOST: %s:%d\r\n"
+                         "MAN: \"ns=01\"\r\nMX: 2\r\nST: %s\r\n\r\n"
+                         % (ssdp_addr[0], ssdp_addr[1], UPNP_ST_WANPPP)
+                         ).encode("latin-1"), ssdp_addr)
+        except OSError:
+            return []
+        deadline = time.monotonic() + max(0.05, wait)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                sock.settimeout(left)
+                data, _ = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                break
+            except OSError:
+                break
+            try:
+                text = data.decode("latin-1")
+            except ValueError:
+                continue
+            for line in text.split("\r\n"):
+                if line.upper().startswith("LOCATION:"):
+                    loc = line.split(":", 1)[1].strip()
+                    if loc and loc not in found:
+                        found.append(loc)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return found
+
+
+def _upnp_services(root):
+    """(serviceType, controlURL) pairs found under any namespace."""
+    out = []
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] != "service":
+            continue
+        stype = curl = None
+        for child in list(elem):
+            name = child.tag.split("}")[-1]
+            if name == "serviceType":
+                stype = (child.text or "").strip()
+            elif name == "controlURL":
+                curl = (child.text or "").strip()
+        if stype and curl:
+            out.append((stype, curl))
+    return out
+
+
+def upnp_describe(location, timeout=5):
+    """(control_url, service_type) or None. Malformed XML -> None."""
+    try:
+        with urllib.request.urlopen(location, timeout=timeout) as resp:
+            raw = resp.read(65536)
+    except Exception:
+        return None
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+    cands = [(st, urllib.parse.urljoin(location, curl))
+             for st, curl in _upnp_services(root)
+             if st in (UPNP_ST_WANIP, UPNP_ST_WANPPP)]
+    if not cands:
+        return None
+    cands.sort(key=lambda kv: 0 if kv[0] == UPNP_ST_WANIP else 1)
+    service, control_url = cands[0][0], cands[0][1]
+    return control_url, service
+
+
+def upnp_soap(control_url, service, action, args, timeout=5):
+    """(ok, items). SOAP faults, HTTP errors and timeouts -> (False, {})."""
+    import xml.sax.saxutils as _sax
+    inner = "".join("<%s>%s</%s>" % (k, _sax.escape(str(v)), k)
+                    for k, v in args.items())
+    envelope = ("<?xml version=\"1.0\"?>"
+                "<s:Envelope xmlns:s="
+                "\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                "s:encodingStyle="
+                "\"http://schemas.xmlsoap.org/soap/encoding/\">"
+                "<s:Body><u:%s xmlns:u=\"%s\">%s</u:%s></s:Body></s:Envelope>"
+                % (action, service, inner, action))
+    req = urllib.request.Request(
+        control_url, data=envelope.encode("utf-8"),
+        headers={"Content-Type": "text/xml",
+                 "SOAPAction": "\"%s#%s\"" % (service, action)})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(65536)
+    except Exception:
+        return False, {}
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return False, {}
+    for elem in root.iter():
+        if elem.tag.split("}")[-1] == "Fault":
+            return False, {}
+    items = {}
+    for elem in root.iter():
+        name = elem.tag.split("}")[-1]
+        if name.endswith("Response"):
+            for child in list(elem):
+                items[child.tag.split("}")[-1]] = (child.text or "").strip()
+    return True, items
+
+
+def upnp_external_ip(control_url, service, timeout=5):
+    ok, items = upnp_soap(control_url, service, "GetExternalIPAddress", {},
+                          timeout=timeout)
+    if not ok:
+        return None
+    ip = items.get("NewExternalIPAddress")
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return ip
+
+
+def upnp_add_mapping(control_url, service, external_port, internal_port,
+                     internal_client, timeout=5):
+    ok, _items = upnp_soap(control_url, service, "AddPortMapping", {
+        "NewRemoteHost": "",
+        "NewExternalPort": int(external_port),
+        "NewProtocol": "TCP",
+        "NewInternalPort": int(internal_port),
+        "NewInternalClient": internal_client,
+        "NewEnabled": 1,
+        "NewPortMappingDescription": UPNP_DESC,
+        "NewLeaseDuration": UPNP_LEASE_S,
+    }, timeout=timeout)
+    return ok
+
+
+def upnp_delete_mapping(control_url, service, external_port, timeout=5):
+    ok, _items = upnp_soap(control_url, service, "DeletePortMapping", {
+        "NewRemoteHost": "",
+        "NewExternalPort": int(external_port),
+        "NewProtocol": "TCP",
+    }, timeout=timeout)
+    return ok
+
+
+def _upnp_signal_handler(signum, frame):
+    _upnp_cleanup_all()
+    prev = _UPNP_PREV_HANDLERS.get(signum)
+    try:
+        signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    if callable(prev):
+        return prev(signum, frame)
+    if signum == getattr(signal, "SIGINT", None):
+        raise KeyboardInterrupt
+    try:
+        os.kill(os.getpid(), signum)
+    except Exception:
+        raise SystemExit(128 + int(signum))
+
+
+def _upnp_install_handlers():
+    global _UPNP_HANDLERS_DONE
+    for signame in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, signame, None)
+        if signum is None:
+            continue
+        try:
+            if signal.getsignal(signum) is _upnp_signal_handler:
+                continue
+            _UPNP_PREV_HANDLERS[signum] = signal.getsignal(signum)
+            signal.signal(signum, _upnp_signal_handler)
+        except (OSError, ValueError):
+            pass
+    _UPNP_HANDLERS_DONE = True
+
+
+def _upnp_register_cleanup(info):
+    _UPNP_REGISTRY.append(info)
+    try:
+        atexit.register(_upnp_cleanup_all)
+    except Exception:
+        pass
+    _upnp_install_handlers()
+
+
+def _upnp_cleanup_all():
+    for info in list(_UPNP_REGISTRY):
+        try:
+            upnp_delete_mapping(info["control_url"], info["service"],
+                                info["external_port"], timeout=3)
+        except Exception:
+            pass
+
+
+def upnp_unmap(info):
+    """Delete one mapping now; best effort. Returns the SOAP result."""
+    try:
+        ok = upnp_delete_mapping(info["control_url"], info["service"],
+                                 info["external_port"], timeout=5)
+    except Exception:
+        return False
+    try:
+        _UPNP_REGISTRY.remove(info)
+    except ValueError:
+        pass
+    return ok
+
+
+def upnp_map(external_port, internal_port=None, internal_client=None,
+             ssdp_addr=None, wait=None):
+    """Full flow: discover -> describe -> external ip -> CGNAT check ->
+    AddPortMapping + cleanup registration. Dict, never raises."""
+    info = {"available": False, "external_ip": None,
+            "external_port": external_port,
+            "internal_client": internal_client or online_local_ip(),
+            "internal_port": internal_port or external_port,
+            "control_url": None, "service": None,
+            "cgnat": False, "reason": ""}
+    try:
+        locs = upnp_discover(ssdp_addr=ssdp_addr, wait=wait)
+        if not locs:
+            info["reason"] = "no UPnP gateway found"
+            return info
+        described = None
+        for loc in locs:
+            described = upnp_describe(loc)
+            if described is not None:
+                break
+        if described is None:
+            info["reason"] = "gateway description unreadable"
+            return info
+        control_url, service = described
+        info["control_url"], info["service"] = control_url, service
+        ext = upnp_external_ip(control_url, service)
+        if ext is None:
+            info["reason"] = "external address unknown"
+            return info
+        info["external_ip"] = ext
+        if upnp_is_cgnat(ext):
+            info["cgnat"] = True
+            info["reason"] = ("CGNAT (%s): a port mapping would be "
+                              "useless; use hole punching or a VPN" % ext)
+            return info
+        if not upnp_add_mapping(control_url, service, external_port,
+                                info["internal_port"], info["internal_client"]):
+            info["reason"] = "AddPortMapping refused"
+            return info
+        info["available"] = True
+        _upnp_register_cleanup(info)
+        return info
+    except Exception:
+        return info
+
+
+# --- Online STUN client (spec section 8.1; one socket for everything) ---
+STUN_COOKIE = 0x2112A442
+STUN_BINDING_REQUEST = 0x0001
+STUN_BINDING_RESPONSE = 0x0101
+STUN_ATTR_XOR_MAPPED = 0x0020
+STUN_ATTR_MAPPED = 0x0001
+
+
+def stun_request():
+    """Binding request + its transaction id (spec section 8.1 recipe)."""
+    txid = secrets.token_bytes(12)
+    pkt = struct.pack(">HHI", STUN_BINDING_REQUEST, 0, STUN_COOKIE) + txid
+    return pkt, txid
+
+
+def parse_stun_response(data, txid):
+    """(ip, port) from a binding success, else None. IPv4 only in v1:
+    XOR-MAPPED-ADDRESS first, plain MAPPED-ADDRESS fallback; anything
+    else (IPv6, wrong txid/cookie/type, truncation) is ignored."""
+    try:
+        if len(data) < 20:
+            return None
+        mtype, mlen, cookie = struct.unpack(">HHI", data[:8])
+        if mtype != STUN_BINDING_RESPONSE or cookie != STUN_COOKIE:
+            return None
+        if data[8:20] != txid:
+            return None
+        i, end = 20, min(len(data), 20 + mlen)
+        while i + 4 <= end:
+            atype, alen = struct.unpack(">HH", data[i:i + 4])
+            v = data[i + 4:i + 4 + alen]
+            if atype == STUN_ATTR_XOR_MAPPED and len(v) >= 8 and v[1] == 1:
+                port = struct.unpack(">H", v[2:4])[0] ^ (STUN_COOKIE >> 16)
+                ip = struct.unpack(">I", v[4:8])[0] ^ STUN_COOKIE
+                return str(ipaddress.IPv4Address(ip)), port
+            if atype == STUN_ATTR_MAPPED and len(v) >= 8 and v[1] == 1:
+                port = struct.unpack(">H", v[2:4])[0]
+                ip = str(ipaddress.IPv4Address(v[4:8]))
+                return ip, port
+            i += 4 + ((alen + 3) & ~3)
+    except (struct.error, ValueError, IndexError):
+        return None
+    return None
+
+
+def stun_parse_server(text):
+    """'HOST:PORT' -> (host, port); bare host defaults to the STUN port."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty STUN server")
+    if ":" in text:
+        host, _, port_s = text.rpartition(":")
+        if not host:
+            raise ValueError("bad STUN server %r" % text)
+        try:
+            port = int(port_s)
+        except ValueError:
+            raise ValueError("bad STUN port %r" % text)
+        if not 1 <= port <= 65535:
+            raise ValueError("bad STUN port %r" % text)
+        return host, port
+    return text, STUN_DEFAULT_PORT
+
+
+def stun_query(sock, server, timeout=None, retries=None):
+    """Ask one STUN server from an existing socket; (ip, port) or None.
+
+    Retries on the same server, then the caller rotates to the next.
+    The socket's timeout is restored. No game data is ever sent here.
+    """
+    timeout = STUN_TIMEOUT_S if timeout is None else timeout
+    retries = STUN_RETRIES if retries is None else retries
+    try:
+        host, port = stun_parse_server(server)
+    except ValueError:
+        return None
+    try:
+        old_timeout = sock.gettimeout()
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+    except OSError:
+        return None
+    try:
+        for _ in range(1 + max(0, retries)):
+            pkt, txid = stun_request()
+            try:
+                sock.sendto(pkt, (host, port))
+            except OSError:
+                return None
+            try:
+                data, _ = sock.recvfrom(2048)
+            except (socket.timeout, TimeoutError, OSError):
+                continue
+            res = parse_stun_response(data, txid)
+            if res is not None:
+                return res
+        return None
+    finally:
+        try:
+            sock.settimeout(old_timeout)
+        except OSError:
+            pass
+
+
+def stun_check(sock, servers, timeout=None, retries=None):
+    """Two-server NAT check from one socket.
+
+    Returns (mapped|None, punchable, reason): the same public endpoint
+    from two servers means punching should work; differing ports mean
+    symmetric NAT; fewer than two answers means unverified/unavailable.
+    """
+    answers = []
+    for server in servers:
+        res = stun_query(sock, server, timeout=timeout, retries=retries)
+        if res is not None:
+            answers.append(res)
+        if len(answers) >= 2:
+            break
+    if not answers:
+        return None, False, "no STUN server answered"
+    if len(answers) < 2:
+        return answers[0], False, (
+            "only one STUN answer; punchability unverified")
+    if answers[0] == answers[1]:
+        return answers[0], True, (
+            "same public endpoint from two STUN servers")
+    return answers[0], False, (
+        "symmetric NAT: STUN servers report different ports; "
+        "hole punching will not work, use a VPN, a port forward or UPnP")
+
+
+# --- Online offer/answer codes (spec section 8.2; manual signaling) ---
+FLAG_OFFER_LAN = 0x02
+
+
+def _normalize_code(text):
+    return (text or "").upper().replace("-", "").replace(" ", "").translate(
+        str.maketrans("018", "OIB"))
+
+
+def _signal_b32e(raw):
+    pad = (-len(raw)) % 5
+    s = base64.b32encode(raw + b"\x00" * pad).decode()
+    return "-".join(s[i:i + 4] for i in range(0, len(s), 4))
+
+
+def _signal_b32d(text, ok_lens):
+    s = _normalize_code(text)
+    try:
+        raw = base64.b32decode(s)
+    except Exception as exc:
+        raise BadInvite("bad code: %s" % exc)
+    if len(raw) not in ok_lens:
+        raise BadInvite("bad code length")
+    return raw
+
+
+def _pack_endpoint(ip, port):
+    try:
+        packed_ip = ipaddress.IPv4Address(ip).packed
+    except Exception as exc:
+        raise BadInvite("bad ip: %s" % exc)
+    if not 0 <= port <= 65535:
+        raise BadInvite("bad port")
+    return struct.pack(">4sH", packed_ip, port)
+
+
+def _unpack_endpoint(buf):
+    ip_packed, (port,) = buf[:4], struct.unpack(">H", buf[4:6])
+    return str(ipaddress.IPv4Address(ip_packed)), port
+
+
+def encode_offer(pub, secret, lan=None, nonce_h=None):
+    """Host offer code + dict. pub/lan are (ip, port); secret is 10 bytes."""
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    if nonce_h is None:
+        nonce_h = new_nonce(NONCE_BYTES_UDP)
+    if len(nonce_h) != NONCE_BYTES_UDP:
+        raise BadInvite("bad nonce length")
+    flags = FLAG_PUNCH
+    body = struct.pack(">BB", PROTOCOL_VERSION, flags | (
+        FLAG_OFFER_LAN if lan else 0)) + _pack_endpoint(*pub)
+    if lan:
+        body += _pack_endpoint(*lan)
+    body += nonce_h + secret
+    raw = body + struct.pack(">H", zlib.crc32(body) & 0xFFFF)
+    offer = {"v": PROTOCOL_VERSION, "flags": flags | (
+        FLAG_OFFER_LAN if lan else 0), "pub": (pub[0], pub[1]),
+        "lan": (lan[0], lan[1]) if lan else None,
+        "nonce_h": nonce_h, "secret": secret, "raw": raw}
+    return _signal_b32e(raw), offer
+
+
+def decode_offer(text):
+    raw = _signal_b32d(text, (30, 35))
+    body = raw[:26] if len(raw) == 30 else raw[:32]
+    (crc,) = struct.unpack(">H", raw[len(body):len(body) + 2])
+    if zlib.crc32(body) & 0xFFFF != crc:
+        raise BadInvite("bad code")
+    ver, flags = struct.unpack(">BB", body[:2])
+    if ver != PROTOCOL_VERSION:
+        raise VersionMismatch("protocol version %d" % ver)
+    if not flags & FLAG_PUNCH:
+        raise BadInvite("not a punch offer")
+    off = 2
+    pub = _unpack_endpoint(body[off:off + 6])
+    off += 6
+    lan = None
+    if flags & FLAG_OFFER_LAN:
+        lan = _unpack_endpoint(body[off:off + 6])
+        off += 6
+    nonce_h = body[off:off + NONCE_BYTES_UDP]
+    off += NONCE_BYTES_UDP
+    secret = body[off:off + SECRET_BYTES]
+    if len(nonce_h) != NONCE_BYTES_UDP or len(secret) != SECRET_BYTES:
+        raise BadInvite("bad code")
+    return {"v": ver, "flags": flags, "pub": pub, "lan": lan,
+            "nonce_h": nonce_h, "secret": secret,
+            "raw": body + struct.pack(">H", crc)}
+
+
+def _answer_tag(secret, offer_raw, answer_body):
+    return hmac.new(secret, offer_raw + answer_body,
+                    hashlib.sha256).digest()[:8]
+
+
+def encode_answer(offer, pub, secret, lan=None, nonce_g=None):
+    """Guest answer code + dict. offer is a code string or decoded dict."""
+    if isinstance(offer, str):
+        offer = decode_offer(offer)
+    if len(secret) != SECRET_BYTES:
+        raise BadInvite("bad secret length")
+    if not hmac.compare_digest(bytes(offer["secret"]), bytes(secret)):
+        raise BadInvite("wrong secret for this offer")
+    if nonce_g is None:
+        nonce_g = new_nonce(NONCE_BYTES_UDP)
+    if len(nonce_g) != NONCE_BYTES_UDP:
+        raise BadInvite("bad nonce length")
+    flags = FLAG_PUNCH | (FLAG_OFFER_LAN if lan else 0)
+    answer_body = struct.pack(">BB", PROTOCOL_VERSION, flags)
+    answer_body += _pack_endpoint(*pub)
+    if lan:
+        answer_body += _pack_endpoint(*lan)
+    answer_body += nonce_g
+    tag = _answer_tag(secret, offer["raw"], answer_body)
+    raw = answer_body + tag + struct.pack(
+        ">H", zlib.crc32(answer_body + tag) & 0xFFFF)
+    answer = {"v": PROTOCOL_VERSION, "flags": flags,
+              "pub": (pub[0], pub[1]),
+              "lan": (lan[0], lan[1]) if lan else None,
+              "nonce_g": nonce_g, "tag": tag}
+    return _signal_b32e(raw), answer
+
+
+def decode_answer(text):
+    raw = _signal_b32d(text, (30, 35))
+    body = raw[:24] if len(raw) == 30 else raw[:30]
+    tag = body[-8:]
+    answer_body = body[:-8]
+    (crc,) = struct.unpack(">H", raw[len(body):len(body) + 2])
+    if zlib.crc32(body) & 0xFFFF != crc:
+        raise BadInvite("bad code")
+    ver, flags = struct.unpack(">BB", answer_body[:2])
+    if ver != PROTOCOL_VERSION:
+        raise VersionMismatch("protocol version %d" % ver)
+    if not flags & FLAG_PUNCH:
+        raise BadInvite("not a punch answer")
+    off = 2
+    pub = _unpack_endpoint(answer_body[off:off + 6])
+    off += 6
+    lan = None
+    if flags & FLAG_OFFER_LAN:
+        lan = _unpack_endpoint(answer_body[off:off + 6])
+        off += 6
+    nonce_g = answer_body[off:off + NONCE_BYTES_UDP]
+    if len(nonce_g) != NONCE_BYTES_UDP:
+        raise BadInvite("bad code")
+    return {"v": ver, "flags": flags, "pub": pub, "lan": lan,
+            "nonce_g": nonce_g, "tag": tag, "body": answer_body}
+
+
+def verify_answer_tag(offer, answer, secret):
+    """True iff the answer tag authenticates (compare_digest)."""
+    if isinstance(offer, str):
+        offer = decode_offer(offer)
+    if isinstance(answer, str):
+        answer = decode_answer(answer)
+    if len(secret) != SECRET_BYTES:
+        return False
+    expected = _answer_tag(secret, offer["raw"], answer["body"])
+    return hmac.compare_digest(expected, bytes(answer["tag"]))
+
+
+def punch_keys(secret, nonce_h, nonce_g):
+    """Both sides derive k_hg/k_gh/k_resume immediately (T2 schedule)."""
+    return derive_keys(secret, bytes(nonce_h), bytes(nonce_g))
+
+
+# --- Online handshake (spec section 6) ---
+def online_b64e(b):
+    return base64.b64encode(b).decode()
+
+
+def online_b64d(s):
+    return base64.b64decode(s.encode())
+
+
+def write_json_line(sock, obj):
+    data = (json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(data) > MAX_HANDSHAKE_BYTES:
+        raise ProtocolError("handshake line too large")
+    sock.sendall(data)
+
+
+def read_json_line(sock, timeout):
+    sock.settimeout(timeout)
+    buf = bytearray()
+    while True:
+        if len(buf) > MAX_HANDSHAKE_BYTES:
+            raise ProtocolError("handshake line too large")
+        try:
+            chunk = sock.recv(1)
+        except OSError as exc:
+            raise HandshakeFailed(str(exc))
+        if not chunk:
+            raise HandshakeFailed("eof")
+        buf += chunk
+        if buf.endswith(b"\n"):
+            break
+    if len(buf) > MAX_HANDSHAKE_BYTES:
+        raise ProtocolError("handshake line too large")
+    try:
+        obj = json.loads(bytes(buf).decode("utf-8"))
+    except ValueError as exc:
+        raise HandshakeFailed("bad json: %s" % exc)
+    if not isinstance(obj, dict):
+        raise HandshakeFailed("bad hello")
+    return obj
+
+
+def _online_fail_delay():
+    lo, hi = FAIL_DELAY_RANGE_S
+    try:
+        time.sleep(random.uniform(lo, hi))
+    except Exception:
+        pass
+
+
+def host_handshake(sock, secret, host_name, rules_hash, game_ver=1, _delay=True):
+    try:
+        hello = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    except (HandshakeFailed, ProtocolError):
+        raise
+    try:
+        if hello.get("t") != "HELLO":
+            raise HandshakeFailed("expected HELLO")
+        if int(hello.get("v")) != PROTOCOL_VERSION:
+            write_json_line(sock, {"t": "ERROR", "reason": "VERSION"})
+            raise VersionMismatch("protocol version")
+        if int(hello.get("game_ver", game_ver)) != game_ver:
+            write_json_line(sock, {"t": "ERROR", "reason": "VERSION"})
+            raise VersionMismatch("game version")
+        nonce_g = online_b64d(str(hello.get("nonce_g", "")))
+        if len(nonce_g) != NONCE_BYTES_TCP:
+            raise HandshakeFailed("bad nonce")
+    except (VersionMismatch, HandshakeFailed):
+        raise
+    except Exception as exc:
+        raise HandshakeFailed(str(exc))
+
+    nonce_h = secrets.token_bytes(NONCE_BYTES_TCP)
+    ph = proof_h(secret, nonce_g, nonce_h)
+    write_json_line(sock, {"t": "CHALLENGE", "nonce_h": online_b64e(nonce_h),
+                           "proof_h": online_b64e(ph)})
+    try:
+        auth = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    except (HandshakeFailed, ProtocolError):
+        raise
+    try:
+        pg = online_b64d(str(auth.get("proof_g", "")))
+    except Exception:
+        raise HandshakeFailed("bad proof")
+    if not hmac.compare_digest(proof_g(secret, nonce_h, nonce_g), pg):
+        if _delay:
+            _online_fail_delay()
+        raise HandshakeFailed("bad proof")
+
+    k_hg, k_gh, k_resume = derive_keys(secret, nonce_h, nonce_g)
+    session_id = secrets.token_hex(8)
+    ready = {"session_id": session_id, "name": host_name, "rules_hash": rules_hash}
+    sock.sendall(seal(k_hg, 0, json.dumps(ready, sort_keys=True,
+                                         separators=(",", ":")).encode()))
+    try:
+        dec = FrameDecoder(k_gh)
+        header = recv_exact(sock, 4, HANDSHAKE_TIMEOUT_S)
+        (n,) = struct.unpack(">I", header)
+        if n > MAX_FRAME_BYTES:
+            raise ProtocolError("frame too large")
+        rest = recv_exact(sock, n + MAC_BYTES, FRAME_READ_TIMEOUT_S)
+        bodies = dec.feed(header + rest)
+        gready = json.loads(bodies[0].decode("utf-8"))
+    except (ProtocolError, ValueError, IndexError) as exc:
+        raise HandshakeFailed("bad READY: %s" % exc)
+    if gready.get("rules_hash") != rules_hash:
+        raise RulesMismatch("rules differ")
+    return {"send_key": k_hg, "recv_key": k_gh, "k_resume": k_resume,
+            "session_id": session_id, "peer_name": str(gready.get("name", "")),
+            "nonce_h": nonce_h, "nonce_g": nonce_g}
+
+
+def guest_handshake(sock, secret, guest_name, rules_hash, game_ver=1):
+    nonce_g = secrets.token_bytes(NONCE_BYTES_TCP)
+    write_json_line(sock, {"t": "HELLO", "v": PROTOCOL_VERSION,
+                           "game_ver": game_ver, "nonce_g": online_b64e(nonce_g)})
+    chall = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    if chall.get("t") == "ERROR":
+        reason = str(chall.get("reason", ""))
+        if reason == "VERSION":
+            raise VersionMismatch("version refused")
+        raise HandshakeFailed("refused: %s" % reason)
+    if chall.get("t") != "CHALLENGE":
+        raise HandshakeFailed("expected CHALLENGE")
+    try:
+        nonce_h = online_b64d(str(chall.get("nonce_h", "")))
+        ph = online_b64d(str(chall.get("proof_h", "")))
+    except Exception:
+        raise HandshakeFailed("bad challenge")
+    if not hmac.compare_digest(proof_h(secret, nonce_g, nonce_h), ph):
+        raise HandshakeFailed("impostor host")
+    pg = proof_g(secret, nonce_h, nonce_g)
+    write_json_line(sock, {"t": "AUTH", "proof_g": online_b64e(pg)})
+
+    k_hg, k_gh, k_resume = derive_keys(secret, nonce_h, nonce_g)
+    try:
+        dec = FrameDecoder(k_hg)
+        header = recv_exact(sock, 4, HANDSHAKE_TIMEOUT_S)
+        (n,) = struct.unpack(">I", header)
+        if n > MAX_FRAME_BYTES:
+            raise ProtocolError("frame too large")
+        rest = recv_exact(sock, n + MAC_BYTES, FRAME_READ_TIMEOUT_S)
+        bodies = dec.feed(header + rest)
+        hready = json.loads(bodies[0].decode("utf-8"))
+    except (ProtocolError, ValueError, IndexError) as exc:
+        raise HandshakeFailed("bad READY: %s" % exc)
+    if hready.get("rules_hash") != rules_hash:
+        raise RulesMismatch("rules differ")
+    session_id = str(hready.get("session_id", ""))
+    ready = {"name": guest_name, "rules_hash": rules_hash}
+    sock.sendall(seal(k_gh, 0, json.dumps(ready, sort_keys=True,
+                                         separators=(",", ":")).encode()))
+    return {"send_key": k_gh, "recv_key": k_hg, "k_resume": k_resume,
+            "session_id": session_id, "peer_name": str(hready.get("name", "")),
+            "nonce_h": nonce_h, "nonce_g": nonce_g}
+
+
+class HostListener:
+    """One-peer rule + failure counter + code burning (spec sections 4+6)."""
+
+    def __init__(self, secret, host_name, rules_hash, game_ver=1,
+                 bind="127.0.0.1", port=0):
+        self.secret = secret
+        self.host_name = host_name
+        self.rules_hash = rules_hash
+        self.game_ver = game_ver
+        self.failures = 0
+        self.burned = False
+        self.active = False
+        self._lock = threading.Lock()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((bind, port))
+        self._sock.listen(5)
+        self._closed = False
+
+    @property
+    def port(self):
+        return self._sock.getsockname()[1]
+
+    def close(self):
+        self._closed = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _is_burned(self):
+        with self._lock:
+            return self.burned
+
+    def _record_failure(self):
+        with self._lock:
+            self.failures += 1
+            if self.failures >= HANDSHAKE_FAIL_LIMIT:
+                self.burned = True
+
+    def _record_success(self):
+        with self._lock:
+            self.burned = True
+            self.active = True
+
+    def release(self):
+        with self._lock:
+            self.active = False
+
+    def serve_once(self, timeout=None):
+        self._sock.settimeout(timeout if timeout is not None else
+                              HANDSHAKE_TIMEOUT_S + 5)
+        while not self._closed:
+            if self._is_burned():
+                raise HandshakeFailed("code burned")
+            try:
+                conn, _ = self._sock.accept()
+            except OSError as exc:
+                raise HandshakeFailed(str(exc))
+            with self._lock:
+                busy = self.active
+            if busy:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            conn.settimeout(HANDSHAKE_TIMEOUT_S)
+            try:
+                info = host_handshake(conn, self.secret, self.host_name,
+                                      self.rules_hash, self.game_ver,
+                                      _delay=False)
+            except (HandshakeFailed, RulesMismatch, VersionMismatch):
+                self._record_failure()
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                if self._is_burned():
+                    raise
+                continue
+            except Exception:
+                self._record_failure()
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            self._record_success()
+            return conn, info
+        raise HandshakeFailed("closed")
+
+
+def online_dial(host, port, secret, guest_name, rules_hash, game_ver=1,
+                timeout=None):
+    sock = socket.create_connection(
+        (host, port),
+        timeout=timeout if timeout is not None else HANDSHAKE_TIMEOUT_S,
+    )
+    try:
+        info = guest_handshake(sock, secret, guest_name, rules_hash, game_ver)
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+    return sock, info
+
+
+# --- Online session layer (spec section 7; blocking facade) ---
+def make_envelope(kind, seq, ack, payload=None):
+    env = {"t": kind, "s": int(seq), "a": int(ack)}
+    if payload is not None:
+        env["d"] = payload
+    return env
+
+
+def validate_envelope(obj):
+    if not isinstance(obj, dict):
+        raise ProtocolError("bad envelope")
+    if obj.get("t") not in ("game", "ping", "pong", "bye"):
+        raise ProtocolError("unknown envelope type")
+    try:
+        s = int(obj.get("s"))
+        a = int(obj.get("a"))
+    except Exception:
+        raise ProtocolError("bad seq/ack")
+    if s < 0 or a < 0:
+        raise ProtocolError("bad seq/ack")
+    return {"t": obj["t"], "s": s, "a": a, "d": obj.get("d")}
+
+
+class Session:
+    """Numbered game envelopes over an authenticated frame transport."""
+
+    def __init__(self, transport, session_id="", name="", clock=None,
+                 on_state=None):
+        self.transport = transport
+        self.session_id = session_id
+        self.name = name
+        self.k_resume = None
+        self.handshake_info = None
+        self._clock = clock if clock is not None else time.time
+        self.on_state = on_state
+        self.state = "CONNECTED"
+        self._next_seq = 1
+        self._peer_ack = 0
+        self._last_peer_seq = 0
+        self._outbound = {}
+        self._lock = threading.Lock()
+        self._inbox = queue.Queue()
+        self._closed = False
+        self._last_recv = self._now()
+        self._last_send = self._now()
+        self._ping_sent_at = None
+        self.rtt = None
+        self._reconnect_since = None
+        self._bye_reason = None
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._heartbeat = threading.Thread(target=self._heartbeat_loop,
+                                           daemon=True)
+        self._heartbeat.start()
+
+    def _now(self):
+        try:
+            return float(self._clock())
+        except TypeError:
+            return float(self._clock)
+
+    def _set_state(self, state):
+        if self.state == state:
+            return
+        self.state = state
+        if state == "RECONNECTING":
+            self._reconnect_since = self._now()
+        if self.on_state is not None:
+            try:
+                self.on_state(state)
+            except Exception:
+                pass
+
+    def send_game(self, msg):
+        with self._lock:
+            if self._closed:
+                raise SessionLost("closed")
+            if len(self._outbound) >= OUTBOUND_BUFFER_MAX:
+                raise SessionLost("outbound buffer full")
+            env = make_envelope("game", self._next_seq, self._last_peer_seq, msg)
+            self._outbound[self._next_seq] = env
+            self._next_seq += 1
+        self._send_env(env)
+
+    def _send_env(self, env):
+        raw = json.dumps(env, sort_keys=True, separators=(",", ":")).encode()
+        if len(raw) > MAX_FRAME_BYTES:
+            raise SessionLost("envelope too large")
+        try:
+            self.transport.send(raw)
+        except Exception as exc:
+            raise SessionLost(str(exc))
+        self._last_send = self._now()
+
+    def _send_raw(self, kind, payload=None):
+        with self._lock:
+            env = make_envelope(kind, 0, self._last_peer_seq, payload)
+        raw = json.dumps(env, sort_keys=True, separators=(",", ":")).encode()
+        try:
+            self.transport.send(raw)
+        except Exception:
+            pass
+        self._last_send = self._now()
+
+    def send_bye(self):
+        try:
+            self._send_raw("bye")
+        finally:
+            self.close()
+
+    def recv_game(self, timeout=None):
+        if self._closed and self._inbox.empty():
+            raise SessionLost(self._bye_reason or "closed")
+        try:
+            msg = self._inbox.get(timeout=timeout)
+        except Exception:
+            raise SessionLost("closed")
+        if msg is None:
+            reason = self._bye_reason or "LINK_LOST"
+            raise SessionLost(reason, reason=reason)
+        if isinstance(msg, dict) and msg.get("t") == "__lost__":
+            raise SessionLost(str(msg.get("reason", "lost")))
+        return msg
+
+    def _read_loop(self):
+        while not self._closed:
+            try:
+                raw = self.transport.recv(timeout=1.0)
+            except Exception:
+                if self._closed:
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            try:
+                env = validate_envelope(obj)
+            except ProtocolError:
+                continue
+            self._handle_env(env)
+
+    def _handle_env(self, env):
+        self._last_recv = self._now()
+        kind = env["t"]
+        with self._lock:
+            ack = env["a"]
+            if ack > self._peer_ack:
+                for seq in [s for s in self._outbound if s <= ack]:
+                    del self._outbound[seq]
+                self._peer_ack = ack
+        if kind == "ping":
+            self._send_raw("pong")
+            return
+        if kind == "pong":
+            if self._ping_sent_at is not None:
+                self.rtt = self._now() - self._ping_sent_at
+                self._ping_sent_at = None
+            return
+        if kind == "bye":
+            self._bye_reason = "PEER_LEFT"
+            try:
+                self._inbox.put(None)
+            except Exception:
+                pass
+            self._set_state("LOST")
+            self.close()
+            return
+        s = env["s"]
+        with self._lock:
+            if s <= self._last_peer_seq:
+                return
+            self._last_peer_seq = s
+        try:
+            d = env.get("d")
+            self._inbox.put(d if isinstance(d, dict) else d)
+        except Exception:
+            pass
+
+    def _heartbeat_loop(self):
+        while not self._closed:
+            time.sleep(1.0)
+            if self._closed:
+                break
+            try:
+                self.tick()
+            except Exception:
+                pass
+
+    def tick(self):
+        if self._closed:
+            return
+        now = self._now()
+        if self.state == "CONNECTED":
+            if now - self._last_send >= PING_INTERVAL_S:
+                try:
+                    self._send_raw("ping")
+                    if self._ping_sent_at is None:
+                        self._ping_sent_at = now
+                except Exception:
+                    pass
+            if now - self._last_recv >= DEAD_AFTER_S:
+                self._set_state("RECONNECTING")
+        elif self.state == "RECONNECTING":
+            if (self._reconnect_since is not None
+                    and now - self._reconnect_since >= RESUME_WINDOW_S):
+                self._set_state("LOST")
+                try:
+                    self._inbox.put({"t": "__lost__", "reason": "LINK_LOST"})
+                except Exception:
+                    pass
+
+    def unacked(self):
+        with self._lock:
+            return [self._outbound[s] for s in sorted(self._outbound)]
+
+    def export_resume(self):
+        with self._lock:
+            return {"session_id": self.session_id,
+                    "last_recv": self._last_peer_seq,
+                    "next_seq": self._next_seq}
+
+    def retransmit_from(self, peer_last_recv):
+        with self._lock:
+            seqs = sorted(s for s in self._outbound if s > peer_last_recv)
+            envs = [dict(self._outbound[s]) for s in seqs]
+            for env in envs:
+                env["a"] = self._last_peer_seq
+        for env in envs:
+            self._send_env(env)
+
+    def attach(self, transport):
+        self.transport = transport
+        self._last_recv = self._now()
+        self._last_send = self._now()
+        self._ping_sent_at = None
+        self.state = "CONNECTED"
+        if self.on_state is not None:
+            try:
+                self.on_state("CONNECTED")
+            except Exception:
+                pass
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def close(self):
+        self._closed = True
+        try:
+            self.transport.close()
+        except Exception:
+            pass
+        try:
+            self._inbox.put(None)
+        except Exception:
+            pass
+
+
+# --- Online terminal safety (spec section 13; peer strings untrusted) ---
+_ONLINE_ESC_SEQ = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b.")
+_ONLINE_C0C1 = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize(text, max_chars):
+    try:
+        s = str(text)
+    except Exception:
+        return ""
+    s = _ONLINE_ESC_SEQ.sub("", s)
+    s = _ONLINE_C0C1.sub("", s)
+    s = s.strip()
+    if len(s) > max_chars:
+        s = s[:max_chars]
+    return s
+
+
+def sanitize_name(name):
+    return sanitize(name, NAME_MAX_CHARS)
+
+
+def sanitize_chat(text):
+    return sanitize(text, CHAT_MAX_CHARS)
+
+
+def render_literal(text):
+    """Peer text safe to print as plain text (never parsed as markup)."""
+    return sanitize_chat(text)
+
+
+class ChatRateLimiter:
+    """Drops over-rate chat (default 5 msgs/sec)."""
+
+    def __init__(self, per_s=None, clock=None):
+        self._per = per_s if per_s is not None else CHAT_RATE_PER_S
+        self._clock = clock if clock is not None else time.time
+        self._hits = []
+
+    def allow(self):
+        now = float(self._clock() if callable(self._clock) else self._clock)
+        window = [t for t in self._hits if now - t < 1.0]
+        if len(window) >= self._per:
+            self._hits = window
+            return False
+        window.append(now)
+        self._hits = window
+        return True
+
+
+# --- Online rules hash + resume handshake + entry flows ---
+def canonical_rules_hash(size, fleet, mode="single"):
+    norm = {"size": int(size),
+            "fleet": sorted([[str(n), int(l)] for n, l in fleet]),
+            "mode": "salvo" if mode == "salvo" else "single"}
+    payload = json.dumps(norm, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def new_session_id():
+    return secrets.token_hex(8)
+
+
+def resume_host_side(sock, k_resume, session_id, host_last_recv):
+    hello = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    if hello.get("t") != "HELLO" or not hello.get("resume"):
+        raise HandshakeFailed("expected RESUME hello")
+    if str(hello.get("session_id", "")) != session_id:
+        raise HandshakeFailed("wrong session")
+    try:
+        guest_last_recv = int(hello.get("last_recv", 0))
+        nonce_g = online_b64d(str(hello.get("nonce_g", "")))
+    except Exception as exc:
+        raise HandshakeFailed(str(exc))
+    nonce_h = secrets.token_bytes(NONCE_BYTES_TCP)
+    write_json_line(sock, {"t": "CHALLENGE", "nonce_h": online_b64e(nonce_h),
+                           "proof_h": online_b64e(proof_h(k_resume, nonce_g,
+                                                          nonce_h))})
+    auth = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    try:
+        pg = online_b64d(str(auth.get("proof_g", "")))
+    except Exception:
+        raise HandshakeFailed("bad proof")
+    if not hmac.compare_digest(proof_g(k_resume, nonce_h, nonce_g), pg):
+        raise HandshakeFailed("bad resume proof")
+    k_hg, k_gh, _ = derive_keys(k_resume, nonce_h, nonce_g)
+    write_json_line(sock, {"t": "RESUME_READY", "session_id": session_id,
+                           "last_recv": host_last_recv})
+    return {"send_key": k_hg, "recv_key": k_gh,
+            "guest_last_recv": guest_last_recv}
+
+
+def resume_guest_side(sock, k_resume, session_id, guest_last_recv):
+    nonce_g = secrets.token_bytes(NONCE_BYTES_TCP)
+    write_json_line(sock, {"t": "HELLO", "resume": True, "session_id": session_id,
+                           "last_recv": guest_last_recv,
+                           "v": PROTOCOL_VERSION,
+                           "nonce_g": online_b64e(nonce_g)})
+    chall = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    if chall.get("t") != "CHALLENGE":
+        raise HandshakeFailed("expected CHALLENGE")
+    nonce_h = online_b64d(str(chall.get("nonce_h", "")))
+    ph = online_b64d(str(chall.get("proof_h", "")))
+    if not hmac.compare_digest(proof_h(k_resume, nonce_g, nonce_h), ph):
+        raise HandshakeFailed("bad host proof")
+    write_json_line(sock, {"t": "AUTH",
+                           "proof_g": online_b64e(proof_g(k_resume, nonce_h,
+                                                          nonce_g))})
+    ready = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
+    if ready.get("t") != "RESUME_READY":
+        raise HandshakeFailed("expected RESUME_READY")
+    if str(ready.get("session_id", "")) != session_id:
+        raise HandshakeFailed("wrong session")
+    k_hg, k_gh, _ = derive_keys(k_resume, nonce_h, nonce_g)
+    return {"send_key": k_gh, "recv_key": k_hg,
+            "host_last_recv": int(ready.get("last_recv", 0))}
+
+
+class OnlineConn:
+    """Thin adapter: MatchConnection surface over a Session.
+
+    The game only touches mode/first_id/my_id/match_id/key/peer_name/
+    cell_anticheat, send(obj), queue, close(), async_handler. Anticheat and
+    game dicts travel inside `game` envelopes untouched.
+    """
+
+    def __init__(self, session, peer_name, mode, first_id, my_id, match_id,
+                 key, cell_anticheat=False):
+        self.session = session
+        self.peer_name = sanitize_name(peer_name)
+        self.mode = mode
+        self.first_id = first_id
+        self.my_id = my_id
+        self.match_id = match_id
+        self.key = key
+        self.cell_anticheat = cell_anticheat
+        self.queue = queue.Queue()
+        self.async_handler = None
+        self.closed = False
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def send(self, obj):
+        if self.closed:
+            return False
+        try:
+            if isinstance(obj, dict) and obj.get("type") == "chat":
+                obj = dict(obj)
+                obj["text"] = sanitize_chat(str(obj.get("text", "")))
+            self.session.send_game(obj)
+            return True
+        except SessionLost:
+            return False
+
+    def _pump(self):
+        while not self.closed:
+            try:
+                msg = self.session.recv_game(timeout=1.0)
+            except SessionLost:
+                break
+            except Exception:
+                continue
+            try:
+                self.queue.put(msg)
+            except Exception:
+                pass
+            if self.async_handler is not None:
+                try:
+                    self.async_handler(msg)
+                except Exception:
+                    pass
+        try:
+            self.queue.put({"type": "disconnect"})
+        except Exception:
+            pass
+
+    def close(self, notify=False):
+        self.closed = True
+        try:
+            self.session.send_bye()
+        except Exception:
+            pass
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+
+def match_params_from_handshake(session_id, host_name, guest_name, mode):
+    """Deterministic mode/first-move from shared handshake output."""
+    mode = "salvo" if mode == "salvo" else "single"
+    digest = hashlib.sha256(
+        ("online|" + session_id + "|" + host_name + "|" + guest_name).encode()
+    ).digest()
+    first = "host" if digest[0] & 1 else "guest"
+    match_id = hashlib.sha256(digest + b"match").hexdigest()[:16]
+    key = hashlib.sha256(digest + b"key").digest()
+    return mode, first, match_id, key
+
+
+def online_local_ip():
+    """LAN IP via the TEST-NET-1 connect trick (no packet is sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def host_once(bind, port, name, rules_hash, secret=None, game_ver=1):
+    if secret is None:
+        secret = new_secret()
+    return HostListener(secret, name, rules_hash, game_ver, bind, port), secret
+
+
+def connect_guest(code, name, rules_hash, game_ver=1, timeout=None):
+    _ver, _flags, ip, port, secret = decode_invite(code)
+    sock, info = online_dial(ip, port, secret, name, rules_hash, game_ver,
+                             timeout)
+    transport = TcpTransport(sock, info["send_key"], info["recv_key"])
+    session = Session(transport, session_id=info["session_id"], name=name)
+    session.k_resume = info["k_resume"]
+    session.handshake_info = info
+    return session, info
+
+
+def accept_host(listener, timeout=None):
+    conn, info = listener.serve_once(timeout=timeout)
+    transport = TcpTransport(conn, info["send_key"], info["recv_key"])
+    session = Session(transport, session_id=info["session_id"],
+                      name=listener.host_name)
+    session.k_resume = info["k_resume"]
+    session.handshake_info = info
+    return session, info
+
+
+ONLINE_ERROR_HINTS = {
+    "REFUSED": "Connection refused: the host is not listening, or a firewall is rejecting.",
+    "TIMEOUT": "Timeout: packets are being dropped by a NAT or firewall; try a VPN or hole punch.",
+    "BAD_CODE": "Bad proof: wrong code.",
+}
+
+ONLINE_GUIDE_SECTIONS = [
+    ("WHAT THIS IS", [
+        "Peer-to-peer internet play. No server, no account, no install:",
+        "two copies of this game talk directly to each other.",
+        "Single file, zero dependencies, standard library only.",
+        "Direct flows use TCP. Hole punch uses UDP (RUDP-lite): one",
+        "socket carries STUN, punching and game traffic.",
+        "Same rules and anti-cheat as LAN: mismatches forfeit.",
+    ]),
+    ("BEFORE YOU START (BOTH PLAYERS)", [
+        "1. Run the SAME game version (mismatch refuses to connect).",
+        "2. Pick the SAME board, fleet, mode and anti-cheat setting.",
+        "3. Decide who HOSTS (shares first) and who JOINS.",
+        "4. Have a chat/call ready: you read codes to each other.",
+        "5. Terminal at least 40 columns wide; codes are long.",
+    ]),
+    ("FLOW 1 - DIRECT CODE (EASIEST WHEN IT APPLIES)", [
+        "Use when: same VPN, or the host has a port forward / UPnP.",
+        "HOST: guided setup > Host > same network — or Advanced",
+        "  Networking > Host > Host direct code (TCP).",
+        "  The game tries UPnP unless Advanced > Settings > UPnP is OFF.",
+        "  Read the invite code + manual host:port line to the guest.",
+        "GUEST: guided setup > Join > invite code — or Advanced >",
+        "  Networking > Join > Paste invite code. Play.",
+        "VPN tip: join the VPN first (Tailscale, ZeroTier, WireGuard)",
+        "and use the VPN address. It always works. Say it out loud:",
+        "'are you on the VPN address?' before anything else.",
+    ]),
+    ("FLOW 2 - HOLE PUNCH (BOTH BEHIND HOME ROUTERS)", [
+        "Use when: no VPN, no port forward. Works on most home NAT.",
+        "HOST: guided setup > Host > different networks — or Advanced",
+        "  Networking > Host > Host hole-punch offer. Note the STUN line:",
+        "  punchable = offer will likely work; anything else read on.",
+        "  Read the OFFER code to the guest.",
+        "GUEST: guided setup > Join > offer code — or Advanced > Join.",
+        "  The game STUNs your NAT,",
+        "  shows YOUR ANSWER code: read it back to the host.",
+        "HOST: paste the answer when asked. Both sides punch",
+        "  (authenticated PUNCH / PUNCH-ACK, ~15 s window).",
+        "GUEST: press Enter only when the host HAS your answer,",
+        "  then both punch. Names + rules verify, game starts.",
+    ]),
+    ("FLOW 3 - MANUAL (IPV6, DNS, ODD SETUPS)", [
+        "Use when: IPv6, DNS name, or codes will not scan/read.",
+        "HOST: host direct as in Flow 1, but read the MANUAL line:",
+        "  host:port PLUS the secret line (two parts, both needed).",
+        "GUEST: guided setup > Join > address + secret — or Advanced",
+        "  Networking > Join > Manual address. Type host:port, then secret.",
+        "  Accepts 203.0.113.9:51234 and [2001:db8::1]:51234.",
+    ]),
+    ("REACHABILITY CHECK (HOST SEES THIS FIRST)", [
+        "Guided setup probes UPnP + STUN in parallel and prints:",
+        "  UPnP: found (external IP) = direct codes should work.",
+        "  UPnP: CGNAT = mapping useless; punch or VPN instead.",
+        "  STUN: punchable at ip:port = offers should work.",
+        "  STUN: anything else = read the reason; try VPN/manual.",
+        "Then pick the offered flow. Manual is always offered.",
+    ]),
+    ("SETTINGS & FLAGS (MENU = CLI, NOTHING CLI-ONLY)", [
+        "Advanced Networking > Settings mirrors every --online flag:",
+        "  Name (20 chars) | Port (0 = random) | Bind address",
+        "  Resume window s | Mode single/salvo | Anti-cheat hash/cell",
+        "  Net debug (redacted logs) | STUN servers (repeatable)",
+        "  UPnP ON/OFF.",
+        "CLI shortcuts: --online host | --online join CODE, --port,",
+        "--bind, --stun HOST:PORT, --no-upnp, --resume-timeout,",
+        "--net-debug, --name. Menu does everything CLI does.",
+    ]),
+    ("CODES, SECURITY, RESUME", [
+        "Codes BURN after first use (or 3 bad tries): ask for a fresh",
+        "one, never retry a dead code. 0/1/8 typos forgiven via crc.",
+        "Offers carry no names: the READY exchange swaps real names",
+        "and checks rules, mirroring TCP READY.",
+        "Auth is HMAC (SHA256); there is NO encryption and NO server.",
+        "Keep codes private: anyone holding one can take the seat.",
+        "Dropped link? TCP auto-reconnects inside the resume window",
+        "(default 120 s). UDP needs a manual redial. Clean exit says",
+        "'Opponent left'; a dead link says 'Connection lost'.",
+    ]),
+    ("ERROR MESSAGES (WHAT THEY MEAN, WHAT TO DO)", [
+        "Connection refused: host not listening / firewall. Check",
+        "  address, port, VPN membership.",
+        "Timeout: NAT/firewall drops packets. Try VPN or punch.",
+        "Wrong code: check the invite, get a fresh one if burned.",
+        "Version mismatch: both update to the same game version.",
+        "Rules mismatch: align board / fleet / mode / anti-cheat.",
+        "Opponent left: clean exit. Connection lost: dropped link.",
+        "Punch timeout, no two-way path: symmetric or hotspot NAT.",
+        "  Fix: VPN, port forward, or UPnP direct mode.",
+        "Answer code at join: give it to the HOST, not the join box.",
+    ]),
+    ("WHICH NAT ARE YOU BEHIND?", [
+        "Home router (full cone): direct + punch both work.",
+        "Symmetric / phone hotspot: punching FAILS by design.",
+        "  Don't retry: switch to VPN or port forward.",
+        "CGNAT (carrier-grade NAT): UPnP mapping is useless even",
+        "  when the router says yes. Punch or VPN instead.",
+    ]),
+    ("TROUBLESHOOTING CHECKLIST", [
+        "1. Same version? Same board/fleet/mode/anti-cheat?",
+        "2. Fresh code? (old ones burn). Read slowly, 0/1/8 forgive.",
+        "3. On the VPN address if using a VPN?",
+        "4. Firewall open for TCP (direct) / UDP (punch)?",
+        "5. Hotspot or symmetric NAT? Stop punching, use VPN.",
+        "6. CGNAT? Ignore UPnP success, punch or VPN.",
+        "7. STUN blocked? Try another --stun server.",
+        "8. Still stuck? Manual host:port + secret line.",
+    ]),
+]
+
+
+def _online_guide_lines():
+    """Plain-text guide (titles + bodies) for typed terminals / tests."""
+    out = []
+    for title, lines in ONLINE_GUIDE_SECTIONS:
+        out.append(title)
+        out.extend(lines)
+        out.append("")
+    return out
+
+
+ONLINE_HOWTO = "\n".join(_online_guide_lines())
+
+
+ONLINE_VPN_SECTIONS = [
+    ("WHAT A VPN DOES", [
+        "A VPN puts both players on one private network, as if you",
+        "shared Wi-Fi. Firewalls and home NAT stop mattering: the",
+        "host's VPN address takes direct codes every time.",
+        "Any VPN works, free or paid. Pick ONE below; both install it,",
+        "both join the same network, then use the VPN address in Flow 1.",
+    ]),
+    ("OPTION 1 - TAILSCALE (STEP BY STEP)", [
+        "1. Install Tailscale on both computers (tailscale.com/download).",
+        "2. Both open it and LOG IN with the same kind of account.",
+        "3. Each copies their Tailscale IP (100.x.y.z, shown in the app).",
+        "4. Host: start guided setup > Host > same network, and read",
+        "   the invite code as usual.",
+        "5. Guest: join with the code. If asked for an address, use",
+        "   the HOST's 100.x.y.z address, not the home Wi-Fi one.",
+        "Stuck on login? One admin account can invite the other by email.",
+    ]),
+    ("OPTION 2 - ANY OTHER VPN", [
+        "ZeroTier, WireGuard, Hamachi, Radmin, a work VPN: all fine.",
+        "Steps are always the same:",
+        "1. Both install the same VPN and join the same network/name.",
+        "2. Both confirm they see each other (peer list / ping).",
+        "3. Play Flow 1 with the HOST's VPN address.",
+        "If it has a choice of virtual addresses, prefer IPv4.",
+    ]),
+    ("BACK IN THE GAME", [
+        "With the VPN connected: Online Match > Play online (guided",
+        "setup) > Host or Join > same network. Direct code, done.",
+        "No VPN? Guided setup probes your routers and offers hole",
+        "punch or the manual line instead.",
+    ]),
+]
+
+
+def _online_vpn_lines():
+    """Plain-text VPN help for typed terminals / tests."""
+    out = []
+    for title, lines in ONLINE_VPN_SECTIONS:
+        out.append(title)
+        out.extend(lines)
+        out.append("")
+    return out
+
+
+def show_online_vpn_help():
+    """Boxed, paged VPN setup help (both UI modes). Never raises."""
+    try:
+        if use_cursor_ui():
+            try:
+                clear()
+            except Exception:
+                pass
+            pages = [ONLINE_VPN_SECTIONS[i:i + 2]
+                     for i in range(0, len(ONLINE_VPN_SECTIONS), 2)]
+            try:
+                for num, page in enumerate(pages):
+                    for line in center_block(
+                            brand_masthead("Online VPN setup")):
+                        print(line)
+                    print()
+                    for title, lines in page:
+                        try:
+                            wrapped = [w for l in lines
+                                       for w in wrap_prose(l)]
+                        except Exception:
+                            wrapped = list(lines)
+                        for line in center_block(
+                                boxed_panel(title, wrapped, double=True)):
+                            print(line)
+                        print()
+                    last = num == len(pages) - 1
+                    for line in center_block(command_bar(
+                            [("ANY KEY", "return" if last else "next page")])):
+                        print(line)
+                    try:
+                        with KeyReader() as kr:
+                            kr.get_key()
+                    except Quit:
+                        return
+                    except Exception:
+                        try:
+                            ask("Enter to continue > ")
+                        except Quit:
+                            return
+                        return
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+                return
+            except Quit:
+                return
+            except Exception:
+                pass
+        page_lines(_online_vpn_lines())
+    except Quit:
+        return
+    except Exception:
+        try:
+            for line in _online_vpn_lines():
+                print(line)
+        except Exception:
+            pass
+
+
+def online_quiz_recommend(role, same_network=None, given=None, reach=None):
+    """Pure quiz recommendation for the guided setup (no I/O, testable).
+
+    role "host": same_network True skips the probe (direct). Otherwise
+    `reach` (an online_reachability dict) picks: UPnP-ok -> direct,
+    punchable -> punch, else -> vpn (manual always exists as fallback).
+    role "join": `given` is what the host shared: invite/offer/manual.
+    Returns (flow, explanation); flow is direct/punch/vpn/manual/ask.
+    """
+    if role == "join":
+        if given == "invite":
+            return ("direct", "Invite code: joining direct.")
+        if given == "offer":
+            return ("punch", "Offer code: answering the punch.")
+        if given == "manual":
+            return ("manual", "Address + secret: manual join.")
+        return ("ask", "Pick what the host gave you.")
+    if role != "host":
+        return ("ask", "Pick host or join first.")
+    if same_network:
+        return ("direct",
+                "Same VPN / Wi-Fi / forward: direct code is the simple path.")
+    try:
+        up = (reach or {}).get("upnp", {})
+        st = (reach or {}).get("stun", {})
+        upnp_ok = bool(up.get("found") and not up.get("cgnat"))
+        if upnp_ok:
+            return ("direct",
+                    "Your router takes a direct code (UPnP mapped it).")
+        if st.get("punchable"):
+            return ("punch",
+                    "Both behind home routers: hole punch should work.")
+        if up.get("found") and up.get("cgnat"):
+            return ("vpn",
+                    "Carrier-grade NAT: UPnP is useless and punching is "
+                    "unlikely. VPN is the reliable fix; manual works "
+                    "with a forward.")
+        return ("vpn",
+                "No verified path (phone hotspots and symmetric NAT "
+                "cause this). VPN is the reliable fix; manual works "
+                "with a forward.")
+    except Exception:
+        return ("vpn",
+                "Probe unreadable: VPN is the safest bet; manual works "
+                "with a forward.")
+
+
+def _online_guided_host(cfg, score, rules):
+    """Host side of the wizard: one plain question, probe, dispatch."""
+    while True:
+        header = "\n".join(brand_masthead("Guided setup — hosting"))
+        try:
+            idx = select_menu(header, [
+                "Same VPN / Wi-Fi / forwarded port (we play direct)",
+                "Different networks / not sure (check my routers)",
+                BACK_LABEL,
+            ])
+        except Quit:
+            return
+        if idx == 2:
+            return
+        if idx == 0:
+            _online_host_direct(cfg, score, rules)
+            return
+        print("Checking reachability (UPnP + STUN, a couple of seconds)...")
+        try:
+            reach = online_reachability(stun_servers=cfg.stun or None)
+        except Quit:
+            return
+        except Exception:
+            reach = None
+        if reach is not None:
+            up = reach["upnp"]
+            st = reach["stun"]
+            print("UPnP: %s. STUN: %s."
+                  % (("found (%s)" % up["external_ip"]) if up["found"]
+                     else up["reason"] or "unavailable",
+                     ("punchable at %s:%d" % st["mapped"]) if st["punchable"]
+                     else st["reason"]))
+        flow, note = online_quiz_recommend("host", False, None, reach)
+        print(note)
+        if flow == "direct":
+            _online_host_direct(cfg, score, rules)
+            return
+        if flow == "punch":
+            _online_host_punch(cfg, score, rules)
+            return
+        try:
+            pick = select_menu("\n".join(
+                brand_masthead("Guided setup — no direct path")), [
+                "See VPN setup help",
+                "Host manual line instead (needs a forward)",
+                BACK_LABEL,
+            ])
+        except Quit:
+            return
+        if pick == 2:
+            return
+        if pick == 0:
+            show_online_vpn_help()
+        else:
+            _online_host_direct(cfg, score, rules)
+            return
+
+
+def _online_guided_join(cfg, score, rules):
+    """Join side of the wizard: what did the host give you? Dispatch."""
+    header = "\n".join(brand_masthead("Guided setup — joining"))
+    try:
+        idx = select_menu(header, [
+            "Invite code (direct play)",
+            "Offer code (hole punch)",
+            "Address + secret (manual)",
+            BACK_LABEL,
+        ])
+    except Quit:
+        return
+    if idx == 3:
+        return
+    if idx == 2:
+        _online_join_manual(cfg, score, rules)
+        return
+    try:
+        code = ask("Invite / offer code > ")
+    except Quit:
+        return
+    if not code.strip():
+        return
+    try:
+        kind = online_code_kind(code.strip())
+    except BadInvite:
+        print(message_for("BAD_CODE"))
+        return
+    if kind == "answer":
+        print("That is an answer code: give it to the host, not to join.")
+        return
+    if kind != ("direct" if idx == 0 else "punch"):
+        print("That looks like %s code; using the right flow for it."
+              % kind)
+    if kind == "direct":
+        _online_join_direct(cfg, score, rules, code)
+    else:
+        _online_join_punch(cfg, score, rules, code)
+
+
+def online_guided_setup(cfg, score=None):
+    """Friendly wizard: setup -> host/join -> plain questions -> flow.
+
+    Auto-detection probes ONLY here (never on menu open). Existing
+    _online_host_*/_online_join_* flows are reused untouched.
+    """
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    header = "\n".join(brand_masthead("Play online — guided setup"))
+    try:
+        idx = select_menu(header, [
+            "Host a match (friends join me)",
+            "Join a match (a friend hosts)",
+            BACK_LABEL,
+        ])
+    except Quit:
+        return
+    if idx == 2:
+        return
+    if idx == 0:
+        _online_guided_host(cfg, score, rules)
+    else:
+        _online_guided_join(cfg, score, rules)
+
+
+def show_online_guide():
+    """Boxed, paged field manual for online play (both UI modes).
+
+    Cursor UI: masthead + two boxed sections per page, ANY-KEY paging.
+    Typed fallback: the same text through page_lines. Never raises.
+    """
+    try:
+        if use_cursor_ui():
+            try:
+                clear()
+            except Exception:
+                pass
+            pages = [ONLINE_GUIDE_SECTIONS[i:i + 2]
+                     for i in range(0, len(ONLINE_GUIDE_SECTIONS), 2)]
+            try:
+                for num, page in enumerate(pages):
+                    for line in center_block(
+                            brand_masthead("Online field manual")):
+                        print(line)
+                    print()
+                    for title, lines in page:
+                        try:
+                            wrapped = [w for l in lines
+                                       for w in wrap_prose(l)]
+                        except Exception:
+                            wrapped = list(lines)
+                        for line in center_block(
+                                boxed_panel(title, wrapped, double=True)):
+                            print(line)
+                        print()
+                    last = num == len(pages) - 1
+                    for line in center_block(command_bar(
+                            [("ANY KEY", "return" if last else "next page")])):
+                        print(line)
+                    try:
+                        with KeyReader() as kr:
+                            kr.get_key()
+                    except Quit:
+                        return
+                    except Exception:
+                        try:
+                            ask("Enter to continue > ")
+                        except Quit:
+                            return
+                        return
+                    try:
+                        clear()
+                    except Exception:
+                        pass
+                return
+            except Quit:
+                return
+            except Exception:
+                pass
+        page_lines(_online_guide_lines())
+    except Quit:
+        return
+    except Exception:
+        try:
+            for line in _online_guide_lines():
+                print(line)
+        except Exception:
+            pass
+
+
+class OnlineConfig:
+    """In-menu equivalent of every --online CLI flag (no CLI exclusives)."""
+
+    def __init__(self, name="Player", port=0, bind="0.0.0.0",
+                 resume_timeout=None, net_debug=False, stun=None,
+                 no_upnp=False, cell_anticheat=False, mode="single"):
+        self.name = sanitize_name(name or "Player")
+        self.port = int(port or 0)
+        self.bind = bind or "0.0.0.0"
+        self.resume_timeout = resume_timeout
+        self.net_debug = bool(net_debug)
+        self.stun = list(stun or [])
+        self.no_upnp = bool(no_upnp)
+        self.cell_anticheat = bool(cell_anticheat)
+        self.mode = "salvo" if mode == "salvo" else "single"
+
+    def describe(self):
+        return [
+            "Name: %s" % self.name,
+            "Port: %s" % (str(self.port) if self.port else "0 (random)"),
+            "Bind: %s" % self.bind,
+            "Resume window: %s" % (
+                ("%ss" % self.resume_timeout)
+                if self.resume_timeout else "default"),
+            "Mode: %s" % self.mode.upper(),
+            "Anti-cheat: %s" % ("PER-CELL" if self.cell_anticheat
+                                else "HASH"),
+            "Net debug: %s" % ("ON" if self.net_debug else "OFF"),
+            "STUN: %s" % (", ".join(self.stun) if self.stun
+                          else "(default servers)"),
+            "UPnP: %s" % ("OFF" if self.no_upnp
+                          else "ON (auto-map)"),
+        ]
+
+
+_ONLINE_CFG = OnlineConfig()
+
+
+def online_config_from_args(args):
+    """Seed the menu config from CLI flags (CLI stays as shortcuts)."""
+    return OnlineConfig(
+        name=getattr(args, "name", None) or "Player",
+        port=getattr(args, "port", 0) or 0,
+        bind=getattr(args, "bind", None) or "0.0.0.0",
+        resume_timeout=getattr(args, "resume_timeout", None),
+        net_debug=getattr(args, "net_debug", False),
+        stun=getattr(args, "stun", None) or [],
+        no_upnp=getattr(args, "no_upnp", False),
+    )
+
+
+def online_join_error_text(exc):
+    """Friendly one-liner for every guest-side failure (menu + CLI share)."""
+    if isinstance(exc, VersionMismatch):
+        return message_for("VERSION")
+    if isinstance(exc, RulesMismatch):
+        return (message_for("RULES_MISMATCH")
+                + " Both sides must pick the same board, fleet and mode.")
+    if isinstance(exc, HandshakeFailed):
+        reason = getattr(exc, "reason", "")
+        if reason:
+            try:
+                return message_for(reason)
+            except Exception:
+                pass
+        return ONLINE_ERROR_HINTS["BAD_CODE"]
+    if isinstance(exc, ConnectionRefusedError):
+        return ONLINE_ERROR_HINTS["REFUSED"]
+    if isinstance(exc, (socket.timeout, TimeoutError, OSError)):
+        return ONLINE_ERROR_HINTS["TIMEOUT"]
+    return "Online join failed: %s" % exc
+
+
+class _OnlineMenuClient:
+    """Minimal LANGame client shim: print/chat surface, no lobby state."""
+
+    def __init__(self, name="Player"):
+        self.name = name
+
+    def print_now(self, line):
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def add_chat(self, line):
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def handle_match_chat(self, peer_name, text):
+        try:
+            print(paint("[%s] %s" % (peer_name, text), "cyan"))
+        except Exception:
+            pass
+
+    def print_chat_history(self):
+        print("  No chat history in online quick match.")
+
+
+def _online_prepare_host(cfg, rules_hash):
+    """Bind a listener and return (listener, secret, code). No blocking."""
+    listener, secret = host_once(cfg.bind or "0.0.0.0", cfg.port or 0,
+                                 cfg.name, rules_hash,
+                                 game_ver=LAN_VERSION)
+    bind = (cfg.bind or "").strip()
+    if bind and bind != "0.0.0.0":
+        invite_ip = bind
+    else:
+        ip = online_local_ip()
+        invite_ip = ip if ip != "0.0.0.0" else "127.0.0.1"
+    code = encode_invite(invite_ip, listener.port, secret)
+    return listener, secret, code
+
+
+def _online_accept_session(listener, cfg):
+    return accept_host(listener, timeout=cfg.resume_timeout or None)
+
+
+def _online_join_session(cfg, code, rules_hash):
+    return connect_guest(code, cfg.name, rules_hash,
+                         game_ver=LAN_VERSION,
+                         timeout=cfg.resume_timeout or None)
+
+
+def _online_launch_game(session, info, cfg, is_host):
+    """Run a full LANGame match over the established online session."""
+    my_id = "host" if is_host else "guest"
+    peer = sanitize_name(info.get("peer_name", "?"))
+    me = sanitize_name(cfg.name)
+    if is_host:
+        host_name, guest_name = me, peer
+    else:
+        host_name, guest_name = peer, me
+    mode, first, match_id, key = match_params_from_handshake(
+        info["session_id"], host_name, guest_name, cfg.mode)
+    conn = OnlineConn(session, peer, mode, first, my_id, match_id, key,
+                      cell_anticheat=cfg.cell_anticheat)
+    client = _OnlineMenuClient(me)
+    try:
+        game = LANGame(client, conn)
+        try:
+            return game.run()
+        except Quit:
+            try:
+                conn.send({"type": "surrender"})
+            except Exception:
+                pass
+            return "loss"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_online_host(args):
+    cfg = online_config_from_args(args)
+    configure_board(10, "classic")
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    try:
+        listener, _secret, code = _online_prepare_host(cfg, rules)
+    except OSError as exc:
+        print("Cannot listen on %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        return
+    print("Online host: %s (port %d)" % (cfg.name, listener.port))
+    print("Invite code: %s" % code)
+    print("Waiting for guest (paste this code on the guest side)...")
+    try:
+        session, info = _online_accept_session(listener, cfg)
+    except HandshakeFailed as exc:
+        print("Host failed: %s" % message_for(getattr(exc, "reason", "")))
+        listener.close()
+        return
+    except Quit:
+        listener.close()
+        return
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    try:
+        _online_launch_game(session, info, cfg, True)
+    finally:
+        listener.close()
+
+
+def run_online_join(args, code):
+    cfg = online_config_from_args(args)
+    configure_board(10, "classic")
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    try:
+        session, info = _online_join_session(cfg, code, rules)
+    except Exception as exc:
+        print(online_join_error_text(exc))
+        return
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    _online_launch_game(session, info, cfg, False)
+
+
+def _online_chat_loop(session, me, peer):
+    limiter = ChatRateLimiter()
+    stop = threading.Event()
+
+    def _rx():
+        while not stop.is_set():
+            try:
+                msg = session.recv_game(timeout=0.5)
+            except SessionLost as exc:
+                print("\n%s" % message_for(getattr(exc, "reason",
+                                                  "LINK_LOST")))
+                stop.set()
+                return
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("type") == "chat":
+                print("\n[%s] %s" % (render_literal(peer),
+                                     render_literal(msg.get("text", ""))))
+            elif isinstance(msg, dict) and msg.get("type") == "bye":
+                print("\n%s" % message_for("PEER_LEFT"))
+                stop.set()
+                return
+
+    t = threading.Thread(target=_rx, daemon=True)
+    t.start()
+    while not stop.is_set():
+        try:
+            line = input("> ")
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            break
+        if line.strip().lower() in ("quit", "exit", "q"):
+            break
+        if not limiter.allow():
+            print("(rate limited, slow down)")
+            continue
+        try:
+            session.send_game({"type": "chat",
+                               "text": sanitize_chat(line)})
+        except SessionLost:
+            print(message_for("LINK_LOST"))
+            break
+    stop.set()
+    try:
+        session.send_bye()
+    except Exception:
+        pass
+    try:
+        session.close()
+    except Exception:
+        pass
+
+
+def online_settings_menu(cfg):
+    """Edit every online option in-menu (parity with all --online flags)."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online settings") +
+            [paint("Every CLI flag lives here too — nothing is CLI-only.", "grey"),
+             ""] + cfg.describe())
+        opts = [
+            "Display name",
+            "TCP port (0 = random)",
+            "Bind address",
+            "Resume window (seconds, blank = default)",
+            "Mode (NORMAL/SALVO)",
+            "Anti-cheat (HASH/PER-CELL, both sides must match)",
+            "Net debug (ON/OFF)",
+            "STUN servers (hole-punch follow-up)",
+            "UPnP (hole-punch follow-up)",
+            BACK_LABEL,
+        ]
+        idx = select_menu(header, opts)
+        if idx == len(opts) - 1:
+            return
+        try:
+            if idx == 0:
+                raw = ask("Display name (max 20 chars) > ")
+                if raw:
+                    cfg.name = sanitize_name(raw)
+            elif idx == 1:
+                raw = ask("TCP port 0-65535 (0 = random) > ")
+                if raw:
+                    try:
+                        port = int(raw.strip())
+                    except ValueError:
+                        print("  Port must be a number.")
+                        continue
+                    if 0 <= port <= 65535:
+                        cfg.port = port
+                    else:
+                        print("  Port must be 0-65535.")
+            elif idx == 2:
+                raw = ask("Bind address (blank = all interfaces) > ")
+                cfg.bind = raw.strip() or "0.0.0.0"
+            elif idx == 3:
+                raw = ask("Resume window seconds (blank = default) > ")
+                if not raw.strip():
+                    cfg.resume_timeout = None
+                else:
+                    try:
+                        val = float(raw.strip())
+                    except ValueError:
+                        print("  Must be a number.")
+                        continue
+                    if val <= 0:
+                        print("  Must be positive.")
+                        continue
+                    cfg.resume_timeout = val
+            elif idx == 4:
+                cfg.mode = "salvo" if cfg.mode != "salvo" else "single"
+                print("  Mode set to %s." % cfg.mode.upper())
+            elif idx == 5:
+                cfg.cell_anticheat = not cfg.cell_anticheat
+                print("  Anti-cheat set to %s."
+                      % ("PER-CELL" if cfg.cell_anticheat else "HASH"))
+            elif idx == 6:
+                cfg.net_debug = not cfg.net_debug
+                print("  Net debug %s." % ("ON" if cfg.net_debug else "OFF"))
+            elif idx == 7:
+                raw = ask("STUN servers, comma-separated HOST:PORT (blank clears) > ")
+                if not raw.strip():
+                    cfg.stun = []
+                else:
+                    cfg.stun = [p.strip() for p in raw.split(",")
+                                if p.strip()]
+                print("  Stored (used by the hole-punch follow-up).")
+            elif idx == 8:
+                cfg.no_upnp = not cfg.no_upnp
+                print("  UPnP %s (used by the hole-punch follow-up)."
+                      % ("OFF" if cfg.no_upnp else "ON"))
+        except Quit:
+            return
+
+
+def _online_bump_score(score, result):
+    if not isinstance(score, dict):
+        return
+    if result == "win":
+        score["win"] = score.get("win", 0) + 1
+    elif result == "loss":
+        score["loss"] = score.get("loss", 0) + 1
+
+
+def _online_host_direct(cfg, score, rules):
+    """Direct TCP host flow, with a UPnP mapping attempt unless disabled."""
+    try:
+        listener, secret, code = _online_prepare_host(cfg, rules)
+    except OSError as exc:
+        print("Cannot listen on %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        return
+    mapping = None
+    if not cfg.no_upnp:
+        try:
+            mapping = upnp_map(listener.port,
+                               internal_client=online_local_ip())
+        except Exception:
+            mapping = None
+    try:
+        if mapping and mapping.get("available"):
+            print("UPnP mapped %s -> you (external %s:%d)."
+                  % (cfg.name, mapping["external_ip"], listener.port))
+        print("Online host: %s (port %d)" % (cfg.name, listener.port))
+        print("Invite code: %s" % code)
+        print("Manual: %s:%d + secret %s"
+              % (online_local_ip(), listener.port,
+                 encode_secret_line(secret)))
+        print("Share the code with your guest. Waiting%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            session, info = _online_accept_session(listener, cfg)
+        except HandshakeFailed as exc:
+            print("Host failed: %s"
+                  % message_for(getattr(exc, "reason", "")))
+            return
+        print("Connected to %s (session %s)."
+              % (sanitize_name(info.get("peer_name", "?")),
+                 info["session_id"]))
+        result = _online_launch_game(session, info, cfg, True)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        try:
+            listener.close()
+        except Exception:
+            pass
+        if mapping and mapping.get("available"):
+            try:
+                upnp_unmap(mapping)
+            except Exception:
+                pass
+
+
+def _online_host_punch(cfg, score, rules):
+    """Hole-punch host flow: STUN on the game socket, offer, answer, punch."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((cfg.bind or "0.0.0.0", cfg.port or 0))
+    except OSError as exc:
+        print("Cannot bind %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
+    handed = False
+    try:
+        servers = cfg.stun or list(DEFAULT_STUN_SERVERS)
+        mapped, punchable, reason = stun_check(sock, servers)
+        lan_ep = (online_local_ip(), sock.getsockname()[1])
+        if mapped is None:
+            print("STUN: %s. Offering LAN-only." % reason)
+        elif not punchable:
+            print("STUN: %s" % reason)
+        pub = mapped or lan_ep
+        secret = new_secret()
+        lan = lan_ep if lan_ep != pub else None
+        ocode, offer = encode_offer(pub, secret, lan=lan)
+        print("Punch offer (share with guest): %s" % ocode)
+        try:
+            acode = ask("Guest answer code > ")
+        except Quit:
+            return
+        try:
+            answer = decode_answer(acode.strip())
+        except (BadInvite, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            return
+        if not verify_answer_tag(offer, answer, secret):
+            print(message_for("BAD_CODE") + " (answer tag invalid).")
+            return
+        k_hg, k_gh, k_resume = punch_keys(secret, offer["nonce_h"],
+                                          answer["nonce_g"])
+        print("Punching%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            peer_addr, _pinfo = punch_connect(
+                sock, punch_candidates(answer), k_hg, k_gh,
+                offer["nonce_h"], peer_nonce=answer["nonce_g"])
+        except HandshakeFailed as exc:
+            print("%s %s" % (message_for(getattr(exc, "reason", "")), exc))
+            return
+        transport = UdpTransport(sock, peer_addr, k_hg, k_gh)
+        handed = True
+        sid = punch_session_id(secret, offer["nonce_h"], answer["nonce_g"])
+        try:
+            peer_name = udp_ready_exchange(transport, True, cfg.name,
+                                           rules, sid)
+        except (RulesMismatch, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            transport.close()
+            return
+        except (HandshakeFailed, TransportClosed) as exc:
+            print(message_for(getattr(exc, "reason", "LINK_LOST")))
+            transport.close()
+            return
+        session = Session(transport, session_id=sid, name=cfg.name)
+        session.k_resume = k_resume
+        print("Connected to %s (session %s)." % (peer_name, sid))
+        result = _online_launch_game(
+            session, {"session_id": sid, "peer_name": peer_name}, cfg, True)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        if not handed:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def online_host_menu(cfg, score=None):
+    """Menu host flow: setup -> reachability -> direct/punch/manual."""
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    print("Checking reachability (UPnP + STUN in parallel)...")
+    try:
+        reach = online_reachability(stun_servers=cfg.stun or None)
+    except Quit:
+        return
+    except Exception:
+        reach = None
+    if reach is not None:
+        up = reach["upnp"]
+        st = reach["stun"]
+        print("UPnP: %s. STUN: %s."
+              % (("found (%s)" % up["external_ip"]) if up["found"]
+                 else up["reason"] or "unavailable",
+                 ("punchable at %s:%d" % st["mapped"]) if st["punchable"]
+                 else st["reason"]))
+        vpn = confirm("Are you on a VPN or forwarded port (direct works)?")
+        plan = plan_host_options(
+            upnp_available=bool(up["found"] and not up["cgnat"]),
+            stun_punchable=st["punchable"], user_direct=vpn)
+    else:
+        plan = plan_host_options()
+    opts = []
+    flows = []
+    for flow, label in (("direct", "Host direct code (TCP)"),
+                        ("punch", "Host hole-punch offer (UDP)"),
+                        ("manual", "Host manual line (TCP host:port)")):
+        offered, note = plan[flow]
+        opts.append("%s — %s" % (label, note))
+        flows.append(flow if offered else None)
+    opts.append(BACK_LABEL)
+    idx = select_menu("\n".join(brand_masthead("Online host — pick a flow")),
+                      opts)
+    if idx == len(opts) - 1:
+        return
+    if flows[idx] is None:
+        print("That flow is not available with current reachability.")
+        return
+    if flows[idx] in ("direct", "manual"):
+        _online_host_direct(cfg, score, rules)
+    else:
+        _online_host_punch(cfg, score, rules)
+
+
+def _online_join_direct(cfg, score, rules, code):
+    try:
+        session, info = _online_join_session(cfg, code.strip(), rules)
+    except Exception as exc:
+        print(online_join_error_text(exc))
+        return
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    try:
+        result = _online_launch_game(session, info, cfg, False)
+    except Quit:
+        return
+    _online_bump_score(score, result)
+
+
+def _online_join_manual(cfg, score, rules):
+    """Manual TCP form: host:port + secret line (IPv6/DNS/odd setups)."""
+    try:
+        addr = ask("Host address (IP:port) > ")
+        secret_line = ask("Secret line > ")
+    except Quit:
+        return
+    try:
+        host, port = _split_host_port(addr.strip())
+        secret = decode_secret_line(secret_line.strip())
+    except (BadInvite, ValueError) as exc:
+        print("Bad manual address/secret: %s" % exc)
+        return
+    try:
+        sock, info = online_dial(host, port, secret, cfg.name, rules,
+                                 LAN_VERSION,
+                                 timeout=cfg.resume_timeout or None)
+    except Exception as exc:
+        print(online_join_error_text(exc))
+        return
+    transport = TcpTransport(sock, info["send_key"], info["recv_key"])
+    session = Session(transport, session_id=info["session_id"], name=cfg.name)
+    session.k_resume = info["k_resume"]
+    session.handshake_info = info
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    try:
+        result = _online_launch_game(session, info, cfg, False)
+    except Quit:
+        return
+    _online_bump_score(score, result)
+
+
+def _split_host_port(text):
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        rest = rest.lstrip(":")
+        if not host or not rest.isdigit():
+            raise ValueError("bad address")
+        return host, int(rest)
+    host, sep, port_s = text.rpartition(":")
+    if not sep or not host or not port_s.isdigit():
+        raise ValueError("bad address, want host:port")
+    return host, int(port_s)
+
+
+def _online_join_punch(cfg, score, rules, ocode):
+    """Hole-punch guest flow: STUN, answer, punch on one socket."""
+    try:
+        offer = decode_offer(ocode.strip())
+    except (BadInvite, VersionMismatch) as exc:
+        print(online_join_error_text(exc))
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((cfg.bind or "0.0.0.0", cfg.port or 0))
+    except OSError as exc:
+        print("Cannot bind %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
+    handed = False
+    try:
+        servers = cfg.stun or list(DEFAULT_STUN_SERVERS)
+        mapped, _punchable, reason = stun_check(sock, servers)
+        lan_ep = (online_local_ip(), sock.getsockname()[1])
+        if mapped is None:
+            print("STUN: %s. Using LAN address." % reason)
+        pub = mapped or lan_ep
+        lan = lan_ep if lan_ep != pub else None
+        try:
+            acode, answer = encode_answer(offer, pub, offer["secret"], lan=lan)
+        except BadInvite as exc:
+            print("Cannot answer this offer: %s" % exc)
+            return
+        print("Your answer code (share with host): %s" % acode)
+        try:
+            ask("Press Enter when the host has it > ")
+        except Quit:
+            return
+        k_hg, k_gh, k_resume = punch_keys(offer["secret"], offer["nonce_h"],
+                                          answer["nonce_g"])
+        print("Punching%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            peer_addr, _pinfo = punch_connect(
+                sock, punch_candidates(offer), k_gh, k_hg,
+                answer["nonce_g"], peer_nonce=offer["nonce_h"])
+        except HandshakeFailed as exc:
+            print("%s %s" % (message_for(getattr(exc, "reason", "")), exc))
+            return
+        transport = UdpTransport(sock, peer_addr, k_gh, k_hg)
+        handed = True
+        sid = punch_session_id(offer["secret"], offer["nonce_h"],
+                               answer["nonce_g"])
+        try:
+            peer_name = udp_ready_exchange(transport, False, cfg.name,
+                                           rules, sid)
+        except (RulesMismatch, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            transport.close()
+            return
+        except (HandshakeFailed, TransportClosed) as exc:
+            print(message_for(getattr(exc, "reason", "LINK_LOST")))
+            transport.close()
+            return
+        session = Session(transport, session_id=sid, name=cfg.name)
+        session.k_resume = k_resume
+        print("Connected to %s (session %s)." % (peer_name, sid))
+        result = _online_launch_game(
+            session, {"session_id": sid, "peer_name": peer_name}, cfg, False)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        if not handed:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def online_join_menu(cfg, score=None):
+    """Menu join flow: setup -> paste any code -> flow by code kind."""
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    header = "\n".join(brand_masthead("Online join — how?"))
+    idx = select_menu(header, ["Paste invite / offer code",
+                               "Manual address (host:port + secret)",
+                               BACK_LABEL])
+    if idx == 2:
+        return
+    if idx == 1:
+        rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+        _online_join_manual(cfg, score, rules)
+        return
+    try:
+        code = ask("Invite / offer code > ")
+    except Quit:
+        return
+    if not code.strip():
+        return
+    try:
+        kind = online_code_kind(code.strip())
+    except BadInvite:
+        print(message_for("BAD_CODE"))
+        return
+    if kind == "answer":
+        print("That is an answer code: give it to the host, not to join.")
+        return
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    if kind == "direct":
+        _online_join_direct(cfg, score, rules, code)
+    else:
+        _online_join_punch(cfg, score, rules, code)
+
+
+def online_advanced_menu(cfg, score=None):
+    """Raw flows + settings, exactly as the old Online menu (power users)."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online — advanced networking") +
+            [paint("Raw flows and settings. Nothing is CLI-only.", "grey"),
+             ""] + cfg.describe())
+        opts = [
+            "Host a match (show invite code)",
+            "Join with invite code",
+            "Settings (name, port, bind, resume, debug, STUN, UPnP)",
+            BACK_LABEL,
+        ]
+        try:
+            idx = select_menu(header, opts)
+        except Quit:
+            return
+        if idx == len(opts) - 1:
+            return
+        if idx == 0:
+            online_host_menu(cfg, score)
+        elif idx == 1:
+            online_join_menu(cfg, score)
+        elif idx == 2:
+            online_settings_menu(cfg)
+
+
+def online_menu(cfg, score=None):
+    """Friendly entry: guided setup, VPN help, advanced, guide."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online — internet play") +
+            [paint("No server. Guided setup picks the right method for you.",
+                   "grey")])
+        opts = [
+            "Play online — guided setup (recommended)",
+            "VPN setup help",
+            "Advanced Networking (host / join / settings)",
+            "How online play works",
+            BACK_LABEL,
+        ]
+        try:
+            idx = select_menu(header, opts)
+        except Quit:
+            return
+        if idx == len(opts) - 1:
+            return
+        if idx == 0:
+            online_guided_setup(cfg, score)
+        elif idx == 1:
+            show_online_vpn_help()
+        elif idx == 2:
+            online_advanced_menu(cfg, score)
+        elif idx == 3:
+            show_online_guide()
+
+
 def main():
     global USE_COLOR, ANSI_OK
 
@@ -9676,6 +13457,25 @@ def main():
                         help="UDP/TCP port for LAN matchmaking")
     parser.add_argument("--lan-password", default=None,
                         help="optional LAN lobby password")
+    parser.add_argument("--online", nargs="+", metavar="MODE",
+                        default=None,
+                        help="online play: 'host' or 'join CODE'")
+    parser.add_argument("--port", type=int, default=0,
+                        help="online TCP/UDP port (0 = random high port)")
+    parser.add_argument("--bind", default=None,
+                        help="online bind address (default all interfaces)")
+    parser.add_argument("--stun", action="append", default=[],
+                        metavar="HOST:PORT",
+                        help="STUN server for hole punching (repeatable)")
+    parser.add_argument("--no-upnp", action="store_true",
+                        help="disable UPnP port mapping")
+    parser.add_argument("--resume-timeout", type=float,
+                        default=RESUME_WINDOW_S,
+                        help="reconnect window in seconds (default 120)")
+    parser.add_argument("--net-debug", action="store_true",
+                        help="verbose redacted network logs")
+    parser.add_argument("--name", default=None,
+                        help="online display name (max 20 chars)")
     parser.add_argument("--board", type=int, default=None,
                         help="board size (6-14); skips the setup menu")
     parser.add_argument("--fleet", choices=sorted(FLEET_PRESETS.keys()), default=None,
@@ -9738,6 +13538,7 @@ def main():
 
     score = {"win": 0, "loss": 0}
     lan_score = {"win": 0, "loss": 0, "verified_win": 0, "forfeit_win": 0}
+    online_cfg = online_config_from_args(args)
 
     try:
         if args.load:
@@ -9760,6 +13561,18 @@ def main():
             mode, contrarian_flag = wiz
             camp = CampaignGame(mode=mode, contrarian=contrarian_flag)
             camp.run()
+            return
+
+        if args.online:
+            configure_board(10, "classic")
+            parts = list(args.online)
+            verb = parts[0].lower() if parts else ""
+            if verb == "host":
+                run_online_host(args)
+            elif verb == "join" and len(parts) >= 2:
+                run_online_join(args, parts[1])
+            else:
+                print("Usage: --online host | --online join CODE")
             return
 
         menu_sel = 0
@@ -9798,7 +13611,7 @@ def main():
                 header_lines.append("")
                 header_lines.extend(profile_panel)
             header_lines.append("")
-            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–7", "QUICK"), ("Q", "QUIT")]))
+            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–8", "QUICK"), ("Q", "QUIT")]))
             header = "\n".join(header_lines)
 
             menu_opts = [
@@ -9806,6 +13619,7 @@ def main():
                 "Campaign (Easy → Nightmare)",
                 "Hotseat (2 players)",
                 "LAN Matchmaking",
+                "Online Match",
                 "How to play",
                 "Settings",
                 "Quit",
@@ -9815,7 +13629,7 @@ def main():
             if choice != -1:
                 menu_sel = choice
 
-            if choice == -1 or choice == 6:
+            if choice == -1 or choice == 7:
                 break
 
             # --- New game -------------------------------------------------
@@ -9917,9 +13731,14 @@ def main():
                     lan_score[k] += v
                 continue
 
-            # --- How to play ---------------------------------------------
-            if choice == 5: settings_menu(); continue
+            # --- Online ---------------------------------------------------
             if choice == 4:
+                online_menu(online_cfg, lan_score)
+                continue
+
+            # --- How to play ---------------------------------------------
+            if choice == 6: settings_menu(); continue
+            if choice == 5:
                 if use_cursor_ui():
                     clear()
                     for line in center_block(brand_masthead("Field manual")):

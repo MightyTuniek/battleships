@@ -1262,6 +1262,29 @@ def _rule_char(char: str = "─") -> str:
     return char
 
 
+_ARROW_GLYPH = "▶"
+
+
+def _arrow_supported() -> bool:
+    """True when the current stdout encoding can render the selection arrow.
+
+    Some terminals (legacy code page, minimal fonts) show U+25B6 as "?"
+    or a blank box. Detect via the stdout encoding and fall back to
+    ASCII ">" so choice windows stay readable everywhere.
+    """
+    try:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        _ARROW_GLYPH.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+def _choice_arrow() -> str:
+    """Selection marker: real arrow when renderable, else ASCII ">"."""
+    return _ARROW_GLYPH if _arrow_supported() else ">"
+
+
 def _vis_len(s):
     return len(strip_ansi(s))
 
@@ -1887,7 +1910,7 @@ def fleet_panel(board, current_name=None, title="FLEET"):
     max_len = max((n for _, n in FLEET), default=5)
     for name, length in FLEET:
         if name == current_name:
-            marker = paint("▶", accent, "bold")
+            marker = paint(_choice_arrow(), accent, "bold")
         elif name in board.ship_cells:
             marker = paint("✓", "green", "bold")
         else:
@@ -2342,7 +2365,7 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
                 if i == idx:
                     # Unmistakable focus: marker + strong highlight, works mono too.
                     if is_color_enabled():
-                        row = paint("▶ ", "cyan", "bold") + paint(label, "bold", "white")
+                        row = paint(_choice_arrow() + " ", "cyan", "bold") + paint(label, "bold", "white")
                     else:
                         row = ">> %s" % strip_ansi(label)
                     menu_rows.append(row)
@@ -2951,7 +2974,7 @@ def hint_text(k, rng=random):
     top = top_candidates(k, n=3, rng=rng)
     lines = [paint("TOP TARGETS", "cyan", "bold")]
     for i, (p, score, count) in enumerate(top, 1):
-        marker = paint("▶", "cyan", "bold") if i == 1 else paint("%02d" % i, "grey")
+        marker = paint(_choice_arrow(), "cyan", "bold") if i == 1 else paint("%02d" % i, "grey")
         lines.append("%s  %s  %s" % (
             marker,
             paint(cell_name(p).ljust(4), "bold", "white"),
@@ -4806,7 +4829,7 @@ class CampaignGame:
                     paint("●", "green", "bold"), name.upper().ljust(9), badge, shots, acc))
             elif len(self.results) == idx:
                 rows.append("%s  %-9s  %s" % (
-                    paint("▶", "cyan", "bold"), name.upper().ljust(9), status_badge("CURRENT", "focus")))
+                    paint(_choice_arrow(), "cyan", "bold"), name.upper().ljust(9), status_badge("CURRENT", "focus")))
             else:
                 rows.append("%s  %-9s  %s" % (
                     paint("○", "grey"), name.upper().ljust(9), status_badge("LOCKED", "disabled")))
@@ -9117,7 +9140,7 @@ class LANClient:
             ]
         else:
             for i, p in enumerate(peers[:player_rows_n]):
-                marker = paint("▶", "cyan", "bold") if i == sel_idx else paint(" ", "grey")
+                marker = paint(_choice_arrow(), "cyan", "bold") if i == sel_idx else paint(" ", "grey")
                 pref = "SALVO" if p.pref == "salvo" else "NORMAL"
                 state = p.state or "available"
                 if state == "available":

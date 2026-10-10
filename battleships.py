@@ -665,9 +665,14 @@ def get_theme(name: str) -> Theme:
 
 
 def is_rich_active() -> bool:
-    """True only when a non-classic theme is opted in and Rich can render."""
+    """True when a non-classic theme is opted in and ANSI can render it.
+
+    Themes are plain-ANSI (zero-dependency); Rich is never required for
+    rendering. The optional rich import flag is informational only.
+    _NO_RICH (--no-rich) opts back out to classic styling.
+    """
     try:
-        if not RICH_OK or _NO_RICH:
+        if _NO_RICH:
             return False
         if _THEME_CURRENT.name == "classic":
             return False
@@ -679,14 +684,12 @@ def is_rich_active() -> bool:
 
 
 def theme_nudge_line() -> str:
-    """Disclaimer under the masthead: install hint or opt-in hint, else ''."""
+    """Disclaimer under the masthead: opt-in hint, else ''."""
     try:
         if _THEME_CURRENT.name != "classic":
             return ""
         if _NO_RICH:
             return ""
-        if not RICH_OK:
-            return RICH_NUDGE
         return CLASSIC_NUDGE
     except Exception:
         return ""
@@ -1158,7 +1161,7 @@ def _theme_menu(sel_store):
             options.append("%s%s  %s" % (marker, name.upper(), badge))
         options.append("Back")
         header = "\n".join(brand_masthead("Settings — Theme"))
-        header += "\n" + paint("Session-only. Classic is the default; themed frames need 'pip install rich'.", "grey")
+        header += "\n" + paint("Session-only. Classic is the default; themes use plain ANSI.", "grey")
         idx = select_menu(header, options, start_idx=min(pos, len(options) - 1))
         pos = idx
         sel_store["__theme__"] = pos
@@ -1896,7 +1899,7 @@ def boxed_panel(title, content_lines, double=False):
 
 def rich_nudge_line() -> str:
     """Install hint shown under the masthead when Rich theming is off."""
-    return RICH_NUDGE
+    return CLASSIC_NUDGE
 
 
 def brand_masthead(context=None, width=None):
@@ -2235,8 +2238,60 @@ def is_back(value) -> bool:
 
 
 def ask(prompt):
+    """Typed-input entry point: plain `input()` off-TTY, separated line on TTY.
+
+    Non-TTY (pipes/redirects) keeps the exact legacy `input(prompt)` path so
+    scripts and tests see unchanged text. On a real terminal, render_frame()
+    leaves the cursor glued to the end of the last command-bar line (no
+    trailing newline), so a bare `input("Public chat > ")` renders as
+    "[Q] QUITPublic chat > ". Emit a leading newline plus the prompt label
+    on its own line (no rule — the per-prompt rule cluttered full-screen
+    UI), then read via a short `> `/`▶ ` marker.
+    Never raises except Quit; styling failures fall back to legacy input.
+    """
     try:
-        return input(prompt).strip()
+        try:
+            styled = bool(sys.stdin.isatty() and sys.stdout.isatty())
+        except Exception:
+            styled = False
+        if not styled:
+            return input(prompt).strip()
+        # Fresh line below any frame (fixes glued "...QUITPublic chat > ").
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        label = str(prompt).strip()
+        short = label.rstrip()
+        if short.endswith(">"):
+            short = short[:-1].rstrip()
+        try:
+            if short:
+                try:
+                    if is_color_enabled():
+                        print(paint(short, "grey"))
+                    else:
+                        print(strip_ansi(short))
+                except Exception:
+                    try:
+                        print(strip_ansi(short))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if is_color_enabled():
+                marker = paint(_choice_arrow() + " ", "cyan", "bold")
+            else:
+                marker = _choice_arrow() + " "
+        except Exception:
+            marker = "> "
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return input(marker).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         raise Quit
@@ -2413,7 +2468,7 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
             # exactly once here; pre-centered headers double-indent (right drift).
             cols, _rows = term_size()
             avail = max(40, cols - 8)
-            header_lines = [strip_ansi(h) if False else h for h in str(header).split("\n")]
+            header_lines = str(header).split("\n")
             # Keep header itself within width so wide terminals never push it right.
             header_lines = [_truncate_vis(h, avail) for h in header_lines]
             menu_rows = []
@@ -2438,7 +2493,13 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
             composed.append("")
             composed.extend(panel)
             composed.append("")
-            bar = "↑/↓ move · Enter select · 1-%d jump" % len(options)
+            # Single-key jump is 1-9 only; for long lists it would mislead
+            # ("1-15 jump" when only 1-9 works), so long lists are
+            # arrows-only. Typed fallback still accepts any 1-N number.
+            if len(options) <= 9:
+                bar = "↑/↓ move · Enter select · 1-%d jump" % len(options)
+            else:
+                bar = "↑/↓ move · Enter select"
             if allow_quit:
                 bar += " · Q quit"
             if footer:
@@ -2454,7 +2515,7 @@ def select_menu(header, options, allow_quit=False, footer="", start_idx=0):
                 return idx
             elif key == "CTRL_C":
                 raise Quit
-            elif key and len(key) == 1 and key in "123456789":
+            elif len(options) <= 9 and key and len(key) == 1 and key in "123456789":
                 n = int(key)
                 if 1 <= n <= len(options):
                     return n - 1
@@ -6319,10 +6380,29 @@ class LANGame:
         self.verified_sunk_cells = set()
         self.final_ship_cells = None
 
+        try:
+            self._chat_limiter = ChatRateLimiter()
+        except Exception:
+            self._chat_limiter = None
+
         self.conn.async_handler = self._async_event
+        # OnlineConn starts without a client; bind it here so its pump
+        # thread can route chat like MatchConnection._read_loop does.
+        try:
+            if getattr(self.conn, "client", None) is None:
+                self.conn.client = client
+        except Exception:
+            pass
 
     def _async_event(self, evt):
         t = evt.get("type")
+        if t == "chat":
+            try:
+                self.client.handle_match_chat(
+                    self.peer_name, str(evt.get("text", "")))
+            except Exception:
+                pass
+            return
         if t == "disconnect" and not self.opponent_disconnected:
             self.opponent_disconnected = True
             self.client.print_now(paint("Opponent connection lost. You win.", "green", "bold"))
@@ -6381,6 +6461,14 @@ class LANGame:
         text = text.strip()[:500]
         if not text:
             return
+        limiter = getattr(self, "_chat_limiter", None)
+        if limiter is not None:
+            try:
+                if not limiter.allow():
+                    self.client.print_now("Chat rate-limited: slow down.")
+                    return
+            except Exception:
+                pass
         self.conn.send({"type": "chat", "text": text})
         self.client.add_chat(paint("[You] %s" % text, "cyan"))
 
@@ -6408,6 +6496,16 @@ class LANGame:
             if t == "surrender":
                 self.opponent_surrendered = True
                 return obj
+
+            if t == "chat":
+                # Stray queued chat (e.g. arrived before the client was
+                # bound): display and keep waiting, mirroring LAN.
+                try:
+                    self.client.handle_match_chat(
+                        self.peer_name, str(obj.get("text", "")))
+                except Exception:
+                    pass
+                continue
 
             if t == "reveal":
                 self.opp_reveal = obj.get("board")
@@ -9397,6 +9495,39 @@ class LANClient:
         ]), width=cols))
         # Truncate to width and atomic-write (no clear flash on 1s refresh).
         frame = [_truncate_vis(l, cols) for l in frame]
+        # Height guard: width is truncated above, but short terminals would
+        # otherwise scroll. Drop notices first, then fall back to one intact
+        # box instead of a gutted dashboard.
+        try:
+            _, rows = term_size()
+        except Exception:
+            rows = 24
+        if len(frame) > rows:
+            frame_nn = []
+            frame_nn.extend(center_block_aligned(mast, width=cols))
+            frame_nn.append("")
+            if cols >= 78:
+                frame_nn.extend(center_block(side_by_side(left, right), width=cols))
+            else:
+                frame_nn.extend(center_block(left, width=cols))
+                frame_nn.append("")
+                frame_nn.extend(center_block(right, width=cols))
+            frame_nn.append("")
+            frame_nn.extend(center_block(match_panel, width=cols))
+            frame_nn.append("")
+            frame_nn.extend(center_block(command_bar([
+                ("↑↓", "SELECT"), ("ENTER", "ACTION"), ("1-9", "CHALLENGE"),
+                ("C", "CHAT"), ("T", "TELL"), ("R", "REQUESTS%s" % req_badge),
+            ]), width=cols))
+            frame_nn.extend(center_block(command_bar([
+                ("G", "START"), ("X", "CANCEL"), ("S", "SETTINGS"),
+                ("U", "STATUS"), ("H", "HELP"), ("Q", "QUIT"),
+            ]), width=cols))
+            frame_nn = [_truncate_vis(l, cols) for l in frame_nn]
+            if len(frame_nn) <= rows:
+                frame = frame_nn
+            else:
+                frame = too_small_frame(cols, len(frame), "LAN LOBBY")
         render_frame(frame)
         return peers, sel_idx
 
@@ -9776,57 +9907,6 @@ def choose_tactic():  # type: ignore[no-untyped-def]
     return idx == 1
 
 
-def _solo_wizard(args):
-    """Step-through setup→level→mode→tactic with Back on every step.
-
-    Returns (name, cls, mode, contrarian) or BACK when the user backs out
-    of the first step (caller returns to the main menu). Never gets stuck:
-    each choose_* offers an explicit Back entry (number or 'back' typed).
-    """
-    need_setup = args.board is None and args.fleet is None
-    step = 0 if need_setup else 1
-    level_info = None
-    mode = None
-    contrarian = None
-    while True:
-        if step == 0:
-            res = choose_setup()
-            if res == BACK:
-                return BACK
-            step = 1
-        elif step == 1:
-            res = choose_level()
-            if res == BACK:
-                if need_setup:
-                    step = 0
-                else:
-                    return BACK
-            else:
-                level_info = res
-                step = 2
-        elif step == 2:
-            res = choose_mode()
-            if res == BACK:
-                step = 1
-            else:
-                mode = res
-                step = 3
-        elif step == 3:
-            if args.contrarian:
-                contrarian = True
-                break
-            res = choose_tactic()
-            if res == BACK:
-                step = 2
-            else:
-                contrarian = bool(res)
-                break
-        else:
-            break
-    name, cls, _ = level_info
-    return (name, cls, mode, contrarian)
-
-
 def _campaign_wizard(args):
     """Same Back navigation for campaign setup. Returns (mode, contrarian)
     or BACK."""
@@ -9971,7 +10051,7 @@ ONLINE_REASON_MESSAGES = {
     "TIMEOUT": "Timeout — packets are being dropped by a NAT or firewall; try a VPN or hole punch.",
     "BAD_CODE": "Wrong code — check the invite and try again.",
     "VERSION": "Version mismatch — both players must run the same game version.",
-    "RULES_MISMATCH": "Rules mismatch — board size / fleet / mode differ.",
+    "RULES_MISMATCH": "Rules mismatch — board size / fleet / mode / anti-cheat differ.",
     "PEER_LEFT": "Opponent left the game.",
     "LINK_LOST": "Connection lost — attempting to reconnect.",
     "PROTOCOL_ERROR": "Protocol error — connection closed.",
@@ -10144,7 +10224,7 @@ class Transport:
     def send(self, frame):
         raise NotImplementedError
 
-    def recv(self):
+    def recv(self, timeout=None):
         raise NotImplementedError
 
     def close(self):
@@ -10279,8 +10359,11 @@ class LanTransport(Transport):
         except Exception:
             pass
 
-    def recv(self):
-        data = self._inbox.get()
+    def recv(self, timeout=None):
+        try:
+            data = self._inbox.get(timeout=timeout)
+        except queue.Empty:
+            raise TransportClosed("timeout")
         if data == b"":
             raise TransportClosed("closed")
         return data
@@ -10986,7 +11069,7 @@ def online_reachability(stun_servers=None, ssdp_addr=None, upnp_wait=None,
 
 
 def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
-                       timeout=None):
+                       timeout=None, cell_anticheat=False):
     """Name/rules READY over a punched transport (mirrors TCP READY).
 
     Host sends READY {session_id, name, rules_hash} first; guest answers
@@ -10994,11 +11077,12 @@ def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
     RulesMismatch. Returns the peer name.
     """
     timeout = HANDSHAKE_TIMEOUT_S if timeout is None else timeout
+    local_anti = bool(cell_anticheat)
     if is_host:
         transport.send(json.dumps(
             {"t": "udp-ready", "session_id": session_id, "name": name,
-             "rules_hash": rules_hash}, sort_keys=True,
-            separators=(",", ":")).encode())
+             "rules_hash": rules_hash, "cell_anticheat": local_anti},
+            sort_keys=True, separators=(",", ":")).encode())
         raw = transport.recv(timeout=timeout)
         try:
             obj = json.loads(raw.decode("utf-8"))
@@ -11008,6 +11092,8 @@ def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
             raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
         if obj.get("rules_hash") != rules_hash:
             raise RulesMismatch("rules differ")
+        if "cell_anticheat" in obj and bool(obj.get("cell_anticheat")) != local_anti:
+            raise RulesMismatch("anti-cheat differs")
         return sanitize_name(str(obj.get("name", "?")))
     raw = transport.recv(timeout=timeout)
     try:
@@ -11019,10 +11105,13 @@ def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
     # Reply first so both sides always reach a verdict (otherwise the host
     # would hang on a mismatch instead of reporting RULES_MISMATCH too).
     transport.send(json.dumps(
-        {"t": "udp-ready", "name": name, "rules_hash": rules_hash},
+        {"t": "udp-ready", "name": name, "rules_hash": rules_hash,
+         "cell_anticheat": local_anti},
         sort_keys=True, separators=(",", ":")).encode())
     if obj.get("rules_hash") != rules_hash:
         raise RulesMismatch("rules differ")
+    if "cell_anticheat" in obj and bool(obj.get("cell_anticheat")) != local_anti:
+        raise RulesMismatch("anti-cheat differs")
     session_id = str(obj.get("session_id", session_id))
     return sanitize_name(str(obj.get("name", "?")))
 
@@ -11676,7 +11765,8 @@ def _online_fail_delay():
         pass
 
 
-def host_handshake(sock, secret, host_name, rules_hash, game_ver=1, _delay=True):
+def host_handshake(sock, secret, host_name, rules_hash, game_ver=1, _delay=True,
+                   cell_anticheat=False):
     try:
         hello = read_json_line(sock, HANDSHAKE_TIMEOUT_S)
     except (HandshakeFailed, ProtocolError):
@@ -11717,7 +11807,8 @@ def host_handshake(sock, secret, host_name, rules_hash, game_ver=1, _delay=True)
 
     k_hg, k_gh, k_resume = derive_keys(secret, nonce_h, nonce_g)
     session_id = secrets.token_hex(8)
-    ready = {"session_id": session_id, "name": host_name, "rules_hash": rules_hash}
+    ready = {"session_id": session_id, "name": host_name, "rules_hash": rules_hash,
+             "cell_anticheat": bool(cell_anticheat)}
     sock.sendall(seal(k_hg, 0, json.dumps(ready, sort_keys=True,
                                          separators=(",", ":")).encode()))
     try:
@@ -11733,12 +11824,15 @@ def host_handshake(sock, secret, host_name, rules_hash, game_ver=1, _delay=True)
         raise HandshakeFailed("bad READY: %s" % exc)
     if gready.get("rules_hash") != rules_hash:
         raise RulesMismatch("rules differ")
+    if "cell_anticheat" in gready and bool(gready.get("cell_anticheat")) != bool(cell_anticheat):
+        raise RulesMismatch("anti-cheat differs")
     return {"send_key": k_hg, "recv_key": k_gh, "k_resume": k_resume,
             "session_id": session_id, "peer_name": str(gready.get("name", "")),
             "nonce_h": nonce_h, "nonce_g": nonce_g}
 
 
-def guest_handshake(sock, secret, guest_name, rules_hash, game_ver=1):
+def guest_handshake(sock, secret, guest_name, rules_hash, game_ver=1,
+                    cell_anticheat=False):
     nonce_g = secrets.token_bytes(NONCE_BYTES_TCP)
     write_json_line(sock, {"t": "HELLO", "v": PROTOCOL_VERSION,
                            "game_ver": game_ver, "nonce_g": online_b64e(nonce_g)})
@@ -11774,8 +11868,11 @@ def guest_handshake(sock, secret, guest_name, rules_hash, game_ver=1):
         raise HandshakeFailed("bad READY: %s" % exc)
     if hready.get("rules_hash") != rules_hash:
         raise RulesMismatch("rules differ")
+    if "cell_anticheat" in hready and bool(hready.get("cell_anticheat")) != bool(cell_anticheat):
+        raise RulesMismatch("anti-cheat differs")
     session_id = str(hready.get("session_id", ""))
-    ready = {"name": guest_name, "rules_hash": rules_hash}
+    ready = {"name": guest_name, "rules_hash": rules_hash,
+             "cell_anticheat": bool(cell_anticheat)}
     sock.sendall(seal(k_gh, 0, json.dumps(ready, sort_keys=True,
                                          separators=(",", ":")).encode()))
     return {"send_key": k_gh, "recv_key": k_hg, "k_resume": k_resume,
@@ -11787,11 +11884,12 @@ class HostListener:
     """One-peer rule + failure counter + code burning (spec sections 4+6)."""
 
     def __init__(self, secret, host_name, rules_hash, game_ver=1,
-                 bind="127.0.0.1", port=0):
+                 bind="127.0.0.1", port=0, cell_anticheat=False):
         self.secret = secret
         self.host_name = host_name
         self.rules_hash = rules_hash
         self.game_ver = game_ver
+        self.cell_anticheat = bool(cell_anticheat)
         self.failures = 0
         self.burned = False
         self.active = False
@@ -11854,7 +11952,8 @@ class HostListener:
             try:
                 info = host_handshake(conn, self.secret, self.host_name,
                                       self.rules_hash, self.game_ver,
-                                      _delay=False)
+                                      _delay=False,
+                                      cell_anticheat=self.cell_anticheat)
             except (HandshakeFailed, RulesMismatch, VersionMismatch):
                 self._record_failure()
                 try:
@@ -11877,13 +11976,14 @@ class HostListener:
 
 
 def online_dial(host, port, secret, guest_name, rules_hash, game_ver=1,
-                timeout=None):
+                timeout=None, cell_anticheat=False):
     sock = socket.create_connection(
         (host, port),
         timeout=timeout if timeout is not None else HANDSHAKE_TIMEOUT_S,
     )
     try:
-        info = guest_handshake(sock, secret, guest_name, rules_hash, game_ver)
+        info = guest_handshake(sock, secret, guest_name, rules_hash, game_ver,
+                               cell_anticheat=cell_anticheat)
     except Exception:
         try:
             sock.close()
@@ -12203,10 +12303,19 @@ class ChatRateLimiter:
 
 
 # --- Online rules hash + resume handshake + entry flows ---
-def canonical_rules_hash(size, fleet, mode="single"):
-    norm = {"size": int(size),
-            "fleet": sorted([[str(n), int(l)] for n, l in fleet]),
-            "mode": "salvo" if mode == "salvo" else "single"}
+def canonical_rules_hash(size, fleet, mode="single", cell_anticheat=False):
+    # Backward-compatible: HASH mode uses the legacy norm (no anticheat key)
+    # so old-vs-new hash-mode games still match. CELL mode adds the key, so
+    # any cell/hash mismatch fails closed as RulesMismatch via READY.
+    if cell_anticheat:
+        norm = {"size": int(size),
+                "fleet": sorted([[str(n), int(l)] for n, l in fleet]),
+                "mode": "salvo" if mode == "salvo" else "single",
+                "anticheat": "cell"}
+    else:
+        norm = {"size": int(size),
+                "fleet": sorted([[str(n), int(l)] for n, l in fleet]),
+                "mode": "salvo" if mode == "salvo" else "single"}
     payload = json.dumps(norm, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -12279,7 +12388,7 @@ class OnlineConn:
     """
 
     def __init__(self, session, peer_name, mode, first_id, my_id, match_id,
-                 key, cell_anticheat=False):
+                 key, cell_anticheat=False, client=None):
         self.session = session
         self.peer_name = sanitize_name(peer_name)
         self.mode = mode
@@ -12290,6 +12399,10 @@ class OnlineConn:
         self.cell_anticheat = cell_anticheat
         self.queue = queue.Queue()
         self.async_handler = None
+        # Set by LANGame.__init__ (duck-typed like MatchConnection.client)
+        # so the pump thread can deliver chat directly, mirroring LAN.
+        # May also be passed here to avoid the bind race.
+        self.client = client
         self.closed = False
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
@@ -12314,6 +12427,23 @@ class OnlineConn:
                 break
             except Exception:
                 continue
+            # Mirror MatchConnection._read_loop: chat is delivered directly
+            # to the client and never queued, so LANGame.wait_event (which
+            # only accepts protocol types) can't swallow it.
+            if isinstance(msg, dict) and msg.get("type") == "chat":
+                delivered = False
+                client = getattr(self, "client", None)
+                if client is not None:
+                    try:
+                        client.handle_match_chat(
+                            self.peer_name, str(msg.get("text", "")))
+                        delivered = True
+                    except Exception:
+                        pass
+                if delivered:
+                    continue
+                # No client attached yet: fall through and queue so
+                # wait_event can display it once the game binds the client.
             try:
                 self.queue.put(msg)
             except Exception:
@@ -12367,16 +12497,19 @@ def online_local_ip():
             pass
 
 
-def host_once(bind, port, name, rules_hash, secret=None, game_ver=1):
+def host_once(bind, port, name, rules_hash, secret=None, game_ver=1,
+                cell_anticheat=False):
     if secret is None:
         secret = new_secret()
-    return HostListener(secret, name, rules_hash, game_ver, bind, port), secret
+    return HostListener(secret, name, rules_hash, game_ver, bind, port,
+                        cell_anticheat), secret
 
 
-def connect_guest(code, name, rules_hash, game_ver=1, timeout=None):
+def connect_guest(code, name, rules_hash, game_ver=1, timeout=None,
+                  cell_anticheat=False):
     _ver, _flags, ip, port, secret = decode_invite(code)
     sock, info = online_dial(ip, port, secret, name, rules_hash, game_ver,
-                             timeout)
+                             timeout, cell_anticheat)
     transport = TcpTransport(sock, info["send_key"], info["recv_key"])
     session = Session(transport, session_id=info["session_id"], name=name)
     session.k_resume = info["k_resume"]
@@ -12474,7 +12607,10 @@ ONLINE_GUIDE_SECTIONS = [
         "Offers carry no names: the READY exchange swaps real names",
         "and checks rules, mirroring TCP READY.",
         "Auth is HMAC (SHA256); there is NO encryption and NO server.",
-        "Keep codes private: anyone holding one can take the seat.",
+        "Codes are BEARER SECRETS: anyone holding one can take the seat.",
+        "NEVER share codes publicly (stream, screenshots, public chat).",
+        "Send them over a private channel to one trusted player only.",
+        "Traffic is authenticated, NOT encrypted: observers can read it.",
         "Dropped link? TCP auto-reconnects inside the resume window",
         "(default 120 s). UDP needs a manual redial. Clean exit says",
         "'Opponent left'; a dead link says 'Connection lost'.",
@@ -12787,7 +12923,8 @@ def online_guided_setup(cfg, score=None):
     if res == BACK:
         return
     cfg.mode = res
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                 getattr(cfg, "cell_anticheat", False))
     header = "\n".join(brand_masthead("Play online — guided setup"))
     try:
         idx = select_menu(header, [
@@ -12927,7 +13064,7 @@ def online_join_error_text(exc):
         return message_for("VERSION")
     if isinstance(exc, RulesMismatch):
         return (message_for("RULES_MISMATCH")
-                + " Both sides must pick the same board, fleet and mode.")
+                + " Both sides must pick the same board, fleet, mode and anti-cheat.")
     if isinstance(exc, HandshakeFailed):
         reason = getattr(exc, "reason", "")
         if reason:
@@ -12975,7 +13112,8 @@ def _online_prepare_host(cfg, rules_hash):
     """Bind a listener and return (listener, secret, code). No blocking."""
     listener, secret = host_once(cfg.bind or "0.0.0.0", cfg.port or 0,
                                  cfg.name, rules_hash,
-                                 game_ver=LAN_VERSION)
+                                 game_ver=LAN_VERSION,
+                                 cell_anticheat=cfg.cell_anticheat)
     bind = (cfg.bind or "").strip()
     if bind and bind != "0.0.0.0":
         invite_ip = bind
@@ -12993,11 +13131,16 @@ def _online_accept_session(listener, cfg):
 def _online_join_session(cfg, code, rules_hash):
     return connect_guest(code, cfg.name, rules_hash,
                          game_ver=LAN_VERSION,
-                         timeout=cfg.resume_timeout or None)
+                         timeout=cfg.resume_timeout or None,
+                         cell_anticheat=cfg.cell_anticheat)
 
 
 def _online_launch_game(session, info, cfg, is_host):
-    """Run a full LANGame match over the established online session."""
+    """Run a full LANGame match over the established online session.
+
+    Returns (result, win_kind) so callers can bump verified/forfeit stats
+    like LAN does. win_kind is "verified"/"forfeit"/None.
+    """
     my_id = "host" if is_host else "guest"
     peer = sanitize_name(info.get("peer_name", "?"))
     me = sanitize_name(cfg.name)
@@ -13007,19 +13150,20 @@ def _online_launch_game(session, info, cfg, is_host):
         host_name, guest_name = peer, me
     mode, first, match_id, key = match_params_from_handshake(
         info["session_id"], host_name, guest_name, cfg.mode)
-    conn = OnlineConn(session, peer, mode, first, my_id, match_id, key,
-                      cell_anticheat=cfg.cell_anticheat)
     client = _OnlineMenuClient(me)
+    conn = OnlineConn(session, peer, mode, first, my_id, match_id, key,
+                      cell_anticheat=cfg.cell_anticheat, client=client)
     try:
         game = LANGame(client, conn)
         try:
-            return game.run()
+            result = game.run()
+            return result, getattr(game, "win_kind", None)
         except Quit:
             try:
                 conn.send({"type": "surrender"})
             except Exception:
                 pass
-            return "loss"
+            return "loss", None
     finally:
         try:
             conn.close()
@@ -13030,7 +13174,8 @@ def _online_launch_game(session, info, cfg, is_host):
 def run_online_host(args):
     cfg = online_config_from_args(args)
     configure_board(10, "classic")
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                 getattr(cfg, "cell_anticheat", False))
     try:
         listener, _secret, code = _online_prepare_host(cfg, rules)
     except OSError as exc:
@@ -13038,11 +13183,17 @@ def run_online_host(args):
         return
     print("Online host: %s (port %d)" % (cfg.name, listener.port))
     print("Invite code: %s" % code)
+    print("WARNING: code is a bearer secret (authenticated, NOT encrypted).")
+    print("Share privately with one player only — never publicly.")
     print("Waiting for guest (paste this code on the guest side)...")
     try:
         session, info = _online_accept_session(listener, cfg)
     except HandshakeFailed as exc:
         print("Host failed: %s" % message_for(getattr(exc, "reason", "")))
+        listener.close()
+        return
+    except (RulesMismatch, VersionMismatch) as exc:
+        print("Host failed: %s" % online_join_error_text(exc))
         listener.close()
         return
     except Quit:
@@ -13059,7 +13210,8 @@ def run_online_host(args):
 def run_online_join(args, code):
     cfg = online_config_from_args(args)
     configure_board(10, "classic")
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                 getattr(cfg, "cell_anticheat", False))
     try:
         session, info = _online_join_session(cfg, code, rules)
     except Exception as exc:
@@ -13068,60 +13220,6 @@ def run_online_join(args, code):
     print("Connected to %s (session %s)."
           % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
     _online_launch_game(session, info, cfg, False)
-
-
-def _online_chat_loop(session, me, peer):
-    limiter = ChatRateLimiter()
-    stop = threading.Event()
-
-    def _rx():
-        while not stop.is_set():
-            try:
-                msg = session.recv_game(timeout=0.5)
-            except SessionLost as exc:
-                print("\n%s" % message_for(getattr(exc, "reason",
-                                                  "LINK_LOST")))
-                stop.set()
-                return
-            except Exception:
-                continue
-            if isinstance(msg, dict) and msg.get("type") == "chat":
-                print("\n[%s] %s" % (render_literal(peer),
-                                     render_literal(msg.get("text", ""))))
-            elif isinstance(msg, dict) and msg.get("type") == "bye":
-                print("\n%s" % message_for("PEER_LEFT"))
-                stop.set()
-                return
-
-    t = threading.Thread(target=_rx, daemon=True)
-    t.start()
-    while not stop.is_set():
-        try:
-            line = input("> ")
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            break
-        if line.strip().lower() in ("quit", "exit", "q"):
-            break
-        if not limiter.allow():
-            print("(rate limited, slow down)")
-            continue
-        try:
-            session.send_game({"type": "chat",
-                               "text": sanitize_chat(line)})
-        except SessionLost:
-            print(message_for("LINK_LOST"))
-            break
-    stop.set()
-    try:
-        session.send_bye()
-    except Exception:
-        pass
-    try:
-        session.close()
-    except Exception:
-        pass
 
 
 def online_settings_menu(cfg):
@@ -13206,11 +13304,19 @@ def online_settings_menu(cfg):
             return
 
 
-def _online_bump_score(score, result):
+def _online_bump_score(score, result, win_kind=None):
     if not isinstance(score, dict):
         return
+    # Normalize legacy tuple callers: _online_launch_game now returns
+    # (result, win_kind); accept it directly for forward-compat.
+    if isinstance(result, (tuple, list)) and len(result) == 2 and win_kind is None:
+        result, win_kind = result[0], result[1]
     if result == "win":
         score["win"] = score.get("win", 0) + 1
+        if win_kind == "verified":
+            score["verified_win"] = score.get("verified_win", 0) + 1
+        else:
+            score["forfeit_win"] = score.get("forfeit_win", 0) + 1
     elif result == "loss":
         score["loss"] = score.get("loss", 0) + 1
 
@@ -13238,6 +13344,8 @@ def _online_host_direct(cfg, score, rules):
         print("Manual: %s:%d + secret %s"
               % (online_local_ip(), listener.port,
                  encode_secret_line(secret)))
+        print("WARNING: codes are bearer secrets (authenticated, NOT encrypted).")
+        print("Share privately with one player only — never publicly.")
         print("Share the code with your guest. Waiting%s..."
               % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
         try:
@@ -13245,6 +13353,9 @@ def _online_host_direct(cfg, score, rules):
         except HandshakeFailed as exc:
             print("Host failed: %s"
                   % message_for(getattr(exc, "reason", "")))
+            return
+        except (RulesMismatch, VersionMismatch) as exc:
+            print("Host failed: %s" % online_join_error_text(exc))
             return
         print("Connected to %s (session %s)."
               % (sanitize_name(info.get("peer_name", "?")),
@@ -13291,6 +13402,8 @@ def _online_host_punch(cfg, score, rules):
         lan = lan_ep if lan_ep != pub else None
         ocode, offer = encode_offer(pub, secret, lan=lan)
         print("Punch offer (share with guest): %s" % ocode)
+        print("WARNING: offer is a bearer secret (authenticated, NOT encrypted).")
+        print("Share privately with one player only — never publicly.")
         try:
             acode = ask("Guest answer code > ")
         except Quit:
@@ -13319,7 +13432,8 @@ def _online_host_punch(cfg, score, rules):
         sid = punch_session_id(secret, offer["nonce_h"], answer["nonce_g"])
         try:
             peer_name = udp_ready_exchange(transport, True, cfg.name,
-                                           rules, sid)
+                                           rules, sid,
+                                           cell_anticheat=cfg.cell_anticheat)
         except (RulesMismatch, VersionMismatch) as exc:
             print(online_join_error_text(exc))
             transport.close()
@@ -13352,7 +13466,8 @@ def online_host_menu(cfg, score=None):
     if res == BACK:
         return
     cfg.mode = res
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                 getattr(cfg, "cell_anticheat", False))
     print("Checking reachability (UPnP + STUN in parallel)...")
     try:
         reach = online_reachability(stun_servers=cfg.stun or None)
@@ -13489,6 +13604,8 @@ def _online_join_punch(cfg, score, rules, ocode):
             print("Cannot answer this offer: %s" % exc)
             return
         print("Your answer code (share with host): %s" % acode)
+        print("WARNING: answer is a bearer secret (authenticated, NOT encrypted).")
+        print("Share privately with the host only — never publicly.")
         try:
             ask("Press Enter when the host has it > ")
         except Quit:
@@ -13510,7 +13627,8 @@ def _online_join_punch(cfg, score, rules, ocode):
                                answer["nonce_g"])
         try:
             peer_name = udp_ready_exchange(transport, False, cfg.name,
-                                           rules, sid)
+                                           rules, sid,
+                                           cell_anticheat=cfg.cell_anticheat)
         except (RulesMismatch, VersionMismatch) as exc:
             print(online_join_error_text(exc))
             transport.close()
@@ -13550,7 +13668,8 @@ def online_join_menu(cfg, score=None):
     if idx == 2:
         return
     if idx == 1:
-        rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+        rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                     getattr(cfg, "cell_anticheat", False))
         _online_join_manual(cfg, score, rules)
         return
     try:
@@ -13567,7 +13686,8 @@ def online_join_menu(cfg, score=None):
     if kind == "answer":
         print("That is an answer code: give it to the host, not to join.")
         return
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode,
+                                 getattr(cfg, "cell_anticheat", False))
     if kind == "direct":
         _online_join_direct(cfg, score, rules, code)
     else:

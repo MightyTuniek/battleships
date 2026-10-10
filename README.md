@@ -61,9 +61,10 @@ Main menu:
 2. `Campaign (Easy → Nightmare)`
 3. `Hotseat (2 players)`
 4. `LAN Matchmaking`
-5. `How to play`
-6. `Settings`
-7. `Quit`
+5. `Online Match`
+6. `How to play`
+7. `Settings`
+8. `Quit`
 
 You fire first in solo games. First to sink the entire enemy fleet wins.
 
@@ -326,6 +327,62 @@ End states: `verified win` (board cryptographically verified) vs `forfeit win` (
 
 Mismatches award the honest side a forfeit win with `Opponent protocol violation: <reason>`.
 
+## Online play
+
+Peer-to-peer internet play with no server: `Main menu → Online Match → Host / Join`.
+Everything the `--online` CLI flags do is also in `Online → Settings`, so nothing
+is CLI-only. Three flows:
+
+1. **Direct code (VPN or port forward).** Same VPN (Tailscale, ZeroTier, WireGuard)
+   always works — use the VPN address. Otherwise the host forwards a TCP port (or
+   relies on UPnP, attempted automatically unless `--no-upnp`) and shares the
+   invite code; the guest pastes it.
+2. **UPnP direct.** Behind a typical home router the host maps the port automatically
+   (lease 3600 s, removed on exit). Behind CGNAT (carrier-grade NAT) the mapping is
+   useless and the menu says so — use hole punch or a VPN instead.
+3. **Hole punch.** Both behind ordinary home NAT: the host shares an offer code,
+   the guest answers, both punch through (STUN-learned endpoints, authenticated
+   PUNCH/PUNCH_ACK, then the normal game). Works on most home routers
+   (endpoint-independent mapping). Fails on symmetric NAT and many mobile hotspots.
+
+Manual form for IPv6, DNS names or odd setups: host shows `host:port` plus the
+secret line; the guest enters both via `Join → Manual address`.
+
+Both sides must pick the same board, fleet, mode and anti-cheat setting, or the
+match refuses with a rules-mismatch message. One socket carries STUN, punching
+and game traffic. Invite codes burn after first use (or three failures).
+
+Error messages:
+
+- `Connection refused` — the host is not listening, or a firewall is rejecting.
+- `Timeout` — packets are being dropped by a NAT or firewall; try a VPN or hole punch.
+- `Wrong code` — check the invite and try again.
+- `Version mismatch` — both players must run the same game version.
+- `Rules mismatch` — board size / fleet / mode differ.
+- `Opponent left` / `Connection lost` — clean exit vs dropped link (reconnects
+  automatically inside the resume window).
+- Hole punch timing out with no two-way path usually means symmetric NAT: the
+  menu says so — use a VPN, a port forward, or UPnP direct mode.
+
+CLI shortcuts (same options live in the menu):
+
+```bash
+python3 battleships.py --online host
+python3 battleships.py --online join CODE
+python3 battleships.py --online host --port 51234 --name Ada --stun stun.example.com:3478
+```
+
+| Flag | Description |
+|---|---|
+| `--online host\|join CODE` | Host or join an online match |
+| `--port N` | Online TCP/UDP port (0 = random high port) |
+| `--bind ADDR` | Bind address (default all interfaces) |
+| `--stun HOST:PORT` | STUN server, repeatable (default public Google servers) |
+| `--no-upnp` | Disable UPnP port mapping |
+| `--resume-timeout SEC` | Reconnect window in seconds (default 120) |
+| `--net-debug` | Verbose redacted network logs |
+| `--name NAME` | Display name (max 20 chars) |
+
 ## Troubleshooting
 
 - Bad colors → `--no-color` or `NO_COLOR=1`.
@@ -340,18 +397,12 @@ Mismatches award the honest side a forfeit win with `Opponent protocol violation
 
 ```text
 .
-├── battleships.py   # the game itself
+├── battleships.py   # the game itself (single file, zero dependencies)
 ├── README.md               # this file
-└── save.json               # created by you when saving (not committed)
+└── LICENSE                 # MIT
 ```
 
-Save files are user-created and should not be committed. Suggested `.gitignore`:
-
-```gitignore
-__pycache__/
-*.pyc
-*.json
-```
+Save files (`save.json`) are created by you when saving and are not committed.
 
 ## Contributing
 

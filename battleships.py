@@ -10669,6 +10669,189 @@ def punch_connect(sock, candidates, send_key, recv_key, local_nonce,
     return peer_addr, {"got_punch": got_punch, "got_ack": got_ack}
 
 
+# --- Online reachability + UDP ready (spec sections 8.3, 10) ---
+def online_code_kind(code):
+    """'direct' | 'offer' | 'answer' by trial decode; BadInvite otherwise."""
+    try:
+        decode_invite(code)
+        return "direct"
+    except VersionMismatch:
+        return "direct"
+    except BadInvite:
+        pass
+    try:
+        decode_offer(code)
+        return "offer"
+    except VersionMismatch:
+        return "offer"
+    except BadInvite:
+        pass
+    try:
+        decode_answer(code)
+        return "answer"
+    except VersionMismatch:
+        return "answer"
+    except BadInvite:
+        pass
+    raise BadInvite("unrecognized code")
+
+
+def plan_host_options(upnp_available=False, stun_punchable=False,
+                      user_direct=False):
+    """Pure planner (spec section 10): which host flows to offer.
+
+    Returns {flow: (offered, note)}. Manual is always available.
+    """
+    direct = bool(upnp_available or user_direct)
+    if upnp_available:
+        direct_note = "UPnP mapped a public port: direct code works."
+    elif user_direct:
+        direct_note = "VPN / forwarded port: direct code works."
+    else:
+        direct_note = ("no direct path (no UPnP, no VPN/forward): "
+                       "try hole punch or manual.")
+    if stun_punchable:
+        punch_note = "NAT looks punchable: offer hole punch."
+    else:
+        punch_note = ("NAT not verified punchable: offers may fail; "
+                      "prefer VPN or manual.")
+    return {
+        "direct": (direct, direct_note),
+        "punch": (bool(stun_punchable), punch_note),
+        "manual": (True, "host:port + secret line for IPv6/DNS/odd setups."),
+    }
+
+
+def upnp_probe(ssdp_addr=None, wait=None):
+    """Capability check without side effects (no mapping is created)."""
+    info = {"found": False, "external_ip": None, "cgnat": False, "reason": ""}
+    try:
+        locs = upnp_discover(ssdp_addr=ssdp_addr, wait=wait)
+    except Exception:
+        return info
+    if not locs:
+        info["reason"] = "no UPnP gateway found"
+        return info
+    described = None
+    for loc in locs:
+        try:
+            described = upnp_describe(loc)
+        except Exception:
+            described = None
+        if described is not None:
+            break
+    if described is None:
+        info["reason"] = "gateway description unreadable"
+        return info
+    try:
+        ext = upnp_external_ip(described[0], described[1])
+    except Exception:
+        ext = None
+    if ext is None:
+        info["reason"] = "external address unknown"
+        return info
+    info["found"] = True
+    info["external_ip"] = ext
+    info["cgnat"] = upnp_is_cgnat(ext)
+    info["reason"] = ("CGNAT: mapping useless, use punch or VPN"
+                      if info["cgnat"] else "gateway ok")
+    return info
+
+
+def online_reachability(stun_servers=None, ssdp_addr=None, upnp_wait=None,
+                        stun_timeout=None, stun_retries=None):
+    """UPnP probe + STUN check in parallel threads (spec section 10).
+
+    Returns {"upnp": {...}, "stun": {"mapped"|None, "punchable", "reason"}}.
+    Uses defaults (DEFAULT_STUN_SERVERS / standard waits) unless told.
+    """
+    servers = list(stun_servers) if stun_servers else list(
+        DEFAULT_STUN_SERVERS)
+    if stun_retries is None:
+        stun_retries = STUN_RETRIES
+    out = {"upnp": {"found": False, "external_ip": None, "cgnat": False,
+                    "reason": "not run"},
+           "stun": {"mapped": None, "punchable": False,
+                    "reason": "not run"}}
+
+    def run_upnp():
+        try:
+            out["upnp"] = upnp_probe(ssdp_addr=ssdp_addr, wait=upnp_wait)
+        except Exception:
+            pass
+
+    def run_stun():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            try:
+                sock.bind(("0.0.0.0", 0))
+            except OSError:
+                out["stun"] = {"mapped": None, "punchable": False,
+                               "reason": "stun socket failed"}
+                return
+            mapped, punchable, reason = stun_check(
+                sock, servers, timeout=stun_timeout, retries=stun_retries)
+            out["stun"] = {"mapped": mapped, "punchable": punchable,
+                           "reason": reason}
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=run_upnp, daemon=True),
+               threading.Thread(target=run_stun, daemon=True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def udp_ready_exchange(transport, is_host, name, rules_hash, session_id,
+                       timeout=None):
+    """Name/rules READY over a punched transport (mirrors TCP READY).
+
+    Host sends READY {session_id, name, rules_hash} first; guest answers
+    {name, rules_hash} and adopts the session id. Rules mismatch raises
+    RulesMismatch. Returns the peer name.
+    """
+    timeout = HANDSHAKE_TIMEOUT_S if timeout is None else timeout
+    if is_host:
+        transport.send(json.dumps(
+            {"t": "udp-ready", "session_id": session_id, "name": name,
+             "rules_hash": rules_hash}, sort_keys=True,
+            separators=(",", ":")).encode())
+        raw = transport.recv(timeout=timeout)
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+        if not isinstance(obj, dict) or obj.get("t") != "udp-ready":
+            raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+        if obj.get("rules_hash") != rules_hash:
+            raise RulesMismatch("rules differ")
+        return sanitize_name(str(obj.get("name", "?")))
+    raw = transport.recv(timeout=timeout)
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+    if not isinstance(obj, dict) or obj.get("t") != "udp-ready":
+        raise HandshakeFailed("bad udp ready", reason="PROTOCOL_ERROR")
+    # Reply first so both sides always reach a verdict (otherwise the host
+    # would hang on a mismatch instead of reporting RULES_MISMATCH too).
+    transport.send(json.dumps(
+        {"t": "udp-ready", "name": name, "rules_hash": rules_hash},
+        sort_keys=True, separators=(",", ":")).encode())
+    if obj.get("rules_hash") != rules_hash:
+        raise RulesMismatch("rules differ")
+    session_id = str(obj.get("session_id", session_id))
+    return sanitize_name(str(obj.get("name", "?")))
+
+
 # --- Online UPnP client (spec section 9; best effort, never raises) ---
 UPNP_ST_WANIP = "urn:schemas-upnp-org:service:WANIPConnection:1"
 UPNP_ST_WANPPP = "urn:schemas-upnp-org:service:WANPPPConnection:1"
@@ -12043,12 +12226,15 @@ ONLINE_ERROR_HINTS = {
 }
 
 ONLINE_HOWTO = (
-    "Online play is direct TCP between two copies of this game (no server). "
-    "The host shows an invite code; the guest pastes it. "
-    "Both sides must use the same board, fleet and mode, and the same "
-    "anti-cheat setting. If you are on different networks you may need a "
-    "VPN, port forwarding, or hole punching (STUN/UPnP settings below are "
-    "stored for that follow-up). One bad code after another burns the code."
+    "Online play is peer-to-peer between two copies of this game (no "
+    "server). Three ways to connect. DIRECT CODE: host and guest on one "
+    "VPN, or the host has a port forward or UPnP router; the host shows "
+    "an invite code and the guest pastes it. HOLE PUNCH: both behind "
+    "home routers; the host shows an offer, the guest answers, both "
+    "punch through. MANUAL: host:port plus the secret line, for IPv6, "
+    "DNS names or odd setups. Both sides must use the same board, fleet "
+    "and mode, and the same anti-cheat setting. Symmetric or mobile "
+    "hotspot NAT cannot be punched: use a VPN. Bad codes burn the invite."
 )
 
 
@@ -12397,24 +12583,30 @@ def _online_bump_score(score, result):
         score["loss"] = score.get("loss", 0) + 1
 
 
-def online_host_menu(cfg, score=None):
-    """Menu host flow: setup -> listen -> full LANGame match."""
-    if choose_setup() == BACK:
-        return
-    res = choose_mode()
-    if res == BACK:
-        return
-    cfg.mode = res
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+def _online_host_direct(cfg, score, rules):
+    """Direct TCP host flow, with a UPnP mapping attempt unless disabled."""
     try:
-        listener, _secret, code = _online_prepare_host(cfg, rules)
+        listener, secret, code = _online_prepare_host(cfg, rules)
     except OSError as exc:
         print("Cannot listen on %s:%s: %s" % (cfg.bind, cfg.port, exc))
         return
+    mapping = None
+    if not cfg.no_upnp:
+        try:
+            mapping = upnp_map(listener.port,
+                               internal_client=online_local_ip())
+        except Exception:
+            mapping = None
     try:
+        if mapping and mapping.get("available"):
+            print("UPnP mapped %s -> you (external %s:%d)."
+                  % (cfg.name, mapping["external_ip"], listener.port))
         print("Online host: %s (port %d)" % (cfg.name, listener.port))
         print("Invite code: %s" % code)
-        print("Share this code with your guest. Waiting%s..."
+        print("Manual: %s:%d + secret %s"
+              % (online_local_ip(), listener.port,
+                 encode_secret_line(secret)))
+        print("Share the code with your guest. Waiting%s..."
               % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
         try:
             session, info = _online_accept_session(listener, cfg)
@@ -12434,23 +12626,145 @@ def online_host_menu(cfg, score=None):
             listener.close()
         except Exception:
             pass
+        if mapping and mapping.get("available"):
+            try:
+                upnp_unmap(mapping)
+            except Exception:
+                pass
 
 
-def online_join_menu(cfg, score=None):
-    """Menu join flow: setup -> paste code -> full LANGame match."""
+def _online_host_punch(cfg, score, rules):
+    """Hole-punch host flow: STUN on the game socket, offer, answer, punch."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((cfg.bind or "0.0.0.0", cfg.port or 0))
+    except OSError as exc:
+        print("Cannot bind %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
+    handed = False
+    try:
+        servers = cfg.stun or list(DEFAULT_STUN_SERVERS)
+        mapped, punchable, reason = stun_check(sock, servers)
+        lan_ep = (online_local_ip(), sock.getsockname()[1])
+        if mapped is None:
+            print("STUN: %s. Offering LAN-only." % reason)
+        elif not punchable:
+            print("STUN: %s" % reason)
+        pub = mapped or lan_ep
+        secret = new_secret()
+        lan = lan_ep if lan_ep != pub else None
+        ocode, offer = encode_offer(pub, secret, lan=lan)
+        print("Punch offer (share with guest): %s" % ocode)
+        try:
+            acode = ask("Guest answer code > ")
+        except Quit:
+            return
+        try:
+            answer = decode_answer(acode.strip())
+        except (BadInvite, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            return
+        if not verify_answer_tag(offer, answer, secret):
+            print(message_for("BAD_CODE") + " (answer tag invalid).")
+            return
+        k_hg, k_gh, k_resume = punch_keys(secret, offer["nonce_h"],
+                                          answer["nonce_g"])
+        print("Punching%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            peer_addr, _pinfo = punch_connect(
+                sock, punch_candidates(answer), k_hg, k_gh,
+                offer["nonce_h"], peer_nonce=answer["nonce_g"])
+        except HandshakeFailed as exc:
+            print("%s %s" % (message_for(getattr(exc, "reason", "")), exc))
+            return
+        transport = UdpTransport(sock, peer_addr, k_hg, k_gh)
+        handed = True
+        sid = punch_session_id(secret, offer["nonce_h"], answer["nonce_g"])
+        try:
+            peer_name = udp_ready_exchange(transport, True, cfg.name,
+                                           rules, sid)
+        except (RulesMismatch, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            transport.close()
+            return
+        except (HandshakeFailed, TransportClosed) as exc:
+            print(message_for(getattr(exc, "reason", "LINK_LOST")))
+            transport.close()
+            return
+        session = Session(transport, session_id=sid, name=cfg.name)
+        session.k_resume = k_resume
+        print("Connected to %s (session %s)." % (peer_name, sid))
+        result = _online_launch_game(
+            session, {"session_id": sid, "peer_name": peer_name}, cfg, True)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        if not handed:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def online_host_menu(cfg, score=None):
+    """Menu host flow: setup -> reachability -> direct/punch/manual."""
     if choose_setup() == BACK:
         return
     res = choose_mode()
     if res == BACK:
         return
     cfg.mode = res
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    print("Checking reachability (UPnP + STUN in parallel)...")
     try:
-        code = ask("Invite code > ")
+        reach = online_reachability(stun_servers=cfg.stun or None)
     except Quit:
         return
-    if not code.strip():
+    except Exception:
+        reach = None
+    if reach is not None:
+        up = reach["upnp"]
+        st = reach["stun"]
+        print("UPnP: %s. STUN: %s."
+              % (("found (%s)" % up["external_ip"]) if up["found"]
+                 else up["reason"] or "unavailable",
+                 ("punchable at %s:%d" % st["mapped"]) if st["punchable"]
+                 else st["reason"]))
+        vpn = confirm("Are you on a VPN or forwarded port (direct works)?")
+        plan = plan_host_options(
+            upnp_available=bool(up["found"] and not up["cgnat"]),
+            stun_punchable=st["punchable"], user_direct=vpn)
+    else:
+        plan = plan_host_options()
+    opts = []
+    flows = []
+    for flow, label in (("direct", "Host direct code (TCP)"),
+                        ("punch", "Host hole-punch offer (UDP)"),
+                        ("manual", "Host manual line (TCP host:port)")):
+        offered, note = plan[flow]
+        opts.append("%s — %s" % (label, note))
+        flows.append(flow if offered else None)
+    opts.append(BACK_LABEL)
+    idx = select_menu("\n".join(brand_masthead("Online host — pick a flow")),
+                      opts)
+    if idx == len(opts) - 1:
         return
-    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    if flows[idx] is None:
+        print("That flow is not available with current reachability.")
+        return
+    if flows[idx] in ("direct", "manual"):
+        _online_host_direct(cfg, score, rules)
+    else:
+        _online_host_punch(cfg, score, rules)
+
+
+def _online_join_direct(cfg, score, rules, code):
     try:
         session, info = _online_join_session(cfg, code.strip(), rules)
     except Exception as exc:
@@ -12463,6 +12777,169 @@ def online_join_menu(cfg, score=None):
     except Quit:
         return
     _online_bump_score(score, result)
+
+
+def _online_join_manual(cfg, score, rules):
+    """Manual TCP form: host:port + secret line (IPv6/DNS/odd setups)."""
+    try:
+        addr = ask("Host address (IP:port) > ")
+        secret_line = ask("Secret line > ")
+    except Quit:
+        return
+    try:
+        host, port = _split_host_port(addr.strip())
+        secret = decode_secret_line(secret_line.strip())
+    except (BadInvite, ValueError) as exc:
+        print("Bad manual address/secret: %s" % exc)
+        return
+    try:
+        sock, info = online_dial(host, port, secret, cfg.name, rules,
+                                 LAN_VERSION,
+                                 timeout=cfg.resume_timeout or None)
+    except Exception as exc:
+        print(online_join_error_text(exc))
+        return
+    transport = TcpTransport(sock, info["send_key"], info["recv_key"])
+    session = Session(transport, session_id=info["session_id"], name=cfg.name)
+    session.k_resume = info["k_resume"]
+    session.handshake_info = info
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    try:
+        result = _online_launch_game(session, info, cfg, False)
+    except Quit:
+        return
+    _online_bump_score(score, result)
+
+
+def _split_host_port(text):
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        rest = rest.lstrip(":")
+        if not host or not rest.isdigit():
+            raise ValueError("bad address")
+        return host, int(rest)
+    host, sep, port_s = text.rpartition(":")
+    if not sep or not host or not port_s.isdigit():
+        raise ValueError("bad address, want host:port")
+    return host, int(port_s)
+
+
+def _online_join_punch(cfg, score, rules, ocode):
+    """Hole-punch guest flow: STUN, answer, punch on one socket."""
+    try:
+        offer = decode_offer(ocode.strip())
+    except (BadInvite, VersionMismatch) as exc:
+        print(online_join_error_text(exc))
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((cfg.bind or "0.0.0.0", cfg.port or 0))
+    except OSError as exc:
+        print("Cannot bind %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
+    handed = False
+    try:
+        servers = cfg.stun or list(DEFAULT_STUN_SERVERS)
+        mapped, _punchable, reason = stun_check(sock, servers)
+        lan_ep = (online_local_ip(), sock.getsockname()[1])
+        if mapped is None:
+            print("STUN: %s. Using LAN address." % reason)
+        pub = mapped or lan_ep
+        lan = lan_ep if lan_ep != pub else None
+        try:
+            acode, answer = encode_answer(offer, pub, offer["secret"], lan=lan)
+        except BadInvite as exc:
+            print("Cannot answer this offer: %s" % exc)
+            return
+        print("Your answer code (share with host): %s" % acode)
+        try:
+            ask("Press Enter when the host has it > ")
+        except Quit:
+            return
+        k_hg, k_gh, k_resume = punch_keys(offer["secret"], offer["nonce_h"],
+                                          answer["nonce_g"])
+        print("Punching%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            peer_addr, _pinfo = punch_connect(
+                sock, punch_candidates(offer), k_gh, k_hg,
+                answer["nonce_g"], peer_nonce=offer["nonce_h"])
+        except HandshakeFailed as exc:
+            print("%s %s" % (message_for(getattr(exc, "reason", "")), exc))
+            return
+        transport = UdpTransport(sock, peer_addr, k_gh, k_hg)
+        handed = True
+        sid = punch_session_id(offer["secret"], offer["nonce_h"],
+                               answer["nonce_g"])
+        try:
+            peer_name = udp_ready_exchange(transport, False, cfg.name,
+                                           rules, sid)
+        except (RulesMismatch, VersionMismatch) as exc:
+            print(online_join_error_text(exc))
+            transport.close()
+            return
+        except (HandshakeFailed, TransportClosed) as exc:
+            print(message_for(getattr(exc, "reason", "LINK_LOST")))
+            transport.close()
+            return
+        session = Session(transport, session_id=sid, name=cfg.name)
+        session.k_resume = k_resume
+        print("Connected to %s (session %s)." % (peer_name, sid))
+        result = _online_launch_game(
+            session, {"session_id": sid, "peer_name": peer_name}, cfg, False)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        if not handed:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def online_join_menu(cfg, score=None):
+    """Menu join flow: setup -> paste any code -> flow by code kind."""
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    header = "\n".join(brand_masthead("Online join — how?"))
+    idx = select_menu(header, ["Paste invite / offer code",
+                               "Manual address (host:port + secret)",
+                               BACK_LABEL])
+    if idx == 2:
+        return
+    if idx == 1:
+        rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+        _online_join_manual(cfg, score, rules)
+        return
+    try:
+        code = ask("Invite / offer code > ")
+    except Quit:
+        return
+    if not code.strip():
+        return
+    try:
+        kind = online_code_kind(code.strip())
+    except BadInvite:
+        print(message_for("BAD_CODE"))
+        return
+    if kind == "answer":
+        print("That is an answer code: give it to the host, not to join.")
+        return
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    if kind == "direct":
+        _online_join_direct(cfg, score, rules, code)
+    else:
+        _online_join_punch(cfg, score, rules, code)
 
 
 def online_menu(cfg, score=None):

@@ -97,8 +97,69 @@
 | T4 | TCP handshake | done | HELLO/CHALLENGE/AUTH/READY, burn, 1-peer |
 | T5 | Session layer | done | `Session` seq/ack/heartbeat/resume; fake-clock tests |
 | T6 | Game integration/CLI/sanitize | done | `--online`, `OnlineConn`, sanitize, headless e2e |
-| T7–T12 | STUN/RUDP/punch/UPnP/UX | deferred | follow-up after T0–T6 verified |
+| T7 | STUN client + NAT check | done | RFC5769 vectors, fake-server retry/rotation/symmetric tests |
+| T8 | Offer/answer codes | done | manual-signaling blobs, tag verification, punch_keys |
+| T9 | RUDP + UDP transport | done | UdpTransport, 1000-msg spec-profile proxy run, Karn + fast retransmit |
+| T10 | Hole punch | done | cone/symmetric NAT doubles, migration, punched-UDP game e2e |
+| T11 | UPnP client | done | fake IGD, mapping args, CGNAT, atexit+signal cleanup |
+| T12 | UX flow/messages/README | done | reachability, host planner, code-kind, README section, this report |
+
+## T7–T12 rulings (deviations from the spec work order)
+
+- R4: `STUN_DEFAULT_PORT = 3478` added beside the spec-exact constants
+  (§3.1 table is silent on the default-port value; named beats magic).
+- R5: RUDP RTO floor = `RUDP_ACK_DELAY_S` (0.02 s granularity floor).
+- R6: fast retransmit on 3 duplicate cumulative acks (wire-compatible
+  addition; keeps the loss-torture runtime practical; dup resends are
+  harmless via dedup).
+- R7: punch failure uses reason TIMEOUT (§11 has no punch code; the T12
+  message names symmetric NAT explicitly).
+- R8: no new punch session-builder wrappers — menu flows compose the
+  already-tested primitives (`punch_connect` + `UdpTransport` + `Session`,
+  the same lines the T10 e2e proves). Thin untested glue is worse.
+- R9: guest starts punching after the user confirms the host has the
+  answer (spec wants punching at answer display; a blocking 15 s window
+  while the user reads would expire on slow relays).
+- Punch display names fall back to local config name + "Guest"/"Host":
+  offer/answer carry no names (§8.2); the UDP READY exchange then swaps
+  real names and checks rules, mirroring TCP READY.
+- Manual `host:port` form accepts `[ipv6]:port` and `host:port`
+  (best-effort IPv6; hole punching stays IPv4-only per §8.1).
+- Test prefixes are `test_online_*` (repo convention from T1–T6), not
+  `test_net_*`; fake STUN/proxy/IGD live inside the test modules.
+
+## Final report (spec §17 T12)
+
+Deviations: single-file layout, sync style, and R4–R9 above. Nothing
+deferred: T0–T12 all implemented and tested. Out-of-scope per spec §1
+(unchanged): relay/matchmaking server, accounts, telemetry, encryption
+(TLS-PSK), IPv6 hole punching.
+
+Deferred minors (polish, not correctness): none open — T11/T12 covered
+the polish tasks. UDP resume (re-punch with k_resume) is unimplemented:
+sessions over UDP carry k_resume but nothing re-signals after death;
+a UDP link death surfaces as LINK_LOST like TCP-expiry. Cost if wrong:
+manual redial for UDP games.
+
+Manual real-world NAT matrix (§16) — a human must run ( CI cannot):
+
+- [ ] home → home, no UPnP, no VPN: punch offer/answer connects, game ends
+- [ ] same with UPnP on: direct code via mapped port connects
+- [ ] VPN → VPN (e.g. Tailscale): direct code to VPN address connects
+- [ ] phone hotspot guest: punch fails with the symmetric-NAT message
+- [ ] CGNAT host: UPnP reports CGNAT, offers punch/manual only
+- [ ] lossy link (`tc netem`): game completes, resume after kill works
+
+Suite command (stdlib only, from repo root; tests are script-style so
+`unittest discover` does NOT pick them up — run each file):
+`foreach ($f in Get-ChildItem tests/test_online_*.py) { python $f.FullName }`
+(pwsh) or `for f in tests/test_online_*.py; do python3 \"$f\"; done` (sh).
+Counts at T12: lan_golden 3, crypto_invite 11, framing_tcp 7, handshake 10,
+session 6, t6 7, menu 10, t7_stun 11, t8_signal 10, t9_rudp 7, t10_punch 8,
+t11_upnp 8, t12_ux 9 — 107 total, all green on 2026-10-10 (Windows,
+CPython 3.14).
 
 ## Blockers / open questions
 
-- None blocking T0–T6. Real-network NAT matrix (§16) is manual, deferred to T12.
+- None. Ship state per user: after merge, github tracks exactly LICENSE,
+  README.md, battleships.py (tests + notes removed pre-merge).

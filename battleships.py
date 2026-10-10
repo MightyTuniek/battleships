@@ -10995,56 +10995,214 @@ ONLINE_ERROR_HINTS = {
     "BAD_CODE": "Bad proof: wrong code.",
 }
 
+ONLINE_HOWTO = (
+    "Online play is direct TCP between two copies of this game (no server). "
+    "The host shows an invite code; the guest pastes it. "
+    "Both sides must use the same board, fleet and mode, and the same "
+    "anti-cheat setting. If you are on different networks you may need a "
+    "VPN, port forwarding, or hole punching (STUN/UPnP settings below are "
+    "stored for that follow-up). One bad code after another burns the code."
+)
+
+
+class OnlineConfig:
+    """In-menu equivalent of every --online CLI flag (no CLI exclusives)."""
+
+    def __init__(self, name="Player", port=0, bind="0.0.0.0",
+                 resume_timeout=None, net_debug=False, stun=None,
+                 no_upnp=False, cell_anticheat=False, mode="single"):
+        self.name = sanitize_name(name or "Player")
+        self.port = int(port or 0)
+        self.bind = bind or "0.0.0.0"
+        self.resume_timeout = resume_timeout
+        self.net_debug = bool(net_debug)
+        self.stun = list(stun or [])
+        self.no_upnp = bool(no_upnp)
+        self.cell_anticheat = bool(cell_anticheat)
+        self.mode = "salvo" if mode == "salvo" else "single"
+
+    def describe(self):
+        return [
+            "Name: %s" % self.name,
+            "Port: %s" % (str(self.port) if self.port else "0 (random)"),
+            "Bind: %s" % self.bind,
+            "Resume window: %s" % (
+                ("%ss" % self.resume_timeout)
+                if self.resume_timeout else "default"),
+            "Mode: %s" % self.mode.upper(),
+            "Anti-cheat: %s" % ("PER-CELL" if self.cell_anticheat
+                                else "HASH"),
+            "Net debug: %s" % ("ON" if self.net_debug else "OFF"),
+            "STUN: %s" % (", ".join(self.stun) if self.stun
+                          else "(none; hole-punch follow-up)"),
+            "UPnP: %s" % ("OFF" if self.no_upnp
+                          else "ON (hole-punch follow-up)"),
+        ]
+
+
+_ONLINE_CFG = OnlineConfig()
+
+
+def online_config_from_args(args):
+    """Seed the menu config from CLI flags (CLI stays as shortcuts)."""
+    return OnlineConfig(
+        name=getattr(args, "name", None) or "Player",
+        port=getattr(args, "port", 0) or 0,
+        bind=getattr(args, "bind", None) or "0.0.0.0",
+        resume_timeout=getattr(args, "resume_timeout", None),
+        net_debug=getattr(args, "net_debug", False),
+        stun=getattr(args, "stun", None) or [],
+        no_upnp=getattr(args, "no_upnp", False),
+    )
+
+
+def online_join_error_text(exc):
+    """Friendly one-liner for every guest-side failure (menu + CLI share)."""
+    if isinstance(exc, VersionMismatch):
+        return message_for("VERSION")
+    if isinstance(exc, RulesMismatch):
+        return (message_for("RULES_MISMATCH")
+                + " Both sides must pick the same board, fleet and mode.")
+    if isinstance(exc, HandshakeFailed):
+        reason = getattr(exc, "reason", "")
+        if reason:
+            try:
+                return message_for(reason)
+            except Exception:
+                pass
+        return ONLINE_ERROR_HINTS["BAD_CODE"]
+    if isinstance(exc, ConnectionRefusedError):
+        return ONLINE_ERROR_HINTS["REFUSED"]
+    if isinstance(exc, (socket.timeout, TimeoutError, OSError)):
+        return ONLINE_ERROR_HINTS["TIMEOUT"]
+    return "Online join failed: %s" % exc
+
+
+class _OnlineMenuClient:
+    """Minimal LANGame client shim: print/chat surface, no lobby state."""
+
+    def __init__(self, name="Player"):
+        self.name = name
+
+    def print_now(self, line):
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def add_chat(self, line):
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def handle_match_chat(self, peer_name, text):
+        try:
+            print(paint("[%s] %s" % (peer_name, text), "cyan"))
+        except Exception:
+            pass
+
+    def print_chat_history(self):
+        print("  No chat history in online quick match.")
+
+
+def _online_prepare_host(cfg, rules_hash):
+    """Bind a listener and return (listener, secret, code). No blocking."""
+    listener, secret = host_once(cfg.bind or "0.0.0.0", cfg.port or 0,
+                                 cfg.name, rules_hash,
+                                 game_ver=LAN_VERSION)
+    bind = (cfg.bind or "").strip()
+    if bind and bind != "0.0.0.0":
+        invite_ip = bind
+    else:
+        ip = online_local_ip()
+        invite_ip = ip if ip != "0.0.0.0" else "127.0.0.1"
+    code = encode_invite(invite_ip, listener.port, secret)
+    return listener, secret, code
+
+
+def _online_accept_session(listener, cfg):
+    return accept_host(listener, timeout=cfg.resume_timeout or None)
+
+
+def _online_join_session(cfg, code, rules_hash):
+    return connect_guest(code, cfg.name, rules_hash,
+                         game_ver=LAN_VERSION,
+                         timeout=cfg.resume_timeout or None)
+
+
+def _online_launch_game(session, info, cfg, is_host):
+    """Run a full LANGame match over the established online session."""
+    my_id = "host" if is_host else "guest"
+    peer = sanitize_name(info.get("peer_name", "?"))
+    me = sanitize_name(cfg.name)
+    if is_host:
+        host_name, guest_name = me, peer
+    else:
+        host_name, guest_name = peer, me
+    mode, first, match_id, key = match_params_from_handshake(
+        info["session_id"], host_name, guest_name, cfg.mode)
+    conn = OnlineConn(session, peer, mode, first, my_id, match_id, key,
+                      cell_anticheat=cfg.cell_anticheat)
+    client = _OnlineMenuClient(me)
+    try:
+        game = LANGame(client, conn)
+        try:
+            return game.run()
+        except Quit:
+            try:
+                conn.send({"type": "surrender"})
+            except Exception:
+                pass
+            return "loss"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def run_online_host(args):
-    bind = args.bind or "0.0.0.0"
-    name = sanitize_name(args.name or "Host")
-    rules = canonical_rules_hash(SIZE, FLEET, "single")
-    listener, secret = host_once(bind, args.port or 0, name, rules,
-                                 game_ver=LAN_VERSION)
-    ip = online_local_ip()
-    code = encode_invite(ip if ip != "0.0.0.0" else "127.0.0.1",
-                         listener.port, secret)
-    print("Online host: %s (port %d)" % (name, listener.port))
+    cfg = online_config_from_args(args)
+    configure_board(10, "classic")
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    try:
+        listener, _secret, code = _online_prepare_host(cfg, rules)
+    except OSError as exc:
+        print("Cannot listen on %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        return
+    print("Online host: %s (port %d)" % (cfg.name, listener.port))
     print("Invite code: %s" % code)
     print("Waiting for guest (paste this code on the guest side)...")
     try:
-        session, info = accept_host(listener,
-                                    timeout=args.resume_timeout or None)
+        session, info = _online_accept_session(listener, cfg)
     except HandshakeFailed as exc:
         print("Host failed: %s" % message_for(getattr(exc, "reason", "")))
         listener.close()
         return
-    print("Connected to %s (session %s). Type messages, 'quit' to leave."
+    except Quit:
+        listener.close()
+        return
+    print("Connected to %s (session %s)."
           % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
-    _online_chat_loop(session, name, info.get("peer_name", "?"))
-    listener.close()
+    try:
+        _online_launch_game(session, info, cfg, True)
+    finally:
+        listener.close()
 
 
 def run_online_join(args, code):
-    name = sanitize_name(args.name or "Guest")
-    rules = canonical_rules_hash(SIZE, FLEET, "single")
+    cfg = online_config_from_args(args)
+    configure_board(10, "classic")
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
     try:
-        session, info = connect_guest(code, name, rules,
-                                      game_ver=LAN_VERSION)
-    except VersionMismatch:
-        print(message_for("VERSION"))
+        session, info = _online_join_session(cfg, code, rules)
+    except Exception as exc:
+        print(online_join_error_text(exc))
         return
-    except RulesMismatch:
-        print(message_for("RULES_MISMATCH"))
-        return
-    except HandshakeFailed:
-        print(ONLINE_ERROR_HINTS["BAD_CODE"])
-        return
-    except ConnectionRefusedError:
-        print(ONLINE_ERROR_HINTS["REFUSED"])
-        return
-    except (socket.timeout, TimeoutError, OSError):
-        print(ONLINE_ERROR_HINTS["TIMEOUT"])
-        return
-    print("Connected to %s (session %s). Type messages, 'quit' to leave."
+    print("Connected to %s (session %s)."
           % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
-    _online_chat_loop(session, name, info.get("peer_name", "?"))
+    _online_launch_game(session, info, cfg, False)
 
 
 def _online_chat_loop(session, me, peer):
@@ -11099,6 +11257,200 @@ def _online_chat_loop(session, me, peer):
         session.close()
     except Exception:
         pass
+
+
+def online_settings_menu(cfg):
+    """Edit every online option in-menu (parity with all --online flags)."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online settings") +
+            [paint("Every CLI flag lives here too — nothing is CLI-only.", "grey"),
+             ""] + cfg.describe())
+        opts = [
+            "Display name",
+            "TCP port (0 = random)",
+            "Bind address",
+            "Resume window (seconds, blank = default)",
+            "Mode (NORMAL/SALVO)",
+            "Anti-cheat (HASH/PER-CELL, both sides must match)",
+            "Net debug (ON/OFF)",
+            "STUN servers (hole-punch follow-up)",
+            "UPnP (hole-punch follow-up)",
+            BACK_LABEL,
+        ]
+        idx = select_menu(header, opts)
+        if idx == len(opts) - 1:
+            return
+        try:
+            if idx == 0:
+                raw = ask("Display name (max 20 chars) > ")
+                if raw:
+                    cfg.name = sanitize_name(raw)
+            elif idx == 1:
+                raw = ask("TCP port 0-65535 (0 = random) > ")
+                if raw:
+                    try:
+                        port = int(raw.strip())
+                    except ValueError:
+                        print("  Port must be a number.")
+                        continue
+                    if 0 <= port <= 65535:
+                        cfg.port = port
+                    else:
+                        print("  Port must be 0-65535.")
+            elif idx == 2:
+                raw = ask("Bind address (blank = all interfaces) > ")
+                cfg.bind = raw.strip() or "0.0.0.0"
+            elif idx == 3:
+                raw = ask("Resume window seconds (blank = default) > ")
+                if not raw.strip():
+                    cfg.resume_timeout = None
+                else:
+                    try:
+                        val = float(raw.strip())
+                    except ValueError:
+                        print("  Must be a number.")
+                        continue
+                    if val <= 0:
+                        print("  Must be positive.")
+                        continue
+                    cfg.resume_timeout = val
+            elif idx == 4:
+                cfg.mode = "salvo" if cfg.mode != "salvo" else "single"
+                print("  Mode set to %s." % cfg.mode.upper())
+            elif idx == 5:
+                cfg.cell_anticheat = not cfg.cell_anticheat
+                print("  Anti-cheat set to %s."
+                      % ("PER-CELL" if cfg.cell_anticheat else "HASH"))
+            elif idx == 6:
+                cfg.net_debug = not cfg.net_debug
+                print("  Net debug %s." % ("ON" if cfg.net_debug else "OFF"))
+            elif idx == 7:
+                raw = ask("STUN servers, comma-separated HOST:PORT (blank clears) > ")
+                if not raw.strip():
+                    cfg.stun = []
+                else:
+                    cfg.stun = [p.strip() for p in raw.split(",")
+                                if p.strip()]
+                print("  Stored (used by the hole-punch follow-up).")
+            elif idx == 8:
+                cfg.no_upnp = not cfg.no_upnp
+                print("  UPnP %s (used by the hole-punch follow-up)."
+                      % ("OFF" if cfg.no_upnp else "ON"))
+        except Quit:
+            return
+
+
+def _online_bump_score(score, result):
+    if not isinstance(score, dict):
+        return
+    if result == "win":
+        score["win"] = score.get("win", 0) + 1
+    elif result == "loss":
+        score["loss"] = score.get("loss", 0) + 1
+
+
+def online_host_menu(cfg, score=None):
+    """Menu host flow: setup -> listen -> full LANGame match."""
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    try:
+        listener, _secret, code = _online_prepare_host(cfg, rules)
+    except OSError as exc:
+        print("Cannot listen on %s:%s: %s" % (cfg.bind, cfg.port, exc))
+        return
+    try:
+        print("Online host: %s (port %d)" % (cfg.name, listener.port))
+        print("Invite code: %s" % code)
+        print("Share this code with your guest. Waiting%s..."
+              % (" (Ctrl-C cancels)" if use_cursor_ui() else ""))
+        try:
+            session, info = _online_accept_session(listener, cfg)
+        except HandshakeFailed as exc:
+            print("Host failed: %s"
+                  % message_for(getattr(exc, "reason", "")))
+            return
+        print("Connected to %s (session %s)."
+              % (sanitize_name(info.get("peer_name", "?")),
+                 info["session_id"]))
+        result = _online_launch_game(session, info, cfg, True)
+        _online_bump_score(score, result)
+    except Quit:
+        return
+    finally:
+        try:
+            listener.close()
+        except Exception:
+            pass
+
+
+def online_join_menu(cfg, score=None):
+    """Menu join flow: setup -> paste code -> full LANGame match."""
+    if choose_setup() == BACK:
+        return
+    res = choose_mode()
+    if res == BACK:
+        return
+    cfg.mode = res
+    try:
+        code = ask("Invite code > ")
+    except Quit:
+        return
+    if not code.strip():
+        return
+    rules = canonical_rules_hash(SIZE, FLEET, cfg.mode)
+    try:
+        session, info = _online_join_session(cfg, code.strip(), rules)
+    except Exception as exc:
+        print(online_join_error_text(exc))
+        return
+    print("Connected to %s (session %s)."
+          % (sanitize_name(info.get("peer_name", "?")), info["session_id"]))
+    try:
+        result = _online_launch_game(session, info, cfg, False)
+    except Quit:
+        return
+    _online_bump_score(score, result)
+
+
+def online_menu(cfg, score=None):
+    """Online submenu: host / join / settings / how-it-works."""
+    while True:
+        header = "\n".join(
+            brand_masthead("Online — direct TCP play") +
+            [paint("No server. Host shares a code, guest pastes it.", "grey"),
+             ""] + cfg.describe())
+        opts = [
+            "Host a match (show invite code)",
+            "Join with invite code",
+            "Settings (name, port, bind, resume, debug, STUN, UPnP)",
+            "How online play works",
+            BACK_LABEL,
+        ]
+        try:
+            idx = select_menu(header, opts)
+        except Quit:
+            return
+        if idx == len(opts) - 1:
+            return
+        if idx == 0:
+            online_host_menu(cfg, score)
+        elif idx == 1:
+            online_join_menu(cfg, score)
+        elif idx == 2:
+            online_settings_menu(cfg)
+        elif idx == 3:
+            for line in wrap_prose(ONLINE_HOWTO):
+                print(line)
+            try:
+                ask("Enter to continue > ")
+            except Quit:
+                return
 
 
 def main():
@@ -11197,6 +11549,7 @@ def main():
 
     score = {"win": 0, "loss": 0}
     lan_score = {"win": 0, "loss": 0, "verified_win": 0, "forfeit_win": 0}
+    online_cfg = online_config_from_args(args)
 
     try:
         if args.load:
@@ -11269,7 +11622,7 @@ def main():
                 header_lines.append("")
                 header_lines.extend(profile_panel)
             header_lines.append("")
-            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–7", "QUICK"), ("Q", "QUIT")]))
+            header_lines.extend(command_bar([("↑↓", "MOVE"), ("ENTER", "SELECT"), ("1–8", "QUICK"), ("Q", "QUIT")]))
             header = "\n".join(header_lines)
 
             menu_opts = [
@@ -11277,6 +11630,7 @@ def main():
                 "Campaign (Easy → Nightmare)",
                 "Hotseat (2 players)",
                 "LAN Matchmaking",
+                "Online Match",
                 "How to play",
                 "Settings",
                 "Quit",
@@ -11286,7 +11640,7 @@ def main():
             if choice != -1:
                 menu_sel = choice
 
-            if choice == -1 or choice == 6:
+            if choice == -1 or choice == 7:
                 break
 
             # --- New game -------------------------------------------------
@@ -11388,9 +11742,14 @@ def main():
                     lan_score[k] += v
                 continue
 
-            # --- How to play ---------------------------------------------
-            if choice == 5: settings_menu(); continue
+            # --- Online ---------------------------------------------------
             if choice == 4:
+                online_menu(online_cfg, lan_score)
+                continue
+
+            # --- How to play ---------------------------------------------
+            if choice == 6: settings_menu(); continue
+            if choice == 5:
                 if use_cursor_ui():
                     clear()
                     for line in center_block(brand_masthead("Field manual")):

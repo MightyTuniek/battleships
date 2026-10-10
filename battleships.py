@@ -1315,6 +1315,13 @@ def _truncate_vis(s, width):
     plain = strip_ansi(s)
     if len(plain) <= width:
         return s
+    # Padding-only overflow: the line sticks out solely because of
+    # trailing spaces (centered/padded rows). Drop the padding instead
+    # of drawing a bogus "..." tail at the right edge of the screen.
+    stripped = plain.rstrip()
+    if len(stripped) <= width:
+        pad = len(plain) - len(stripped)
+        return s[:len(s) - pad]
     if width <= 3:
         return plain[:width]
     return plain[:width - 3] + "..."
@@ -13913,7 +13920,7 @@ def main():
             except Exception:
                 pass
             header_lines.append("")
-            header_lines.append(_pad_vis(paint("TACTICAL OPERATIONS", _theme_accent("cyan")), term_width(), "center") if term_width() >= 78 else paint("TACTICAL OPERATIONS", _theme_accent("cyan")))
+            header_lines.append(paint("TACTICAL OPERATIONS", _theme_accent("cyan")))
             header_lines.append("")
             if term_width() >= 78:
                 header_lines.extend(side_by_side(session_panel, profile_panel, gap="    "))

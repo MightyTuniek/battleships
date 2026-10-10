@@ -10565,6 +10565,104 @@ class UdpTransport(Transport):
                     return
 
 
+# --- Online hole punch (spec section 8.3) ---
+def punch_candidates(peer):
+    """Candidate endpoints from a decoded offer/answer dict.
+
+    Public endpoint first, LAN candidate second (lock-on may pick LAN).
+    """
+    cands = [(peer["pub"][0], peer["pub"][1])]
+    if peer.get("lan") is not None:
+        cands.append((peer["lan"][0], peer["lan"][1]))
+    return cands
+
+
+def punch_session_id(secret, nonce_h, nonce_g):
+    """Session id shared without exchange: both sides know all inputs."""
+    return hashlib.sha256(bytes(secret) + b"|udp-session|"
+                          + bytes(nonce_h) + b"|"
+                          + bytes(nonce_g)).hexdigest()[:16]
+
+
+def punch_connect(sock, candidates, send_key, recv_key, local_nonce,
+                  peer_nonce=None, window=None, interval=None):
+    """PUNCH every interval to each candidate until valid packets flow both
+    ways, then return (peer_addr, info). Locks onto the authenticated
+    source address. Raises HandshakeFailed on expiry (reason TIMEOUT)."""
+    window = PUNCH_WINDOW_S if window is None else window
+    interval = PUNCH_INTERVAL_S if interval is None else interval
+    try:
+        old_timeout = sock.gettimeout()
+    except OSError:
+        raise HandshakeFailed("punch socket gone", reason="TIMEOUT")
+    try:
+        sock.settimeout(interval)
+    except OSError:
+        raise HandshakeFailed("punch socket gone", reason="TIMEOUT")
+    punch_pkt = _rudp_packet(RUDP_TYPE_PUNCH, 0, 0, 0, 1,
+                             bytes(local_nonce), bytes(send_key))
+    ack_pkt = _rudp_packet(RUDP_TYPE_PUNCH_ACK, 0, 0, 0, 1,
+                           bytes(local_nonce), bytes(send_key))
+    got_punch, got_ack, peer_addr = False, False, None
+    deadline = time.monotonic() + window
+    last_send = 0.0
+    try:
+        while True:
+            now = time.monotonic()
+            if got_punch and got_ack:
+                break
+            if now >= deadline:
+                break
+            if now - last_send >= interval:
+                for cand in candidates:
+                    try:
+                        sock.sendto(punch_pkt, (cand[0], cand[1]))
+                    except OSError:
+                        pass
+                last_send = now
+            try:
+                data, src = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError as exc:
+                raise HandshakeFailed("punch io error: %s" % exc,
+                                      reason="TIMEOUT")
+            parsed = _rudp_parse(data, bytes(recv_key))
+            if parsed is None:
+                continue
+            ptype, _s, _a, _fi, _fc, payload = parsed
+            if ptype == RUDP_TYPE_PUNCH:
+                if peer_nonce is not None and bytes(payload) != bytes(
+                        peer_nonce):
+                    continue
+                if peer_addr is None:
+                    peer_addr = src
+                got_punch = True
+                try:
+                    sock.sendto(ack_pkt, src)
+                except OSError:
+                    pass
+            elif ptype == RUDP_TYPE_PUNCH_ACK:
+                if peer_nonce is not None and bytes(payload) != bytes(
+                        peer_nonce):
+                    continue
+                if peer_addr is None:
+                    peer_addr = src
+                got_ack = True
+    finally:
+        try:
+            sock.settimeout(old_timeout)
+        except OSError:
+            pass
+    if not (got_punch and got_ack):
+        raise HandshakeFailed(
+            "hole punch timed out with no two-way path; likely symmetric "
+            "NAT or a carrier-grade NAT. Punching will not work here: use "
+            "a VPN, a port forward or UPnP direct mode.",
+            reason="TIMEOUT")
+    return peer_addr, {"got_punch": got_punch, "got_ack": got_ack}
+
+
 # --- Online STUN client (spec section 8.1; one socket for everything) ---
 STUN_COOKIE = 0x2112A442
 STUN_BINDING_REQUEST = 0x0001

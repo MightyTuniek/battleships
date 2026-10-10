@@ -1612,6 +1612,64 @@ def center_block(lines, width=None):
     return [_center_pad(l, width) for l in lines]
 
 
+def center_block_aligned(lines, width=None):
+    """Center a block as a unit: one common left pad for every line.
+
+    Unlike center_block (which centers each line individually, so rows of
+    different lengths wobble sideways and table columns drift apart), this
+    keeps a shared left edge so internal alignment survives. Use it for
+    multi-line headers, metric rows and preformatted tables. Single lines
+    and equal-width boxes render exactly as with center_block. Narrow
+    terminals (<78) are returned unchanged, mirroring center_block.
+    """
+    if width is None:
+        width = term_width()
+    items = list(lines)
+    if width < 78:
+        return items
+    try:
+        w = max((_vis_len(l) for l in items), default=0)
+    except Exception:
+        return items
+    pad = max(0, (width - w) // 2)
+    return [((" " * pad) + l) if l else l for l in items]
+
+
+def metric_table(rows, gap="  "):
+    """Join metric cells into aligned columns.
+
+    Each row is a list of already-formatted cells (e.g. metric_row). Every
+    column except a row's last is padded to the widest visible width seen
+    in that column, so variable-length values can't push later columns
+    sideways. Single-column rows pass through untouched.
+    """
+    if not rows:
+        return []
+    widths = {}
+    for r in rows:
+        for i, cell in enumerate(r):
+            if i < len(r) - 1:
+                try:
+                    w = _vis_len(cell)
+                except Exception:
+                    try:
+                        w = len(cell)
+                    except Exception:
+                        w = 0
+                if w > widths.get(i, 0):
+                    widths[i] = w
+    out = []
+    for r in rows:
+        parts = []
+        for i, cell in enumerate(r):
+            if i < len(r) - 1:
+                parts.append(_pad_vis(cell, widths.get(i, 0)))
+            else:
+                parts.append(cell)
+        out.append(gap.join(parts))
+    return out
+
+
 def rule(width=None, char="─", style=("grey",)):
     char = _rule_char(char)
     if width is None:
@@ -2974,7 +3032,10 @@ def hint_text(k, rng=random):
     top = top_candidates(k, n=3, rng=rng)
     lines = [paint("TOP TARGETS", "cyan", "bold")]
     for i, (p, score, count) in enumerate(top, 1):
-        marker = paint(_choice_arrow(), "cyan", "bold") if i == 1 else paint("%02d" % i, "grey")
+        if i == 1:
+            marker = paint(_choice_arrow() + " ", "cyan", "bold")
+        else:
+            marker = paint("%02d" % i, "grey")
         lines.append("%s  %s  %s" % (
             marker,
             paint(cell_name(p).ljust(4), "bold", "white"),
@@ -3741,7 +3802,7 @@ def interactive_place_fleet(board):
                 if name:
                     orient = "HORIZONTAL" if horiz else "VERTICAL"
                     state = status_badge("VALID", "ok") if valid else status_badge("BLOCKED", "critical")
-                    frame.extend(center_block([
+                    frame.extend(center_block_aligned([
                         "%s %s (%d)  %s %s  %s %s  %s %s" % (
                             paint("PLACE", "grey"), paint(name.upper(), "bold", "white"), length,
                             paint("CURSOR", "grey"), paint(cell_name(cursor), "bold", "cyan"),
@@ -4043,6 +4104,7 @@ def show_shot_review(game):
         page_lines(out)
         return
 
+    review_rows = []
     for i, e in enumerate(history, 1):
         cell = cell_name(e["pos"])
         if e["sunk"]:
@@ -4055,7 +4117,10 @@ def show_shot_review(game):
         if not e["coach_opt"] and e.get("top3"):
             top3 = ", ".join(cell_name(p) for p in e["top3"])
             suffix = "   " + paint("(top-3: %s)" % top3, "grey")
-        out.extend(center_block(wrap_prose("  %3d.  %-5s  %s%s" % (i, cell, desc, suffix))))
+        review_rows.extend(wrap_prose("  %3d.  %-5s  %s%s" % (i, cell, desc, suffix)))
+    # One common left pad for every row: per-row centering would stagger
+    # the turn/cell columns sideways.
+    out.extend(center_block_aligned(review_rows))
 
     out.append("")
     out.extend(coach_summary_lines(history))
@@ -4083,13 +4148,16 @@ def coach_summary_lines(history):
     if off:
         out.append("")
         out.extend(center_block([paint("SHOTS OUTSIDE EXPERT TOP-3", "grey")]))
+        off_rows = []
         for i, e in enumerate(history, 1):
             if not e["coach_opt"]:
                 top3 = ", ".join(cell_name(p) for p in e["top3"])
                 desc = "HIT" if e["hit"] else "miss"
-                out.extend(center_block(wrap_prose(
+                off_rows.extend(wrap_prose(
                     "      Turn %2d:  %-5s  %-5s   top-3: %s"
-                    % (i, cell_name(e["pos"]), desc, top3))))
+                    % (i, cell_name(e["pos"]), desc, top3)))
+        # One common left pad: per-row centering would stagger the columns.
+        out.extend(center_block_aligned(off_rows))
     else:
         out.append("")
         out.extend(center_block([status_badge("Flawless — every shot in expert top-3", "success")]))
@@ -4300,12 +4368,12 @@ class Game:
         hits = metric_row("HITS", str(s["hits"]))
         accr = metric_row("ACCURACY", acc)
         if term_width() >= 58:
-            return ["%s  %s  %s" % (turn, opp, mode),
-                    "%s  %s  %s" % (shots, hits, accr)]
+            return metric_table([[turn, opp, mode],
+                                 [shots, hits, accr]])
         # Narrow terminal: stacked pairs keep every HUD row within 40 cols.
-        return ["%s  %s" % (turn, opp),
-                "%s  %s" % (mode, shots),
-                "%s  %s" % (hits, accr)]
+        return metric_table([[turn, opp],
+                             [mode, shots],
+                             [hits, accr]])
 
     def _header_block(self):
         title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("TACTICAL OPERATIONS", "cyan")
@@ -4345,7 +4413,7 @@ class Game:
     def _frame_lines(self, notes, cursor=None, hint_block=None, density_block=None,
                      extra_line=None, footer=None):
         cols, rows = term_size()
-        header = center_block(self._header_block(), width=cols)
+        header = center_block_aligned(self._header_block(), width=cols)
         boards = render_boards(
             self.player, self.enemy,
             last_player=getattr(self, "last_player", None),
@@ -4447,7 +4515,7 @@ class Game:
         ])
         if extras:
             cols, rows = term_size()
-            header = center_block(self._header_block(), width=cols)
+            header = center_block_aligned(self._header_block(), width=cols)
             boards = render_boards(
                 self.player, self.enemy,
                 last_player=getattr(self, "last_player", None),
@@ -4828,7 +4896,7 @@ class Game:
             print(line)
         print()
 
-        for line in center_block(_feed_lines(notes, limit=6)):
+        for line in center_block_aligned(_feed_lines(notes, limit=6)):
             print(line)
         print()
 
@@ -5230,12 +5298,12 @@ class HotseatGame:
             frame.extend(center_block(brand_masthead("Hotseat — Player %d firing" % (seat + 1)), width=cols))
             frame.extend(render_boards(self.boards[seat], foe, cursor=cursor).split("\n"))
             frame.append("")
-            frame.extend(center_block(boxed_panel(paint("STATUS", "bold"), [
-                "%s  %s" % (metric_row("PLAYER", str(seat + 1)),
-                            metric_row("TARGET", cell_name(cursor))),
-                "%s  %s" % (metric_row("SHOTS", str(self.stats[seat]["shots"])),
-                            metric_row("HITS", str(self.stats[seat]["hits"]))),
-            ]), width=cols))
+            frame.extend(center_block(boxed_panel(paint("STATUS", "bold"), metric_table([
+                [metric_row("PLAYER", str(seat + 1)),
+                 metric_row("TARGET", cell_name(cursor))],
+                [metric_row("SHOTS", str(self.stats[seat]["shots"])),
+                 metric_row("HITS", str(self.stats[seat]["hits"]))],
+            ])), width=cols))
             foe_rows = enemy_status_rows(enemy=foe)
             frame.extend(center_block(boxed_panel(paint("ENEMY FLEET", "bold"), foe_rows), width=cols))
             if extra:
@@ -6686,19 +6754,17 @@ class LANGame:
         secure = metric_row("SECURE", ver)
         link = metric_row("LINK", "STABLE" if not getattr(self.conn, "closed", False) else "LOST")
         if term_width() >= 58:
-            return ["%s  %s  %s" % (
-                        turn,
-                        metric_row("OPPONENT", str(self.peer_name).upper()[:16]),
-                        mode),
-                    "%s  %s  %s" % (shots, hits, accr),
-                    "%s  %s" % (secure, link)]
+            return metric_table([[turn,
+                                  metric_row("OPPONENT", str(self.peer_name).upper()[:16]),
+                                  mode],
+                                 [shots, hits, accr],
+                                 [secure, link]])
         # Narrow terminal: stacked pairs (+ shorter peer name) stay in 40 cols.
-        return ["%s  %s" % (
-                    turn,
-                    metric_row("OPPONENT", str(self.peer_name).upper()[:12])),
-                "%s  %s" % (mode, shots),
-                "%s  %s" % (hits, accr),
-                "%s  %s" % (secure, link)]
+        return metric_table([[turn,
+                              metric_row("OPPONENT", str(self.peer_name).upper()[:12])],
+                             [mode, shots],
+                             [hits, accr],
+                             [secure, link]])
 
     def _lan_header(self):
         title = paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS · %s" % str(self.peer_name).upper()[:20], "cyan")
@@ -6711,7 +6777,7 @@ class LANGame:
             ("L", "CHAT"), ("Q", "SURRENDER"),
         ])
         frame = []
-        frame.extend(center_block(self._lan_header(), width=cols))
+        frame.extend(center_block_aligned(self._lan_header(), width=cols))
         extra_sunk = self.verified_sunk_cells if self.conn.cell_anticheat else None
 
         frame.extend(render_lan_boards(
@@ -6727,14 +6793,14 @@ class LANGame:
         foe_rows = enemy_status_rows(knowledge=self.pk)
         if cursor is not None:
             target_rows = [
-                "%s  %s" % (paint("TARGET", "grey"), paint(cell_name(cursor), "bold", "cyan")),
-                "%s  %s" % (paint("OPPONENT", "grey"), paint(str(self.peer_name)[:18], "white")),
-                "%s  %s" % (paint("STATUS", "grey"), status_badge("READY TO FIRE", "focus")),
+                "%s  %s" % (paint("TARGET".ljust(8), "grey"), paint(cell_name(cursor), "bold", "cyan")),
+                "%s  %s" % (paint("OPPONENT".ljust(8), "grey"), paint(str(self.peer_name)[:18], "white")),
+                "%s  %s" % (paint("STATUS".ljust(8), "grey"), status_badge("READY TO FIRE", "focus")),
             ]
         else:
             target_rows = [
-                "%s  %s" % (paint("OPPONENT", "grey"), paint(str(self.peer_name)[:18], "white")),
-                "%s  %s" % (paint("MODE", "grey"), paint("Salvo" if self.mode == "salvo" else "Normal", "white")),
+                "%s  %s" % (paint("OPPONENT".ljust(8), "grey"), paint(str(self.peer_name)[:18], "white")),
+                "%s  %s" % (paint("MODE".ljust(8), "grey"), paint("Salvo" if self.mode == "salvo" else "Normal", "white")),
             ]
         left = boxed_panel(paint("FLEET STATUS", "bold"), fleet_rows)
         mid = boxed_panel(paint("ENEMY FLEET", "bold"), foe_rows)
@@ -7411,7 +7477,7 @@ class LANGame:
                 print(line)
         print()
 
-        for line in center_block(_feed_lines(self.finish_notes, limit=6)):
+        for line in center_block_aligned(_feed_lines(self.finish_notes, limit=6)):
             print(line)
         print()
 
@@ -8667,14 +8733,14 @@ class LANClient:
         with self.request_lock:
             req_count = len(self.incoming_requests)
 
-        status = [
-            "%s  %s" % (metric_row("YOU", self.name[:18]), metric_row("PORT", str(self.port))),
-            "%s  %s" % (metric_row("PEERS", str(peer_count)), metric_row("REQUESTS", str(req_count))),
-            "%s  %s" % (metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
-                        metric_row("LOCK", "ON" if self.lobby_key else "OFF")),
-            "%s  %s" % (metric_row("ANTICHEAT", "CELL" if self.cell_anticheat else "HASH"),
-                        metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
-        ]
+        status = metric_table([
+            [metric_row("YOU", self.name[:18]), metric_row("PORT", str(self.port))],
+            [metric_row("PEERS", str(peer_count)), metric_row("REQUESTS", str(req_count))],
+            [metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
+             metric_row("LOCK", "ON" if self.lobby_key else "OFF")],
+            [metric_row("ANTICHEAT", "CELL" if self.cell_anticheat else "HASH"),
+             metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))],
+        ])
         try:
             _ips = local_lan_ips()
             if _ips:
@@ -9089,7 +9155,7 @@ class LANClient:
         ])):
             print(line)
         print()
-        for line in center_block([w for l in LAN_HELP.strip("\n").split("\n") for w in wrap_prose(l)]):
+        for line in center_block_aligned([w for l in LAN_HELP.strip("\n").split("\n") for w in wrap_prose(l)]):
             print(line)
         print()
         ask("Press Enter to return > ")
@@ -9273,19 +9339,26 @@ class LANClient:
                 _ip_short = "unknown"
         except Exception:
             _ip_short = "unknown"
+        # Fixed-column header: metric_table keeps PREF/LOCK and PEERS/SCORE
+        # at the same X on every row; center_block_aligned below applies one
+        # common left pad so the rows can't wobble sideways.
+        you_c = metric_row("YOU", self.name[:16])
+        pref_c = metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL")
+        peers_c = metric_row("PEERS", str(len(peers)))
+        port_c = metric_row("PORT", str(self.port))
+        lock_c = metric_row("LOCK", lock)
+        score_c = metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))
+        ip_c = metric_row("IP", _ip_short)
+        hint = paint("join: request <IP>:%d" % int(self.port), "grey")
+        row_you, row_port, row_ip_full = metric_table([[you_c, pref_c, peers_c],
+                                                       [port_c, lock_c, score_c],
+                                                       [ip_c, hint]])
+        row_ip = _truncate_vis(row_ip_full, max(40, cols - 8))
         mast = [
             paint("BATTLESHIPS", "bold", "white") + "  " + paint("LAN OPERATIONS", "cyan") + paint("  %s %s" % (spin, stamp), "grey"),
-            "%s  %s  %s" % (
-                metric_row("YOU", self.name[:16]),
-                metric_row("PREF", "SALVO" if self.pref == "salvo" else "NORMAL"),
-                metric_row("PEERS", str(len(peers)))),
-            "%s  %s  %s" % (
-                metric_row("PORT", str(self.port)),
-                metric_row("LOCK", lock),
-                metric_row("SCORE", "%dW/%dL" % (self.lan_score["win"], self.lan_score["loss"]))),
-            _truncate_vis("%s  %s" % (
-                metric_row("IP", _ip_short),
-                paint("join: request <IP>:%d" % int(self.port), "grey")), max(40, cols - 8)),
+            row_you,
+            row_port,
+            row_ip,
             rule(min(72, cols - 8)),
         ]
 
@@ -9300,7 +9373,7 @@ class LANClient:
         notice_panel = boxed_panel(paint("NOTICES", "bold"), [_truncate_vis(n, panel_w) for n in notices]) if notices else None
 
         frame = []
-        frame.extend(center_block(mast, width=cols))
+        frame.extend(center_block_aligned(mast, width=cols))
         frame.append("")
         if cols >= 78:
             frame.extend(center_block(side_by_side(left, right), width=cols))

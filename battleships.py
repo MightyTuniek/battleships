@@ -12996,14 +12996,14 @@ def main():
                         default=None,
                         help="online play: 'host' or 'join CODE'")
     parser.add_argument("--port", type=int, default=0,
-                        help="online TCP port (0 = random high port)")
+                        help="online TCP/UDP port (0 = random high port)")
     parser.add_argument("--bind", default=None,
                         help="online bind address (default all interfaces)")
     parser.add_argument("--stun", action="append", default=[],
                         metavar="HOST:PORT",
-                        help="STUN server (repeatable; hole-punch follow-up)")
+                        help="STUN server for hole punching (repeatable)")
     parser.add_argument("--no-upnp", action="store_true",
-                        help="disable UPnP port mapping (hole-punch follow-up)")
+                        help="disable UPnP port mapping")
     parser.add_argument("--resume-timeout", type=float,
                         default=RESUME_WINDOW_S,
                         help="reconnect window in seconds (default 120)")

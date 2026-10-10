@@ -9693,6 +9693,7 @@ RESUME_WINDOW_S = 120
 OUTBOUND_BUFFER_MAX = 1000
 STUN_TIMEOUT_S = 1.5
 STUN_RETRIES = 2
+STUN_DEFAULT_PORT = 3478
 DEFAULT_STUN_SERVERS = (
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
@@ -10219,6 +10220,139 @@ def recv_exact(sock, n, timeout):
             raise TransportClosed("eof")
         out += chunk
     return bytes(out)
+
+
+# --- Online STUN client (spec section 8.1; one socket for everything) ---
+STUN_COOKIE = 0x2112A442
+STUN_BINDING_REQUEST = 0x0001
+STUN_BINDING_RESPONSE = 0x0101
+STUN_ATTR_XOR_MAPPED = 0x0020
+STUN_ATTR_MAPPED = 0x0001
+
+
+def stun_request():
+    """Binding request + its transaction id (spec section 8.1 recipe)."""
+    txid = secrets.token_bytes(12)
+    pkt = struct.pack(">HHI", STUN_BINDING_REQUEST, 0, STUN_COOKIE) + txid
+    return pkt, txid
+
+
+def parse_stun_response(data, txid):
+    """(ip, port) from a binding success, else None. IPv4 only in v1:
+    XOR-MAPPED-ADDRESS first, plain MAPPED-ADDRESS fallback; anything
+    else (IPv6, wrong txid/cookie/type, truncation) is ignored."""
+    try:
+        if len(data) < 20:
+            return None
+        mtype, mlen, cookie = struct.unpack(">HHI", data[:8])
+        if mtype != STUN_BINDING_RESPONSE or cookie != STUN_COOKIE:
+            return None
+        if data[8:20] != txid:
+            return None
+        i, end = 20, min(len(data), 20 + mlen)
+        while i + 4 <= end:
+            atype, alen = struct.unpack(">HH", data[i:i + 4])
+            v = data[i + 4:i + 4 + alen]
+            if atype == STUN_ATTR_XOR_MAPPED and len(v) >= 8 and v[1] == 1:
+                port = struct.unpack(">H", v[2:4])[0] ^ (STUN_COOKIE >> 16)
+                ip = struct.unpack(">I", v[4:8])[0] ^ STUN_COOKIE
+                return str(ipaddress.IPv4Address(ip)), port
+            if atype == STUN_ATTR_MAPPED and len(v) >= 8 and v[1] == 1:
+                port = struct.unpack(">H", v[2:4])[0]
+                ip = str(ipaddress.IPv4Address(v[4:8]))
+                return ip, port
+            i += 4 + ((alen + 3) & ~3)
+    except (struct.error, ValueError, IndexError):
+        return None
+    return None
+
+
+def stun_parse_server(text):
+    """'HOST:PORT' -> (host, port); bare host defaults to the STUN port."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty STUN server")
+    if ":" in text:
+        host, _, port_s = text.rpartition(":")
+        if not host:
+            raise ValueError("bad STUN server %r" % text)
+        try:
+            port = int(port_s)
+        except ValueError:
+            raise ValueError("bad STUN port %r" % text)
+        if not 1 <= port <= 65535:
+            raise ValueError("bad STUN port %r" % text)
+        return host, port
+    return text, STUN_DEFAULT_PORT
+
+
+def stun_query(sock, server, timeout=None, retries=None):
+    """Ask one STUN server from an existing socket; (ip, port) or None.
+
+    Retries on the same server, then the caller rotates to the next.
+    The socket's timeout is restored. No game data is ever sent here.
+    """
+    timeout = STUN_TIMEOUT_S if timeout is None else timeout
+    retries = STUN_RETRIES if retries is None else retries
+    try:
+        host, port = stun_parse_server(server)
+    except ValueError:
+        return None
+    try:
+        old_timeout = sock.gettimeout()
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+    except OSError:
+        return None
+    try:
+        for _ in range(1 + max(0, retries)):
+            pkt, txid = stun_request()
+            try:
+                sock.sendto(pkt, (host, port))
+            except OSError:
+                return None
+            try:
+                data, _ = sock.recvfrom(2048)
+            except (socket.timeout, TimeoutError, OSError):
+                continue
+            res = parse_stun_response(data, txid)
+            if res is not None:
+                return res
+        return None
+    finally:
+        try:
+            sock.settimeout(old_timeout)
+        except OSError:
+            pass
+
+
+def stun_check(sock, servers, timeout=None, retries=None):
+    """Two-server NAT check from one socket.
+
+    Returns (mapped|None, punchable, reason): the same public endpoint
+    from two servers means punching should work; differing ports mean
+    symmetric NAT; fewer than two answers means unverified/unavailable.
+    """
+    answers = []
+    for server in servers:
+        res = stun_query(sock, server, timeout=timeout, retries=retries)
+        if res is not None:
+            answers.append(res)
+        if len(answers) >= 2:
+            break
+    if not answers:
+        return None, False, "no STUN server answered"
+    if len(answers) < 2:
+        return answers[0], False, (
+            "only one STUN answer; punchability unverified")
+    if answers[0] == answers[1]:
+        return answers[0], True, (
+            "same public endpoint from two STUN servers")
+    return answers[0], False, (
+        "symmetric NAT: STUN servers report different ports; "
+        "hole punching will not work, use a VPN, a port forward or UPnP")
 
 
 # --- Online handshake (spec section 6) ---
